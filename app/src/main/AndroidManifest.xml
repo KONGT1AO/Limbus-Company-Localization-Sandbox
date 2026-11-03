@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <queries>
+        <package android:name="com.ProjectMoon.LimbusCompany" />
+        <!-- Android 11 起 PackageManager 查询受限；显式声明常见 ROM 的后台权限管理器，
+             才能在 vivo/iQOO、MIUI、ColorOS、EMUI 等设备上验证并打开对应设置页。 -->
+        <package android:name="com.iqoo.secure" />
+        <package android:name="com.vivo.permissionmanager" />
+        <package android:name="com.miui.securitycenter" />
+        <package android:name="com.coloros.safecenter" />
+        <package android:name="com.oplus.battery" />
+        <package android:name="com.huawei.systemmanager" />
+        <package android:name="com.hihonor.systemmanager" />
+        <package android:name="com.meizu.safe" />
+    </queries>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 自更新由系统安装器完成；首次安装新版仍需用户允许安装来源并确认安装。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 容器可能以宿主身份转发前台服务通知；声明权限以兼容 Android 13 及以上。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 允许用户在系统界面明确授予后台省电白名单。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:name=".LimbusZhCNApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@drawable/app_icon"
+        android:label="@string/app_name"
+        android:roundIcon="@drawable/app_icon"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LimbusZhCN"
+        tools:targetApi="31">
+        <!-- 仅向系统安装器临时授权读取汉化器自身的更新 APK。 -->
+        <provider
+            android:name=".update.AppUpdateFileProvider"
+            android:authorities="${applicationId}.selfupdate.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/app_update_paths" />
+        </provider>
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.LimbusZhCN">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

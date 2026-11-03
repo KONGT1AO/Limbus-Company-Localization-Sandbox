@@ -1,0 +1,42 @@
+# Gradle & Build Caches
+.gradle/
+build/
+**/build/
+.cxx/
+**/.cxx/
+.kotlin/
+captures/
+
+# Local Environment & Secrets
+local.properties
+local.signing.properties
+*.signing.properties
+*.jks
+*.keystore
+*.p12
+*.key
+
+# IDE Configurations
+.idea/
+*.iml
+.vscode/
+
+# Binaries, Packages & Heavy Test Assets
+*.apk
+*.apks
+*.aab
+*.zip
+GEMINI_zh-CN/
+!app/src/main/assets/microg/*.apk
+
+# Internal Development, AI Agent Rules & Handoff History
+AGENTS.md
+HANDOFF_SUMMARY.md
+docs/HANDOFF_HISTORY_FULL.md
+docs/
+
+# Temporary Logs & OS Garbage
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
