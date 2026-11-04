@@ -197,8 +197,10 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
             if (LIMBUS_PACKAGE.equals(info.packageName)) {
                 targetOrientation = LimbusOrientationManager.resolveInitialOrientation(activity, info.screenOrientation);
             }
-            if (activity.getRequestedOrientation() == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                    && targetOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+            boolean shouldApplyOrientation = (activity.getRequestedOrientation() == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    && targetOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+                    || (LIMBUS_PACKAGE.equals(info.packageName) && targetOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+            if (shouldApplyOrientation) {
                 if (activity.getRequestedOrientation() != targetOrientation) {
                     ActivityManagerCompat.setActivityOrientation(activity, targetOrientation);
                     boolean needWait;
@@ -225,6 +227,9 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
             }
         }
         super.callActivityOnCreate(activity, icicle);
+        if (activity != null && LIMBUS_PACKAGE.equals(activity.getPackageName())) {
+            LimbusOrientationManager.get().applyLockedOrientation(activity);
+        }
         exposeMicrogLoginWebViewIfBridgeStalls(activity);
     }
 
