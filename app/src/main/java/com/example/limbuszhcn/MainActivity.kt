@@ -26,9 +26,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -67,6 +69,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -731,42 +734,74 @@ class MainActivity : ComponentActivity() {
                 )
 
                 if (showPackSelectionDialog) {
+                    val packCardShape = CutCornerShape(
+                        topStart = 0.dp,
+                        topEnd = 8.dp,
+                        bottomEnd = 0.dp,
+                        bottomStart = 8.dp
+                    )
                     AlertDialog(
                         onDismissRequest = { showPackSelectionDialog = false },
                         title = {
-                            Text(
-                                text = "汉化包管理与切换",
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.titleLarge
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(4.dp)
+                                        .height(20.dp)
+                                        .background(MaterialTheme.colorScheme.primary)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = "汉化包管理与切换",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.titleLarge
+                                )
+                            }
                         },
                         text = {
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .heightIn(max = 480.dp)
                                     .verticalScroll(rememberScrollState()),
-                                verticalArrangement = Arrangement.spacedBy(12.dp)
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text(
                                     text = "点击即可切换生效对应汉化包；启动游戏时将锁定所选版本，防止被覆盖：",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(bottom = 4.dp)
                                 )
 
                                 if (dropInCandidates.isNotEmpty()) {
-                                    Text(
-                                        text = "📁 热投递专区待导入 (${dropInCandidates.size})",
-                                        fontWeight = FontWeight.Bold,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .width(3.dp)
+                                                .height(13.dp)
+                                                .background(Color(0xFFE07A5F))
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "热投递专区待导入 (${dropInCandidates.size})",
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
                                     dropInCandidates.forEach { candidate ->
                                         Surface(
-                                            shape = RoundedCornerShape(8.dp),
-                                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                            shape = packCardShape,
+                                            color = Color(0xFF1E1E23),
                                             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)),
                                             modifier = Modifier
                                                 .fillMaxWidth()
+                                                .defaultMinSize(minHeight = 64.dp)
                                                 .clickable {
                                                     showPackSelectionDialog = false
                                                     runTask("正在解压并切换至汉化包 ${candidate.name}...") {
@@ -790,37 +825,76 @@ class MainActivity : ComponentActivity() {
                                                         installResultMessage(summary, imported.sourceLabel)
                                                     }
                                                 }
-                                                .padding(10.dp)
                                         ) {
-                                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                                Text(
-                                                    text = candidate.name,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    maxLines = 1,
-                                                    style = MaterialTheme.typography.bodyMedium
-                                                )
-                                                val sizeStr = if (candidate.sizeBytes > 0) {
-                                                    String.format(java.util.Locale.US, "%.1f MB", candidate.sizeBytes / (1024.0 * 1024.0))
-                                                } else {
-                                                    "文件夹"
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(
+                                                    modifier = Modifier.weight(1f),
+                                                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                                                ) {
+                                                    Text(
+                                                        text = candidate.name,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                        style = MaterialTheme.typography.bodyMedium
+                                                    )
+                                                    val sizeStr = if (candidate.sizeBytes > 0) {
+                                                        String.format(java.util.Locale.US, "%.1f MB", candidate.sizeBytes / (1024.0 * 1024.0))
+                                                    } else {
+                                                        "文件夹"
+                                                    }
+                                                    val verStr = if (candidate.versionHint.isNotBlank()) " · v${candidate.versionHint}" else ""
+                                                    Text(
+                                                        text = "$sizeStr$verStr · 待导入",
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                        fontSize = 11.5.sp,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
                                                 }
-                                                val verStr = if (candidate.versionHint.isNotBlank()) " · v${candidate.versionHint}" else ""
-                                                Text(
-                                                    text = "$sizeStr$verStr · 点击立即导入并生效",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Surface(
+                                                    shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+                                                ) {
+                                                    Text(
+                                                        text = "导入并生效",
+                                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                                    )
+                                                }
                                             }
                                         }
                                     }
                                 }
 
-                                Text(
-                                    text = "📦 已导入本地缓存 (${installedPatches.size})",
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(3.dp)
+                                            .height(13.dp)
+                                            .background(MaterialTheme.colorScheme.primary)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "已导入本地缓存 (${installedPatches.size})",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
                                 if (installedPatches.isEmpty()) {
                                     Text(
                                         text = "暂无已导入的汉化包，可通过“导入 .zip/.7z”或在线下载获取",
@@ -830,15 +904,15 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     installedPatches.forEach { patch ->
                                         Surface(
-                                            shape = RoundedCornerShape(8.dp),
-                                            color = if (patch.isActive) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                            shape = packCardShape,
+                                            color = if (patch.isActive) Color(0xFF2B191C) else Color(0xFF1B1B1E),
                                             border = BorderStroke(
-                                                if (patch.isActive) 2.dp else 1.dp,
-                                                if (patch.isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                                if (patch.isActive) 1.5.dp else 1.dp,
+                                                if (patch.isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.22f)
                                             ),
                                             modifier = Modifier
                                                 .fillMaxWidth()
+                                                .defaultMinSize(minHeight = 64.dp)
                                                 .clickable {
                                                     if (!patch.isActive) {
                                                         showPackSelectionDialog = false
@@ -849,33 +923,93 @@ class MainActivity : ComponentActivity() {
                                                         }
                                                     }
                                                 }
-                                                .padding(10.dp)
                                         ) {
                                             Row(
                                                 modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                                    Text("版本 v${patch.version}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
-                                                    Text("${patch.sourceLabel} · ${patch.jsonFileCount} 个 JSON 文件", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
                                                 if (patch.isActive) {
-                                                    Surface(
-                                                        shape = RoundedCornerShape(4.dp),
-                                                        color = MaterialTheme.colorScheme.primary,
-                                                        modifier = Modifier.padding(start = 8.dp)
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(3.5.dp)
+                                                            .height(36.dp)
+                                                            .background(MaterialTheme.colorScheme.primary)
+                                                    )
+                                                } else {
+                                                    Spacer(modifier = Modifier.width(3.5.dp))
+                                                }
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(
+                                                            start = 11.dp,
+                                                            end = 14.dp,
+                                                            top = 12.dp,
+                                                            bottom = 12.dp
+                                                        ),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Column(
+                                                        modifier = Modifier.weight(1f),
+                                                        verticalArrangement = Arrangement.spacedBy(3.dp)
                                                     ) {
                                                         Text(
-                                                            text = "当前生效",
-                                                            color = MaterialTheme.colorScheme.onPrimary,
-                                                            style = MaterialTheme.typography.labelSmall,
+                                                            text = "版本 v${patch.version}",
                                                             fontWeight = FontWeight.Bold,
-                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            style = MaterialTheme.typography.bodyMedium,
+                                                            color = if (patch.isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                        Text(
+                                                            text = "${patch.sourceLabel} · ${patch.jsonFileCount} 个 JSON 文件",
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            fontSize = 11.5.sp,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                                         )
                                                     }
-                                                } else {
-                                                    Text("点击生效", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                    if (patch.isActive) {
+                                                        Surface(
+                                                            shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                                            color = MaterialTheme.colorScheme.primary
+                                                        ) {
+                                                            Row(
+                                                                verticalAlignment = Alignment.CenterVertically,
+                                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                                            ) {
+                                                                Box(
+                                                                    modifier = Modifier
+                                                                        .size(6.dp)
+                                                                        .clip(RoundedCornerShape(3.dp))
+                                                                        .background(MaterialTheme.colorScheme.onPrimary)
+                                                                )
+                                                                Spacer(modifier = Modifier.width(5.dp))
+                                                                Text(
+                                                                    text = "当前生效",
+                                                                    color = MaterialTheme.colorScheme.onPrimary,
+                                                                    style = MaterialTheme.typography.labelSmall,
+                                                                    fontWeight = FontWeight.Bold
+                                                                )
+                                                            }
+                                                        }
+                                                    } else {
+                                                        Surface(
+                                                            shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                                                        ) {
+                                                            Text(
+                                                                text = "点击切换",
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                color = MaterialTheme.colorScheme.primary,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                                            )
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
