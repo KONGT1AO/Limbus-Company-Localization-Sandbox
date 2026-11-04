@@ -1,5 +1,7 @@
 package com.example.limbuszhcn
 
+import com.lody.virtual.client.hook.delegate.LimbusOrientationManager
+
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -194,6 +196,9 @@ class MainActivity : ComponentActivity() {
             var resourceCancellation by remember { mutableStateOf<AtomicBoolean?>(null) }
             var pendingDiagnosticArchive by remember { mutableStateOf<File?>(null) }
             var showPackSelectionDialog by remember { mutableStateOf(false) }
+            var screenOrientationMode by remember {
+                mutableStateOf(LimbusOrientationManager.getOrientationMode(this@MainActivity))
+            }
             var installedPatches by remember { mutableStateOf<List<CachedPatchMetadata>>(emptyList()) }
             var dropInCandidates by remember { mutableStateOf<List<GeminiLangPackImporter.DropInCandidate>>(emptyList()) }
             var message by remember {
@@ -696,6 +701,11 @@ class MainActivity : ComponentActivity() {
                             pendingGameRestartForNewIndex = true
                             installResultMessage(summary, "在线下载汉化包")
                         }
+                    },
+                    screenOrientationMode = screenOrientationMode,
+                    onScreenOrientationModeChange = { mode ->
+                        screenOrientationMode = mode
+                        LimbusOrientationManager.setOrientationMode(this@MainActivity, mode)
                     },
                     onExportResources = {
                         val stamp = java.time.LocalDateTime.now()

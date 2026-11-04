@@ -295,10 +295,15 @@ public class HCallbackStub implements Handler.Callback, IInjector {
             getH().sendMessageAtFrontOfQueue(Message.obtain(msg));
             return false;
         }
-        if (info.screenOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED && token != null) {
+        int stubOrientation = info.screenOrientation;
+        if ("com.ProjectMoon.LimbusCompany".equals(info.packageName)) {
+            stubOrientation = com.lody.virtual.client.hook.delegate.LimbusOrientationManager.resolveInitialOrientation(
+                    VirtualCore.get().getContext(), info.screenOrientation);
+        }
+        if (stubOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED && token != null) {
             try {
                 IActivityManager.setRequestedOrientation.call(ActivityManagerNative.getDefault.call(),
-                        token, info.screenOrientation);
+                        token, stubOrientation);
             } catch (Throwable e) {
                 e.printStackTrace();
             }

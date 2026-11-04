@@ -1,5 +1,7 @@
 package com.example.limbuszhcn
 
+import com.lody.virtual.client.hook.delegate.LimbusOrientationManager
+
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -105,7 +107,9 @@ internal fun LimbusPeScreenRedesign(
     onPullFromGithubClick: () -> Unit,
     onExportResources: () -> Unit,
     onImportResources: () -> Unit,
-    onExportDebugLogs: () -> Unit
+    onExportDebugLogs: () -> Unit,
+    screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
+    onScreenOrientationModeChange: (Int) -> Unit = {}
 ) {
     var selectedTab by remember { mutableStateOf(HostTab.Launch) }
     val launchHint = when {
@@ -167,6 +171,8 @@ internal fun LimbusPeScreenRedesign(
                     containerStatus = containerStatus,
                     githubReleaseUrl = githubReleaseUrl,
                     busy = busy,
+                    screenOrientationMode = screenOrientationMode,
+                    onScreenOrientationModeChange = onScreenOrientationModeChange,
                     onSyncInstalledGame = onSyncInstalledGame,
                     onGithubReleaseUrlChange = onGithubReleaseUrlChange,
                     onPullFromGithubClick = onPullFromGithubClick,
@@ -710,7 +716,9 @@ private fun MaintenancePage(
     onPullFromGithubClick: () -> Unit,
     onExportResources: () -> Unit,
     onImportResources: () -> Unit,
-    onExportDebugLogs: () -> Unit
+    onExportDebugLogs: () -> Unit,
+    screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
+    onScreenOrientationModeChange: (Int) -> Unit = {}
 ) {
     PageColumn {
         PageHeading(
@@ -734,6 +742,72 @@ private fun MaintenancePage(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("手动重新同步宿主机游戏 APK")
+            }
+        }
+        SectionCard(
+            title = "横屏方向与旋转",
+            badge = when (screenOrientationMode) {
+                LimbusOrientationManager.MODE_AUTO_SENSOR -> "双向自适应"
+                LimbusOrientationManager.MODE_REVERSE_LANDSCAPE -> "锁定反向"
+                LimbusOrientationManager.MODE_LANDSCAPE -> "锁定常规"
+                else -> "系统原生"
+            }
+        ) {
+            Text(
+                text = "针对手机开启竖屏锁定（系统关闭自动旋转）进行专项适配。默认突破系统锁定，在横屏下可随握持姿态自由翻转，且默认以音量键朝上为正方向。",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                val modes = listOf(
+                    Triple(LimbusOrientationManager.MODE_AUTO_SENSOR, "智能双向旋转 (推荐)", "突破竖屏锁定 · 默认音量键朝上"),
+                    Triple(LimbusOrientationManager.MODE_REVERSE_LANDSCAPE, "锁定反向横屏", "音量键始终朝上 · 防误触按键"),
+                    Triple(LimbusOrientationManager.MODE_LANDSCAPE, "锁定常规横屏", "音量键始终朝下 · 传统默认方向"),
+                    Triple(LimbusOrientationManager.MODE_SYSTEM, "系统原生托管", "保持系统与游戏默认行为")
+                )
+                modes.forEach { (mode, title, desc) ->
+                    val selected = screenOrientationMode == mode
+                    Surface(
+                        onClick = { onScreenOrientationModeChange(mode) },
+                        shape = CutCornerShape(topEnd = 6.dp, bottomStart = 6.dp),
+                        color = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                        border = BorderStroke(
+                            1.dp,
+                            if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = title,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = desc,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                            if (selected) {
+                                Text(
+                                    text = "● 已生效",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
         SectionCard(

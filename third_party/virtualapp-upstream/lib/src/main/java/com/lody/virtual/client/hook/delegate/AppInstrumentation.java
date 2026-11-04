@@ -193,14 +193,18 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
             if (info.theme != 0 && !microgThemeRebuilt) {
                 activity.setTheme(info.theme);
             }
+            int targetOrientation = info.screenOrientation;
+            if (LIMBUS_PACKAGE.equals(info.packageName)) {
+                targetOrientation = LimbusOrientationManager.resolveInitialOrientation(activity, info.screenOrientation);
+            }
             if (activity.getRequestedOrientation() == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                    && info.screenOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
-                if (activity.getRequestedOrientation() != info.screenOrientation) {
-                    ActivityManagerCompat.setActivityOrientation(activity, info.screenOrientation);
+                    && targetOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+                if (activity.getRequestedOrientation() != targetOrientation) {
+                    ActivityManagerCompat.setActivityOrientation(activity, targetOrientation);
                     boolean needWait;
                     //set orientation
                     Configuration configuration = activity.getResources().getConfiguration();
-                    if (isOrientationLandscape(info.screenOrientation)) {
+                    if (isOrientationLandscape(targetOrientation)) {
                         needWait = configuration.orientation != Configuration.ORIENTATION_LANDSCAPE;
                         configuration.orientation = Configuration.ORIENTATION_LANDSCAPE;
                     } else {
@@ -215,6 +219,9 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
                         }
                     }
                 }
+            }
+            if (LIMBUS_PACKAGE.equals(info.packageName)) {
+                LimbusOrientationManager.get().attach(activity);
             }
         }
         super.callActivityOnCreate(activity, icicle);
@@ -636,6 +643,9 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
     @Override
     public void callActivityOnResume(Activity activity) {
         applyLimbusThreadContextClassLoader(mirror.android.app.Activity.mActivityInfo.get(activity), "callActivityOnResume");
+        if (activity != null && LIMBUS_PACKAGE.equals(activity.getPackageName())) {
+            LimbusOrientationManager.get().onResume(activity);
+        }
         super.callActivityOnResume(activity);
         Intent intent = activity.getIntent();
         if (intent != null) {
@@ -677,6 +687,9 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
     @Override
     public void callActivityOnDestroy(Activity activity) {
         try {
+            if (activity != null && LIMBUS_PACKAGE.equals(activity.getPackageName())) {
+                LimbusOrientationManager.get().onDestroy(activity);
+            }
             super.callActivityOnDestroy(activity);
         } finally {
             // 保留目标 onDestroy 内的合法调用查询；生命周期返回或抛错后都不再持有该页面的身份。
@@ -686,6 +699,9 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
 
     @Override
     public void callActivityOnPause(Activity activity) {
+        if (activity != null && LIMBUS_PACKAGE.equals(activity.getPackageName())) {
+            LimbusOrientationManager.get().onPause(activity);
+        }
         super.callActivityOnPause(activity);
     }
 
