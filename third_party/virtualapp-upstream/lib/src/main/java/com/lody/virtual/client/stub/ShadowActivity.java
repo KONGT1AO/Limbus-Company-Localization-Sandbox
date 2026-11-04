@@ -210,6 +210,22 @@ public abstract class ShadowActivity extends Activity {
         }
     }
 
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        try {
+            if ("com.ProjectMoon.LimbusCompany".equals(VClient.get().getCurrentPackage())) {
+                Log.i(TAG, "ShadowActivity onDestroy for game, stopping KeepAliveService");
+                KeepAliveService.stop(this);
+                android.app.NotificationManager nm = (android.app.NotificationManager) getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+                if (nm != null) {
+                    nm.cancel(HiddenForeNotification.FOREGROUND_NOTIFICATION_ID);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static class P0 extends ShadowActivity {
     }
 

@@ -1,4 +1,4 @@
-﻿import java.util.Properties
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -20,8 +20,8 @@ android {
         applicationId = "io.limbuspe.box"
         minSdk = 26
         targetSdk = 35
-        versionCode = 214
-        versionName = "1.0.0"
+        versionCode = 215
+        versionName = "1.0.1"
 
         ndk {
             abiFilters += "arm64-v8a"

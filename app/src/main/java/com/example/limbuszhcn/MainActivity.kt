@@ -146,6 +146,7 @@ class MainActivity : ComponentActivity() {
             TAG,
             "MainActivity.onCreate pid=${Process.myPid()} taskId=$taskId intent=${intent.describeForLog()}"
         )
+        LauncherTaskWatcherService.start(applicationContext)
         launchContainerGameFromDebugIntent(intent)
         enableEdgeToEdge()
 
@@ -189,6 +190,9 @@ class MainActivity : ComponentActivity() {
             }
             var resourceCancellation by remember { mutableStateOf<AtomicBoolean?>(null) }
             var pendingDiagnosticArchive by remember { mutableStateOf<File?>(null) }
+            var showPackSelectionDialog by remember { mutableStateOf(false) }
+            var installedPatches by remember { mutableStateOf<List<CachedPatchMetadata>>(emptyList()) }
+            var dropInCandidates by remember { mutableStateOf<List<GeminiLangPackImporter.DropInCandidate>>(emptyList()) }
             var message by remember {
                 mutableStateOf(containerStatus.message)
             }
@@ -201,12 +205,16 @@ class MainActivity : ComponentActivity() {
                 val meta = runCatching { installer?.latestCachedPatchMetadata() }.getOrNull()
                 val font = runCatching { geminiImporter.describeActiveFont() }.getOrDefault("未检测")
                 val report = runCatching { deviceCompatibility.report() }.getOrNull()
+                val patches = runCatching { installer?.listInstalledPatches() }.getOrNull().orEmpty()
+                val candidates = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
                 runOnUiThread {
                     containerStatus = status
                     gameRunning = running
                     lastInstall = active
                     cachedMeta = meta
                     fontStatus = font
+                    installedPatches = patches
+                    dropInCandidates = candidates
                     if (report != null) {
                         compatibilityReport = report
                     }
@@ -556,10 +564,22 @@ class MainActivity : ComponentActivity() {
                                     val summary = installer.refreshActiveRedirects()
                                     installResultMessage(summary)
                                 } else {
-                                    "已开启汉化模式，请导入 GEMINI_zh-CN 汉化包"
+                                    "已开启汉化模式，请导入中文汉化包"
                                 }
                             }
                         }
+                    },
+                    onManagePacksClick = {
+                        showPackSelectionDialog = true
+                        Thread {
+                            val installer = runCatching { createInstaller() }.getOrNull()
+                            val patches = runCatching { installer?.listInstalledPatches() }.getOrNull().orEmpty()
+                            val candidates = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
+                            runOnUiThread {
+                                installedPatches = patches
+                                dropInCandidates = candidates
+                            }
+                        }.start()
                     },
                     onImportArchiveClick = {
                         openArchiveLauncher.launch(
@@ -666,9 +686,12 @@ class MainActivity : ComponentActivity() {
                             require(readContainerStatus().gameImported) { "请先点击一次启动或同步正版游戏以初始化容器" }
                             val url = githubReleaseUrl.trim()
                             require(url.isNotBlank()) { "请填写有效的 GitHub Releases 地址" }
-                            val summary = createInstaller().installFromGitHub(url)
+                            val summary = createInstaller().installFromGitHub(
+                                releaseUrl = url,
+                                downloadDirectory = dropInDir.toPath()
+                            )
                             pendingGameRestartForNewIndex = true
-                            installResultMessage(summary, "GitHub Releases")
+                            installResultMessage(summary, "在线下载汉化包")
                         }
                     },
                     onExportResources = {
@@ -706,6 +729,167 @@ class MainActivity : ComponentActivity() {
                         }.start()
                     }
                 )
+
+                if (showPackSelectionDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showPackSelectionDialog = false },
+                        title = {
+                            Text(
+                                text = "汉化包管理与切换",
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.titleLarge
+                            )
+                        },
+                        text = {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Text(
+                                    text = "点击即可切换生效对应汉化包；启动游戏时将锁定所选版本，防止被覆盖：",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+
+                                if (dropInCandidates.isNotEmpty()) {
+                                    Text(
+                                        text = "📁 热投递专区待导入 (${dropInCandidates.size})",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    dropInCandidates.forEach { candidate ->
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    showPackSelectionDialog = false
+                                                    runTask("正在解压并切换至汉化包 ${candidate.name}...") {
+                                                        val imported = if (candidate.isArchive) {
+                                                            geminiImporter.importFromArchiveFile(
+                                                                archiveFile = candidate.file,
+                                                                originalNameHint = candidate.name,
+                                                                sourceLabel = "热投递专区 (${candidate.name})"
+                                                            )
+                                                        } else {
+                                                            geminiImporter.importFromLocalDirectory(
+                                                                sourceDir = candidate.file.toPath(),
+                                                                sourceLabel = "热投递文件夹 (${candidate.name})"
+                                                            )
+                                                        }
+                                                        pendingGameRestartForNewIndex = true
+                                                        val summary = createInstaller().activateRedirect(
+                                                            imported.extraction.outputDirectory,
+                                                            imported.extraction.manifest
+                                                        )
+                                                        installResultMessage(summary, imported.sourceLabel)
+                                                    }
+                                                }
+                                                .padding(10.dp)
+                                        ) {
+                                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                                Text(
+                                                    text = candidate.name,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                    style = MaterialTheme.typography.bodyMedium
+                                                )
+                                                val sizeStr = if (candidate.sizeBytes > 0) {
+                                                    String.format(java.util.Locale.US, "%.1f MB", candidate.sizeBytes / (1024.0 * 1024.0))
+                                                } else {
+                                                    "文件夹"
+                                                }
+                                                val verStr = if (candidate.versionHint.isNotBlank()) " · v${candidate.versionHint}" else ""
+                                                Text(
+                                                    text = "$sizeStr$verStr · 点击立即导入并生效",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text(
+                                    text = "📦 已导入本地缓存 (${installedPatches.size})",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                if (installedPatches.isEmpty()) {
+                                    Text(
+                                        text = "暂无已导入的汉化包，可通过“导入 .zip/.7z”或在线下载获取",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                } else {
+                                    installedPatches.forEach { patch ->
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (patch.isActive) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                            border = BorderStroke(
+                                                if (patch.isActive) 2.dp else 1.dp,
+                                                if (patch.isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                            ),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    if (!patch.isActive) {
+                                                        showPackSelectionDialog = false
+                                                        runTask("正在切换至汉化包 v${patch.version}...") {
+                                                            val summary = createInstaller().activatePatchByVersion(patch.version)
+                                                            pendingGameRestartForNewIndex = true
+                                                            installResultMessage(summary, "切换汉化包")
+                                                        }
+                                                    }
+                                                }
+                                                .padding(10.dp)
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                                    Text("版本 v${patch.version}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+                                                    Text("${patch.sourceLabel} · ${patch.jsonFileCount} 个 JSON 文件", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                }
+                                                if (patch.isActive) {
+                                                    Surface(
+                                                        shape = RoundedCornerShape(4.dp),
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.padding(start = 8.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = "当前生效",
+                                                            color = MaterialTheme.colorScheme.onPrimary,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = FontWeight.Bold,
+                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                        )
+                                                    }
+                                                } else {
+                                                    Text("点击生效", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { showPackSelectionDialog = false }) {
+                                Text("关闭")
+                            }
+                        }
+                    )
+                }
             }
         }
     }
@@ -1085,9 +1269,9 @@ private fun LimbusPeScreen(
                 }
             }
 
-            // 卡片 3：GEMINI_zh-CN 汉化包与 TTF 字体
+            // 卡片 3：中文汉化包与字体
             SectionCard(
-                title = "3. GEMINI_zh-CN 汉化包与 TTF 字体",
+                title = "3. 中文汉化包与字体",
                 badge = if (translationEnabled) "汉化开启" else "原版直连"
             ) {
                 Row(
@@ -1369,6 +1553,7 @@ private fun LimbusPeScreenPreview() {
             message = "沙箱环境与汉化索引已就绪",
             onCancelTask = null,
             onToggleTranslationEnabled = {},
+            onManagePacksClick = {},
             onImportArchiveClick = {},
             onImportFolderClick = {},
             onScanDropInAndRefreshClick = {},

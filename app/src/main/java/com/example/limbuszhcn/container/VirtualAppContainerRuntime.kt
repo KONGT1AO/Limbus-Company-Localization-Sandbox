@@ -376,12 +376,9 @@ private class VirtualAppReflectionBridge(
 
     private fun waitForGameTaskForeground(packageName: String, timeoutMillis: Long): Boolean {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-            ?: return isGameRunning(packageName)
+            ?: return false
         val deadline = SystemClock.elapsedRealtime() + timeoutMillis
         do {
-            if (isGameRunning(packageName)) {
-                return true
-            }
             val foregroundTask = runCatching {
                 activityManager.getRunningTasks(1).firstOrNull()
             }.getOrNull()

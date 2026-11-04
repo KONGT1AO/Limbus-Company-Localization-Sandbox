@@ -23,6 +23,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 允许用户在系统界面明确授予后台省电白名单。 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 热投递专区支持用户自由从公共 Download 目录存取汉化包文件 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
     <application
         android:name=".LimbusZhCNApplication"
@@ -45,6 +50,11 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/app_update_paths" />
         </provider>
+        <service
+            android:name=".LauncherTaskWatcherService"
+            android:exported="false"
+            android:stopWithTask="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
