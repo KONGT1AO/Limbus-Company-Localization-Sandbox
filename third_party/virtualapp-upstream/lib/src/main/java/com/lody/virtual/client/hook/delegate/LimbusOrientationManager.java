@@ -137,9 +137,11 @@ public class LimbusOrientationManager {
     public static int resolveInitialOrientation(Context context, int fallbackOrientation) {
         int mode = getOrientationMode(context);
         if (mode == MODE_LANDSCAPE) {
-            return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
-        } else {
+            // 模式 1：物理音量键在下方
             return ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+        } else {
+            // 模式 0（推荐）：物理音量键在上方（防按键误触）
+            return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
         }
     }
 
@@ -150,7 +152,7 @@ public class LimbusOrientationManager {
         if (activity == null || activity.isFinishing()) {
             return;
         }
-        int target = resolveInitialOrientation(activity, ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE);
+        int target = resolveInitialOrientation(activity, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
         try {
             int current = activity.getRequestedOrientation();
             if (current != target) {
