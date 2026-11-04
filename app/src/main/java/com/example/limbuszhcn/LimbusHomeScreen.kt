@@ -745,16 +745,11 @@ private fun MaintenancePage(
             }
         }
         SectionCard(
-            title = "横屏方向与旋转",
-            badge = when (screenOrientationMode) {
-                LimbusOrientationManager.MODE_AUTO_SENSOR -> "双向自适应"
-                LimbusOrientationManager.MODE_REVERSE_LANDSCAPE -> "锁定反向"
-                LimbusOrientationManager.MODE_LANDSCAPE -> "锁定常规"
-                else -> "系统原生"
-            }
+            title = "横屏方向锁定",
+            badge = if (screenOrientationMode == LimbusOrientationManager.MODE_LANDSCAPE) "常规横屏" else "反向横屏"
         ) {
             Text(
-                text = "针对手机开启竖屏锁定（系统关闭自动旋转）进行专项适配。默认突破系统锁定，在横屏下可随握持姿态自由翻转，且默认以音量键朝上为正方向。",
+                text = "针对手机开启竖屏锁定（系统关闭自动旋转）进行专项适配。可自由指定游戏横屏朝向，告别误触音量键与锁屏按键，进入游戏直接锁定。",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
@@ -763,10 +758,16 @@ private fun MaintenancePage(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 val modes = listOf(
-                    Triple(LimbusOrientationManager.MODE_AUTO_SENSOR, "智能双向旋转 (推荐)", "突破竖屏锁定 · 默认音量键朝上"),
-                    Triple(LimbusOrientationManager.MODE_REVERSE_LANDSCAPE, "锁定反向横屏", "音量键始终朝上 · 防误触按键"),
-                    Triple(LimbusOrientationManager.MODE_LANDSCAPE, "锁定常规横屏", "音量键始终朝下 · 传统默认方向"),
-                    Triple(LimbusOrientationManager.MODE_SYSTEM, "系统原生托管", "保持系统与游戏默认行为")
+                    Triple(
+                        LimbusOrientationManager.MODE_REVERSE_LANDSCAPE,
+                        "锁定反向横屏 (推荐)",
+                        "音量键始终朝上 · 避免双手握持误触按键（惯用推荐）"
+                    ),
+                    Triple(
+                        LimbusOrientationManager.MODE_LANDSCAPE,
+                        "锁定常规横屏",
+                        "音量键始终朝下 · 传统原生默认方向"
+                    )
                 )
                 modes.forEach { (mode, title, desc) ->
                     val selected = screenOrientationMode == mode
