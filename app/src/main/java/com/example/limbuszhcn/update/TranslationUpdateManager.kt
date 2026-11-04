@@ -126,7 +126,7 @@ internal class GitHubTranslationReleaseClient(
         val version = tag.toLongOrNull()
             ?: throw TranslationProtocolException("GitHub release tag is not numeric: $tag")
         val asset = pickMainAsset(releaseJson, version)
-            ?: throw TranslationProtocolException("GitHub release does not contain LimbusLocalize_${version}.7z")
+            ?: throw TranslationProtocolException("GitHub release does not contain LimbusLocalize_${version}.zip / .7z")
         return GitHubTranslationRelease(
             version = version,
             assetUrl = source.validatedAssetUrl(asset.url, tag, version),
@@ -135,11 +135,13 @@ internal class GitHubTranslationReleaseClient(
     }
 
     private fun pickMainAsset(json: String, version: Long): GitHubAsset? {
-        val expected = "LimbusLocalize_${version}.7z"
+        val candidates = listOf("LimbusLocalize_${version}.zip", "LimbusLocalize_${version}.7z")
         return ASSET_FIELDS.findAll(json)
             .mapNotNull { match ->
                 val name = match.groupValues[1].jsonUnescape()
-                if (!name.equals(expected, ignoreCase = true)) {
+                val matches = candidates.any { it.equals(name, ignoreCase = true) } ||
+                    (name.startsWith("LimbusLocalize", ignoreCase = true) && (name.endsWith(".zip", true) || name.endsWith(".7z", true)))
+                if (!matches) {
                     return@mapNotNull null
                 }
                 val digest = match.groupValues[2].jsonUnescape()
@@ -153,7 +155,10 @@ internal class GitHubTranslationReleaseClient(
                     sha256 = digest.removePrefix("sha256:").lowercase().takeIf { it.isNotBlank() }
                 )
             }
-            .sortedWith(compareByDescending<GitHubAsset> { it.name.equals(expected, ignoreCase = true) })
+            .sortedWith(
+                compareByDescending<GitHubAsset> { it.name.equals("LimbusLocalize_${version}.zip", ignoreCase = true) }
+                    .thenByDescending { it.name.equals("LimbusLocalize_${version}.7z", ignoreCase = true) }
+            )
             .firstOrNull()
     }
 
@@ -237,7 +242,8 @@ internal class TranslationPackageDownloader(
             .validatedAssetUrl(request.url, parts[4], request.version.toLongOrNull()
                 ?: throw TranslationProtocolException("Archive version is not numeric"))
         request.destinationDirectory.createDirectories()
-        val finalFile = request.destinationDirectory.resolve("LimbusLocalize_${request.version}.7z")
+        val extension = if (request.url.contains(".zip", ignoreCase = true)) ".zip" else ".7z"
+        val finalFile = request.destinationDirectory.resolve("LimbusLocalize_${request.version}$extension")
         if (finalFile.exists() && request.expectedSha256 != null && sha256(finalFile) == request.expectedSha256) {
             return DownloadResult(finalFile, fromCache = true)
         }

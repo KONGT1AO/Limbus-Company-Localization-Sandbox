@@ -92,6 +92,7 @@ internal fun LimbusPeScreenRedesign(
     message: String,
     onCancelTask: (() -> Unit)?,
     onToggleTranslationEnabled: (Boolean) -> Unit,
+    onManagePacksClick: () -> Unit = {},
     onImportArchiveClick: () -> Unit,
     onImportFolderClick: () -> Unit,
     onScanDropInAndRefreshClick: () -> Unit,
@@ -156,6 +157,7 @@ internal fun LimbusPeScreenRedesign(
                     translationEnabled = translationEnabled,
                     busy = busy,
                     onToggleTranslationEnabled = onToggleTranslationEnabled,
+                    onManagePacksClick = onManagePacksClick,
                     onImportArchiveClick = onImportArchiveClick,
                     onImportFolderClick = onImportFolderClick,
                     onScanDropInAndRefreshClick = onScanDropInAndRefreshClick
@@ -583,6 +585,7 @@ private fun TranslationPage(
     translationEnabled: Boolean,
     busy: Boolean,
     onToggleTranslationEnabled: (Boolean) -> Unit,
+    onManagePacksClick: () -> Unit = {},
     onImportArchiveClick: () -> Unit,
     onImportFolderClick: () -> Unit,
     onScanDropInAndRefreshClick: () -> Unit
@@ -638,28 +641,36 @@ private fun TranslationPage(
             HorizontalDivider(
                 color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
             )
-            StatusLine(label = "汉化版本", value = versionDisplay)
+            StatusLine(label = "当前汉化版本", value = versionDisplay)
             StatusLine(label = "本地化文件", value = jsonCountDisplay)
             StatusLine(label = "中文字体", value = fontStatus)
             if (!cachedMeta?.notice.isNullOrBlank()) {
                 InfoStrip(cachedMeta?.notice.orEmpty())
             }
-            StatusLine(label = "热投递目录", value = dropInPath)
+            StatusLine(label = "公共热投递专区", value = dropInPath)
             Text(
-                text = "运行时会锁定游戏日语槽位，并按需生成中文 SDF 字体图集，不改写原版校验文件。",
+                text = "支持直接放入零协会、GEMINI 等任意符合规范的中文汉化包，运行时自动对齐，不改写游戏校验文件。",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
         }
         SectionCard(
-            title = "导入与重建",
-            badge = "本地资源"
+            title = "汉化包管理与导入",
+            badge = "自由切换"
         ) {
+            Button(
+                onClick = onManagePacksClick,
+                enabled = !busy,
+                shape = ControlShape,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("📑 切换 / 管理汉化包")
+            }
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Button(
+                OutlinedButton(
                     onClick = onImportArchiveClick,
                     enabled = !busy,
                     shape = ControlShape,
@@ -682,7 +693,7 @@ private fun TranslationPage(
                 shape = ControlShape,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("扫描热投递目录并重建索引")
+                Text("扫描热投递专区并对齐")
             }
         }
         Spacer(modifier = Modifier.height(4.dp))

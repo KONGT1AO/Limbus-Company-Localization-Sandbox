@@ -83,8 +83,10 @@ internal data class GitHubReleaseSource(
      */
     fun validatedAssetUrl(url: String, releaseTag: String, version: Long): String {
         val uri = githubHttpsUri(url)
-        val expectedPath = "/$owner/$repository/releases/download/$releaseTag/LimbusLocalize_$version.7z"
-        if (!uri.host.equals("github.com", ignoreCase = true) || !uri.rawPath.equals(expectedPath, ignoreCase = true)
+        val expectedPrefix = "/$owner/$repository/releases/download/$releaseTag/LimbusLocalize_$version"
+        val matches = uri.rawPath.equals("$expectedPrefix.zip", ignoreCase = true) ||
+            uri.rawPath.equals("$expectedPrefix.7z", ignoreCase = true)
+        if (!uri.host.equals("github.com", ignoreCase = true) || !matches
             || uri.rawQuery != null || uri.rawFragment != null
         ) {
             throw TranslationProtocolException("GitHub asset does not match the selected repository, tag and archive")
@@ -177,7 +179,7 @@ internal class GitHubReleasePageFallback(
             .firstOrNull() ?: throw TranslationProtocolException("Missing official GitHub release asset fragment")
         val releaseTag = fragment.first
         val version = releaseTag.toLong()
-        val expectedName = "LimbusLocalize_$version.7z"
+        val expectedNames = listOf("LimbusLocalize_$version.zip", "LimbusLocalize_$version.7z")
         val assets = readPage(fragment.second, 512 * 1024)
         var rowDepth = 0
         var officialRow = false
@@ -207,7 +209,7 @@ internal class GitHubReleasePageFallback(
                         assetUrl = valid
                     }
                 } else if (tag.name == "clipboard-copy"
-                    && tag.attributes["aria-label"] == "Copy to clipboard digest for $expectedName"
+                    && expectedNames.any { tag.attributes["aria-label"] == "Copy to clipboard digest for $it" }
                 ) {
                     val value = tag.attributes["value"].orEmpty()
                     if (!SHA256.matches(value)) throw TranslationProtocolException("Invalid published GitHub SHA-256")
@@ -217,7 +219,7 @@ internal class GitHubReleasePageFallback(
                 }
             }
         }
-        throw TranslationProtocolException("Official GitHub release does not contain $expectedName with SHA-256")
+        throw TranslationProtocolException("Official GitHub release does not contain LimbusLocalize_$version.zip/.7z with SHA-256")
     }
 
     private fun readPage(url: String, maxBytes: Int): String {

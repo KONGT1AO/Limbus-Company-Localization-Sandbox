@@ -97,4 +97,70 @@ class GeminiLangPackImporterTest {
         Files.write(jpNew, """{"dataList":[{"id":1,"content":"新規イベント"}]}""".toByteArray(Charsets.UTF_8))
         assertTrue(installer.shouldRecompileForCurrentResources())
     }
+
+    @Test
+    fun `switching active pack pins user choice and does not get reverted by older higher version patch`() {
+        val root = tempFolder.newFolder("workspace_multi").toPath()
+        val cacheRoot = root.resolve("translation-cache")
+        val localizeRoot = root.resolve("Localize")
+
+        // 1. 准备官方日文资源
+        val jpSkill = localizeRoot.resolve("jp/JP_Skills.json")
+        Files.createDirectories(jpSkill.parent)
+        Files.write(jpSkill, """{"dataList":[{"id":101,"name":"日文技能"}]}""".toByteArray(Charsets.UTF_8))
+
+        val storage = ContainerWorkspaceStorage(localizeRoot)
+        val installer = ContainerPatchInstaller(cacheRoot, storage)
+        val importer = GeminiLangPackImporter(cacheRoot)
+
+        // 2. 先导入高版本号的旧包（v2026110101）
+        val highZip = root.resolve("OldHighVersion.zip").toFile()
+        ZipOutputStream(FileOutputStream(highZip)).use { zos ->
+            zos.putNextEntry(ZipEntry("Info/version.json"))
+            zos.write("""{"version": 2026110101}""".toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+            zos.putNextEntry(ZipEntry("Skills.json"))
+            zos.write("""{"dataList":[{"id":101,"name":"高版本旧译文"}]}""".toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+        }
+        val highResult = importer.importFromArchiveFile(highZip, sourceLabel = "旧高版本")
+        val highSummary = installer.activateRedirect(highResult.extraction.outputDirectory, highResult.extraction.manifest)
+        assertTrue(highSummary.indexActivated)
+        assertEquals("2026110101", installer.activeInstallSummary()?.version)
+
+        // 3. 用户手动导入较低版本号的新包（零协会 2026103002）
+        val llcZip = root.resolve("LimbusLocalize_2026103002.zip").toFile()
+        ZipOutputStream(FileOutputStream(llcZip)).use { zos ->
+            zos.putNextEntry(ZipEntry("LimbusCompany_Data/Lang/LLC_zh-CN/Info/version.json"))
+            zos.write("""{"version": 2026103002}""".toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+            zos.putNextEntry(ZipEntry("LimbusCompany_Data/Lang/LLC_zh-CN/Skills.json"))
+            zos.write("""{"dataList":[{"id":101,"name":"零协会新译文"}]}""".toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+        }
+        val llcResult = importer.importFromArchiveFile(llcZip, sourceLabel = "零协会")
+        val llcSummary = installer.activateRedirect(llcResult.extraction.outputDirectory, llcResult.extraction.manifest)
+        assertTrue(llcSummary.indexActivated)
+
+        // 验证当前生效版本已被切换并锁定为零协会 2026103002
+        assertEquals("2026103002", installer.activeInstallSummary()?.version)
+        assertEquals("2026103002", installer.pinnedPatchVersion())
+
+        // 启动游戏前的重编检查：绝对不能因为 patch-cache 中存在数值更大的 2026110101 就反冲触发重编！
+        assertFalse(installer.shouldRecompileForCurrentResources())
+        val refreshed = installer.refreshActiveRedirects()
+        assertEquals("2026103002", refreshed.version)
+        assertEquals("2026103002", installer.activeInstallSummary()?.version)
+
+        // 验证已安装补丁列表能够列出两个包，且零协会包处于 active 状态
+        val installedList = installer.listInstalledPatches()
+        assertEquals(2, installedList.size)
+        val activePack = installedList.first { it.isActive }
+        assertEquals("2026103002", activePack.version)
+
+        // 4. 用户若主动点击切回高版本旧包，可成功自由切换
+        val switchedBack = installer.activatePatchByVersion("2026110101")
+        assertEquals("2026110101", switchedBack.version)
+        assertEquals("2026110101", installer.pinnedPatchVersion())
+    }
 }

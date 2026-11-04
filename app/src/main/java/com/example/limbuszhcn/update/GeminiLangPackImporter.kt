@@ -33,9 +33,8 @@ import kotlin.io.path.outputStream
 /**
  * 本地汉化包全格式导入与热投递扫描引擎。
  *
- * 专门适配 `GEMINI_zh-CN` 目录结构（无语言前缀 JSON、6 大子目录、`Info/version.json`、`Font/Context/ChineseFont.ttf`），
- * 同时兼容 `.zip`、`.7z`、SAF 文件夹、固定热投递目录 `/sdcard/Android/data/io.limbuspe.box/files/DropIn_Lang_Pack`
- * 以及 v1.0.0 旧版缓存的自动无缝迁移。
+ * 专门适配遵循官方自定义接口的中文汉化包目录结构（无语言前缀 JSON、各大子目录、`Info/version.json`、`Font/Context/ChineseFont.ttf` 等），
+ * 兼容 `.zip`、`.7z`、文件夹导入以及公共热投递目录 `/storage/emulated/0/Download/LimbusLocalizer`。
  */
 class GeminiLangPackImporter(
     private val cacheRoot: Path
@@ -53,29 +52,103 @@ class GeminiLangPackImporter(
         val sourceLabel: String
     )
 
+    data class DropInCandidate(
+        val file: File,
+        val isArchive: Boolean,
+        val name: String,
+        val sizeBytes: Long,
+        val lastModified: Long,
+        val versionHint: String
+    )
+
     /**
-     * 确保固定热投递目录存在并生成使用说明文件。
+     * 确保固定公共热投递目录存在并生成使用说明文件。
+     * 优先使用公共可直接访问的 /storage/emulated/0/Download/LimbusLocalizer/。
      */
     fun ensureDropInDirectory(context: Context): File {
-        val base = context.getExternalFilesDir(null) ?: context.filesDir
-        val dir = File(base, DROP_IN_DIR_NAME)
-        if (!dir.exists()) {
-            dir.mkdirs()
+        val primaryDir = runCatching {
+            val downloadPublic = android.os.Environment.getExternalStoragePublicDirectory(
+                android.os.Environment.DIRECTORY_DOWNLOADS
+            )
+            File(downloadPublic, DROP_IN_PUBLIC_SUBDIR).apply { mkdirs() }
+        }.getOrNull()
+
+        val dir = if (primaryDir != null && (primaryDir.isDirectory || primaryDir.mkdirs())) {
+            primaryDir
+        } else {
+            val base = context.getExternalFilesDir(null) ?: context.filesDir
+            File(base, DROP_IN_DIR_NAME).apply { mkdirs() }
         }
+
         val readme = File(dir, DROP_IN_README_NAME)
         if (!readme.exists()) {
             runCatching {
                 readme.writeText(
                     buildString {
-                        appendLine("【Limbus PE 汉化包自动热投递目录】")
-                        appendLine("将新版 GEMINI_zh-CN.zip（或 .7z）压缩包，或解压后的 GEMINI_zh-CN 文件夹放入本目录。")
-                        appendLine("打开「边狱公司」或点击「启动游戏」时，将自动识别版本号覆盖更新汉化与字体。")
+                        appendLine("【Limbus PE 中文汉化包自动热投递专区】")
+                        appendLine("1. 将任意符合规范的中文汉化压缩包（.zip / .7z）放入本目录，或解压后的汉化文件夹放入本目录；")
+                        appendLine("2. 在「边狱公司启动器」主界面的汉化卡片中，可点击「切换汉化包」自由选择要生效的汉化版本；")
+                        appendLine("3. 软件内在线下载的汉化包也会默认下载到本目录。")
                     },
                     Charsets.UTF_8
                 )
             }
         }
         return dir
+    }
+
+    /**
+     * 列出热投递专区中所有可供选择的候选汉化包（包括未导入的和已标记的压缩包、以及解压文件夹）。
+     */
+    fun listDropInCandidates(context: Context): List<DropInCandidate> {
+        val dropInDir = ensureDropInDirectory(context)
+        val files = dropInDir.listFiles() ?: return emptyList()
+        val list = mutableListOf<DropInCandidate>()
+
+        for (file in files) {
+            val name = file.name
+            if (name == DROP_IN_README_NAME || name.startsWith(".")) continue
+
+            val isZip = name.endsWith(".zip", ignoreCase = true) || name.endsWith(".zip.imported", ignoreCase = true)
+            val is7z = name.endsWith(".7z", ignoreCase = true) || name.endsWith(".7z.imported", ignoreCase = true)
+
+            if (file.isFile && (isZip || is7z)) {
+                val cleanName = name.removeSuffix(".imported")
+                val versionMatch = Regex("""(\d{8,12})""").find(cleanName)?.value.orEmpty()
+                list.add(
+                    DropInCandidate(
+                        file = file,
+                        isArchive = true,
+                        name = cleanName,
+                        sizeBytes = file.length(),
+                        lastModified = file.lastModified(),
+                        versionHint = versionMatch
+                    )
+                )
+            } else if (file.isDirectory) {
+                val versionJson = File(file, "Info/version.json")
+                var ver = ""
+                if (versionJson.isFile) {
+                    ver = runCatching {
+                        JSONObject(versionJson.readText(Charsets.UTF_8)).optString("version", "")
+                    }.getOrDefault("")
+                }
+                list.add(
+                    DropInCandidate(
+                        file = file,
+                        isArchive = false,
+                        name = name,
+                        sizeBytes = 0L,
+                        lastModified = file.lastModified(),
+                        versionHint = ver
+                    )
+                )
+            }
+        }
+        return list.sortedWith(
+            compareByDescending<DropInCandidate> { it.versionHint.toLongOrNull() ?: 0L }
+                .thenByDescending { it.lastModified }
+        )
     }
 
     /**
@@ -411,7 +484,7 @@ class GeminiLangPackImporter(
             }
 
             if (entries.isEmpty()) {
-                throw ArchiveValidationException("未在所选包中检测到有效的本地化 JSON 文件（请确认选择了 GEMINI_zh-CN 汉化包）")
+                throw ArchiveValidationException("未在所选包中检测到有效的本地化 JSON 文件（请确认选择了标准的中文汉化包）")
             }
 
             val archiveSha = overrideArchiveSha256
@@ -439,7 +512,7 @@ class GeminiLangPackImporter(
                 setProperty("customFontName", customFontName)
             }
             tempPatchDir.resolve(ContainerPatchInstaller.LOCAL_PACK_META_FILE).outputStream().use { out ->
-                metaProps.store(out, "GEMINI_zh-CN local pack metadata")
+                metaProps.store(out, "Limbus local pack metadata")
             }
 
             if (finalPatchDir.exists()) {
@@ -717,9 +790,10 @@ class GeminiLangPackImporter(
     }
 
     companion object {
+        const val DROP_IN_PUBLIC_SUBDIR = "LimbusLocalizer"
         const val DROP_IN_DIR_NAME = "DropIn_Lang_Pack"
         const val CUSTOM_FONT_FILE_NAME = "CustomChineseFont.ttf"
-        private const val DROP_IN_README_NAME = "使用说明_将汉化包ZIP或文件夹放入此处即可自动导入.txt"
+        private const val DROP_IN_README_NAME = "使用说明_将汉化包ZIP或7Z放入此处即可选择导入.txt"
         private const val PREFS_NAME = "limbuspe_local_pack"
         private const val KEY_LAST_DROPIN_DIR_SIG = "last_dropin_dir_sig"
         private const val MAX_ARCHIVE_FILES = 6_000

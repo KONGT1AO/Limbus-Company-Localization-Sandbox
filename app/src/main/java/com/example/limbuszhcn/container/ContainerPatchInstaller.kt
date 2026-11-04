@@ -7,11 +7,13 @@ import com.example.limbuszhcn.gamefs.PatchUninstallSummary
 import com.example.limbuszhcn.update.InstallGitHubReleaseRequest
 import com.example.limbuszhcn.update.PatchManifest
 import com.example.limbuszhcn.update.TranslationUpdateManager
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Base64
 import java.util.LinkedHashSet
+import java.util.stream.Collectors
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.inputStream
@@ -38,15 +40,20 @@ class ContainerPatchInstaller(
      * @param installedVersion 已知的本地汉化版本；非空时仅接受更高版本。
      * @return 本次索引编译、资源就绪度和激活状态摘要。
      */
-    fun installFromGitHub(releaseUrl: String, installedVersion: Long? = null): PatchInstallSummary {
+    fun installFromGitHub(
+        releaseUrl: String,
+        installedVersion: Long? = null,
+        downloadDirectory: Path = cacheRoot.resolve("downloads")
+    ): PatchInstallSummary {
         val result = TranslationUpdateManager().installFromGitHub(
             InstallGitHubReleaseRequest(
                 releaseUrl = releaseUrl,
-                downloadCacheRoot = cacheRoot.resolve("downloads"),
+                downloadCacheRoot = downloadDirectory,
                 patchCacheRoot = cacheRoot.resolve("patch-cache"),
                 installedVersion = installedVersion
             )
         )
+        pinActivePatch(result.manifest.requestedVersion)
         return activateRedirect(result.outputDirectory, result.manifest)
     }
 
@@ -197,6 +204,7 @@ class ContainerPatchInstaller(
                 )
             }
             patchDirectory.resolve(ACTIVE_MARKER_FILE).writeText("runtime-index-jp-ui\n", Charsets.UTF_8)
+            pinActivePatch(manifest.requestedVersion)
         } else if (!resourcesReady) {
             runCatching {
                 android.util.Log.w(
@@ -504,10 +512,106 @@ class ContainerPatchInstaller(
         return PatchUninstallSummary(version = manifest.requestedVersion, deletedFiles = restored)
     }
 
+    /**
+     * 锁定指定版本为当前用户主动选定的生效补丁。
+     */
+    fun pinActivePatch(version: String) {
+        runCatching {
+            cacheRoot.resolve(PINNED_PATCH_FILE).writeText(version.trim(), Charsets.UTF_8)
+        }
+    }
+
+    /**
+     * 获取当前被用户主动锁定的补丁版本（若有）。
+     */
+    fun pinnedPatchVersion(): String? {
+        val file = cacheRoot.resolve(PINNED_PATCH_FILE)
+        if (file.isRegularFile()) {
+            val ver = runCatching { file.readText(Charsets.UTF_8).trim() }.getOrNull()
+            if (!ver.isNullOrBlank()) return ver
+        }
+        return null
+    }
+
+    /**
+     * 激活并切换至指定版本的已导入补丁，锁定为当前生效包。
+     */
+    fun activatePatchByVersion(version: String, auditDirectory: Path? = null): PatchInstallSummary {
+        val patchDirectory = cacheRoot.resolve("patch-cache").resolve(version)
+        require(patchDirectory.isDirectory()) { "未找到指定的汉化包缓存: $version" }
+        val manifestFile = patchDirectory.resolve("manifest.json")
+        require(manifestFile.isRegularFile()) { "汉化包缺少 manifest.json: $manifestFile" }
+        val manifest = PatchManifest.fromJson(manifestFile.readText(Charsets.UTF_8))
+        pinActivePatch(manifest.requestedVersion)
+        return activateRedirect(patchDirectory, manifest, auditDirectory)
+    }
+
+    /**
+     * 列出所有已导入缓存的汉化包，并标注当前哪个包处于激活生效状态。
+     */
+    fun listInstalledPatches(): List<CachedPatchMetadata> {
+        val patchRootDir = cacheRoot.resolve("patch-cache").toFile()
+        if (!patchRootDir.isDirectory) return emptyList()
+        val activeVer = activeInstallSummary()?.version ?: pinnedPatchVersion()
+        val subDirs = patchRootDir.listFiles()?.filter { it.isDirectory && File(it, "manifest.json").isFile } ?: return emptyList()
+        return subDirs.mapNotNull { dir ->
+            runCatching {
+                val manifestFile = File(dir, "manifest.json")
+                val header = readManifestHeader(manifestFile) ?: return@runCatching null
+                val metaFile = File(dir, LOCAL_PACK_META_FILE)
+                val props = java.util.Properties().apply {
+                    if (metaFile.isFile) metaFile.inputStream().use(::load)
+                }
+                CachedPatchMetadata(
+                    version = header.first,
+                    jsonFileCount = header.second,
+                    notice = props.getProperty("notice").orEmpty(),
+                    sourceLabel = props.getProperty("sourceLabel", "已导入汉化包"),
+                    customFontName = props.getProperty("customFontName").orEmpty(),
+                    isActive = (header.first == activeVer)
+                )
+            }.getOrNull()
+        }.sortedWith(
+            compareByDescending<CachedPatchMetadata> { it.isActive }
+                .thenByDescending { it.version.toLongOrNull() ?: 0L }
+        )
+    }
+
+    private fun readManifestHeader(manifestFile: File): Pair<String, Int>? {
+        var requestedVersion: String? = null
+        var extractedFileCount: Int? = null
+        manifestFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            for (line in lines) {
+                if (requestedVersion == null) {
+                    val m = Regex(""""requestedVersion"\s*:\s*"([^"]+)"""").find(line)
+                    if (m != null) requestedVersion = m.groupValues[1]
+                }
+                if (extractedFileCount == null) {
+                    val m = Regex(""""extractedFileCount"\s*:\s*(\d+)""").find(line)
+                    if (m != null) extractedFileCount = m.groupValues[1].toIntOrNull()
+                }
+                if (requestedVersion != null && extractedFileCount != null) {
+                    break
+                }
+                if (line.contains(""""entries"""")) {
+                    break
+                }
+            }
+        }
+        return if (requestedVersion != null) Pair(requestedVersion, extractedFileCount ?: 0) else null
+    }
+
     private fun latestPatchDirectory(): Path? {
         val patchRoot = cacheRoot.resolve("patch-cache")
         if (!patchRoot.isDirectory()) {
             return null
+        }
+        val pinned = pinnedPatchVersion()
+        if (pinned != null) {
+            val target = patchRoot.resolve(pinned)
+            if (target.isDirectory() && target.resolve("manifest.json").isRegularFile()) {
+                return target
+            }
         }
         return Files.list(patchRoot).use { paths ->
             paths
@@ -519,12 +623,14 @@ class ContainerPatchInstaller(
     }
 
     private fun comparePatchDirectories(left: Path, right: Path): Int {
+        val timeCmp = Files.getLastModifiedTime(left).compareTo(Files.getLastModifiedTime(right))
+        if (timeCmp != 0) return timeCmp
         val leftVersion = left.name.toLongOrNull()
         val rightVersion = right.name.toLongOrNull()
         if (leftVersion != null && rightVersion != null) {
             return leftVersion.compareTo(rightVersion)
         }
-        return Files.getLastModifiedTime(left).compareTo(Files.getLastModifiedTime(right))
+        return left.name.compareTo(right.name)
     }
 
     private fun removeLangOverlay(manifest: PatchManifest) {
@@ -548,6 +654,7 @@ class ContainerPatchInstaller(
         private const val TRANSLATION_INDEX_DIR = "translation-index"
         private const val INDEX_MANIFEST_FILE = "manifest.properties"
         private const val JP_FINGERPRINT_FILE = "jp-fingerprint.txt"
+        private const val PINNED_PATCH_FILE = "pinned_patch.name"
         const val LOCAL_PACK_META_FILE = "local-pack-meta.properties"
         private const val TAG = "LimbusZhCN"
         private const val UPSTREAM_LANG_PREFIX = "LimbusCompany_Data/Lang/LLC_zh-CN/"
@@ -561,7 +668,8 @@ data class CachedPatchMetadata(
     val jsonFileCount: Int,
     val notice: String = "",
     val sourceLabel: String = "",
-    val customFontName: String = ""
+    val customFontName: String = "",
+    val isActive: Boolean = false
 )
 
 internal fun hasSufficientJapaneseSources(available: Int, candidate: Int): Boolean =

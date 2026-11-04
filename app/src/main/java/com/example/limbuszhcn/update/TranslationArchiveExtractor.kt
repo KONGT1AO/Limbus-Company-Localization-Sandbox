@@ -44,45 +44,92 @@ class TranslationArchiveExtractor(
         var versionFromArchive: Long? = null
 
         try {
-            SevenZFile(request.archive.toFile()).use { archive ->
-                var entry = archive.nextEntry
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (entry != null) {
-                    if (!entry.isDirectory) {
-                        archiveFileCount += 1
-                        validateEntryMethods(entry)
-
-                        val sourcePath = entry.name ?: throw ArchiveValidationException("Archive entry has no name")
-                        val mapped = mapEntry(sourcePath)
-                        if (mapped != null) {
-                            val entrySize = entry.size
-                            validateSize(sourcePath, entrySize)
-                            totalUncompressedBytes += entrySize
-                            if (totalUncompressedBytes > limits.maxTotalUncompressedBytes) {
-                                throw ArchiveValidationException(
-                                    "Archive uncompressed size exceeds ${limits.maxTotalUncompressedBytes} bytes"
-                                )
-                            }
-
-                            val outputPath = tempDir.resolve(mapped.cachePath)
-                            outputPath.parent.createDirectories()
-                            copyEntry(archive, outputPath, buffer)
-
-                            val fileSha256 = sha256(outputPath)
-                            if (mapped.isVersionFile) {
-                                versionFromArchive = readVersion(outputPath)
-                            } else {
-                                entries += PatchFileEntry(
-                                    sourcePath = sourcePath,
-                                    cachePath = mapped.cachePath,
-                                    targetPath = mapped.targetPath,
-                                    size = Files.size(outputPath),
-                                    sha256 = fileSha256
-                                )
+            val archiveFile = request.archive.toFile()
+            if (isZipFile(archiveFile)) {
+                java.util.zip.ZipFile(archiveFile).use { zip ->
+                    val enumEntries = zip.entries()
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (enumEntries.hasMoreElements()) {
+                        val entry = enumEntries.nextElement()
+                        if (!entry.isDirectory) {
+                            archiveFileCount += 1
+                            val sourcePath = entry.name.replace('\\', '/')
+                            val mapped = mapEntry(sourcePath)
+                            if (mapped != null) {
+                                val entrySize = entry.size
+                                if (entrySize >= 0) {
+                                    validateSize(sourcePath, entrySize)
+                                    totalUncompressedBytes += entrySize
+                                    if (totalUncompressedBytes > limits.maxTotalUncompressedBytes) {
+                                        throw ArchiveValidationException(
+                                            "Archive uncompressed size exceeds ${limits.maxTotalUncompressedBytes} bytes"
+                                        )
+                                    }
+                                }
+                                val outputPath = tempDir.resolve(mapped.cachePath)
+                                outputPath.parent.createDirectories()
+                                zip.getInputStream(entry).use { input ->
+                                    outputPath.outputStream().buffered().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+                                val fileSha256 = sha256(outputPath)
+                                if (mapped.isVersionFile) {
+                                    versionFromArchive = readVersion(outputPath)
+                                } else {
+                                    entries += PatchFileEntry(
+                                        sourcePath = sourcePath,
+                                        cachePath = mapped.cachePath,
+                                        targetPath = mapped.targetPath,
+                                        size = Files.size(outputPath),
+                                        sha256 = fileSha256
+                                    )
+                                }
                             }
                         }
                     }
-                    entry = archive.nextEntry
+                }
+            } else {
+                SevenZFile(archiveFile).use { archive ->
+                    var entry = archive.nextEntry
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (entry != null) {
+                        if (!entry.isDirectory) {
+                            archiveFileCount += 1
+                            validateEntryMethods(entry)
+
+                            val sourcePath = entry.name ?: throw ArchiveValidationException("Archive entry has no name")
+                            val mapped = mapEntry(sourcePath)
+                            if (mapped != null) {
+                                val entrySize = entry.size
+                                validateSize(sourcePath, entrySize)
+                                totalUncompressedBytes += entrySize
+                                if (totalUncompressedBytes > limits.maxTotalUncompressedBytes) {
+                                    throw ArchiveValidationException(
+                                        "Archive uncompressed size exceeds ${limits.maxTotalUncompressedBytes} bytes"
+                                    )
+                                }
+
+                                val outputPath = tempDir.resolve(mapped.cachePath)
+                                outputPath.parent.createDirectories()
+                                copyEntry(archive, outputPath, buffer)
+
+                                val fileSha256 = sha256(outputPath)
+                                if (mapped.isVersionFile) {
+                                    versionFromArchive = readVersion(outputPath)
+                                } else {
+                                    entries += PatchFileEntry(
+                                        sourcePath = sourcePath,
+                                        cachePath = mapped.cachePath,
+                                        targetPath = mapped.targetPath,
+                                        size = Files.size(outputPath),
+                                        sha256 = fileSha256
+                                    )
+                                }
+                            }
+                        }
+                        entry = archive.nextEntry
+                    }
                 }
             }
 
@@ -220,6 +267,16 @@ class TranslationArchiveExtractor(
     private fun readVersion(path: Path): Long? {
         val text = String(Files.readAllBytes(path), Charsets.UTF_8)
         return VERSION_REGEX.find(text)?.groupValues?.get(1)?.toLongOrNull()
+    }
+
+    private fun isZipFile(file: java.io.File): Boolean {
+        if (file.name.endsWith(".zip", ignoreCase = true)) return true
+        return runCatching {
+            file.inputStream().use { input ->
+                val header = ByteArray(4)
+                input.read(header) == 4 && header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() && header[2] == 0x03.toByte() && header[3] == 0x04.toByte()
+            }
+        }.getOrDefault(false)
     }
 
     private fun writeManifest(path: Path, manifest: PatchManifest) {
