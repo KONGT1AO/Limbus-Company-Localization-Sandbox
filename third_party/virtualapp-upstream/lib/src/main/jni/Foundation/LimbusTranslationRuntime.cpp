@@ -1533,7 +1533,7 @@ bool restore_ellipsis_truncated_translation(const std::string &text,
         if (entry.size() > prefix_len &&
             entry.find('\n') == std::string::npos &&
             entry.compare(0, prefix_len, text, 0, prefix_len) == 0) {
-            if (!found || entry.size() < best_match.size()) {
+            if (!found || entry.size() > best_match.size()) {
                 best_match = entry;
                 found = true;
             }
@@ -4017,8 +4017,16 @@ bool is_mirror_dungeon_gift_or_shop_name(const std::string &component_name,
 
 bool is_battle_skill_banner_control(const std::string &component_name,
                                     const std::string &parent_name) {
-    return (component_name == "SkillNameText" && parent_name == "SkillNameField") ||
-           (component_name == "Name" && parent_name == "NameField");
+    if (component_name == "SkillNameText") {
+        return parent_name.find("SkillNameField") != std::string::npos ||
+               parent_name.find("Banner") != std::string::npos ||
+               parent_name.find("Duel") != std::string::npos ||
+               parent_name.find("Skill") != std::string::npos;
+    }
+    if (component_name == "Name" && parent_name.find("NameField") != std::string::npos) {
+        return true;
+    }
+    return false;
 }
 
 bool is_loading_screen_hint_title(const std::string &display_text) {
@@ -4820,6 +4828,11 @@ bool apply_translated_tmp_style(void *instance, void *managed_text,
             maximum = std::max(maximum, state.font_size_max);
         }
         float minimum = std::max(10.0f, maximum * 0.45f);
+        if (skill_title && visible_length > 0) {
+            float available_width = rect.valid && rect.width > 30.0f ? rect.width : 280.0f;
+            float required_min = available_width / (static_cast<float>(visible_length) * 1.05f);
+            minimum = std::fmax(8.0f, std::fmin(minimum, required_min));
+        }
         invoke_bool_setter(g_tmp_set_word_wrapping_info, instance, false);
         invoke_float_setter(g_tmp_set_font_size_min_info, instance, minimum);
         invoke_float_setter(g_tmp_set_font_size_max_info, instance, maximum);
@@ -5047,6 +5060,9 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
             const bool may_be_composed_cjk_ui =
                     egogift_name || mirror_reward_ui || battle_skill_banner ||
                     battle_winrate_label || general_ui_cjk;
+            if (battle_skill_banner) {
+                translated = true;
+            }
             bool promoted_egogift = false;
             if (!translated && !already_chinese && current_font != nullptr &&
                 may_be_composed_cjk_ui) {
@@ -5335,7 +5351,10 @@ void finalize_tmp_text(void *instance, void *managed_text) {
         return;
     }
     const bool promoted_rebuild = has_pending_tmp_rebuild(instance);
-    if (!is_translated_managed_string(managed_text) && !promoted_rebuild) {
+    const std::string component_name = read_unity_object_name(instance);
+    const std::string parent_name = read_unity_parent_name(instance);
+    const bool is_skill_banner = is_battle_skill_banner_control(component_name, parent_name);
+    if (!is_translated_managed_string(managed_text) && !promoted_rebuild && !is_skill_banner) {
         return;
     }
     TmpComponentState state;
