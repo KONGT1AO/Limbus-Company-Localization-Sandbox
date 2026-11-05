@@ -2250,6 +2250,7 @@ acquisition2_fn const kAcquisition2Replacements[] = {ACQUISITION_SLOTS(ACQUISITI
 
 bool apply_chinese_material_underlay(void *material, bool force);
 void apply_chinese_font_materials();
+void apply_chinese_font_materials_for(void *asset);
 bool find_tmp_component_state(void *instance, TmpComponentState *state);
 void *ensure_translated_tmp_material(void *instance);
 void *invoke_object_getter(const void *method_info, void *instance);
@@ -2467,6 +2468,9 @@ bool ensure_tmp_font() {
     }
     bool ready = g_tmp_font_asset != nullptr;
     pthread_mutex_unlock(&g_lock);
+    if (ready) {
+        apply_chinese_font_materials();
+    }
     return ready;
 }
 
@@ -2623,7 +2627,10 @@ size_t preload_cjk_glyphs(void *font, const std::string &text) {
             if (exception == nullptr && boxed != nullptr) {
                 uint8_t added = 0;
                 memcpy(&added, g_object_unbox(boxed), sizeof(added));
-                if (added != 0) return 0;
+                if (added != 0) {
+                    apply_chinese_font_materials_for(font);
+                    return 0;
+                }
             }
         }
     }
@@ -3537,14 +3544,8 @@ bool apply_chinese_material_underlay(void *material, bool force) {
         void *exception = nullptr;
         g_runtime_invoke(g_material_set_float_info, material, args, &exception);
     }
-    if (g_material_enable_keyword_info != nullptr) {
-        void *keyword = new_managed_string("UNDERLAY_ON");
-        if (keyword != nullptr) {
-            void *args[] = {keyword};
-            void *exception = nullptr;
-            g_runtime_invoke(g_material_enable_keyword_info, material, args, &exception);
-        }
-    }
+    write_material_keyword_property(material, "UNDERLAY_ON", true);
+    write_material_keyword_property(material, "UNDERLAY_OFF", false);
     MaterialOutlineStyle applied = read_material_outline(material);
     LT_LOGI("Chinese SDF underlay material=%p width=%.3f faceDilate=%.3f "
             "underlayOffset=(%.3f,%.3f) dilate=%.3f",
@@ -3607,13 +3608,13 @@ void sync_translated_tmp_materials(void *instance, bool force = false) {
     }
     ensure_translated_tmp_material(instance);
     const bool mirror_reward_sync = is_mirror_dungeon_reward_control(component_name, parent_name);
+    if (mirror_reward_sync) {
+        return;
+    }
     const bool is_battle_control_sync = top_status || bottom_status ||
             is_battle_skill_banner_control(component_name, parent_name) ||
             is_battle_winrate_control(component_name, parent_name) ||
             state.preserve_source_outline || state.use_regular_title_font;
-    if (mirror_reward_sync || !is_battle_control_sync) {
-        return;
-    }
     void *materials = read_tmp_material_collection(instance);
     if (materials != nullptr) {
         ManagedObjectPin materials_pin(materials);
@@ -3637,9 +3638,13 @@ void sync_translated_tmp_materials(void *instance, bool force = false) {
             if (material == nullptr) continue;
             ManagedObjectPin material_pin(material);
             if (!material_pin.alive()) continue;
-            apply_material_visual_style(
-                    material, state.source_material_style, face_dilate,
-                    state.preserve_source_outline, bottom_status);
+            if (is_battle_control_sync) {
+                apply_material_visual_style(
+                        material, state.source_material_style, face_dilate,
+                        state.preserve_source_outline, bottom_status);
+            } else {
+                apply_chinese_material_underlay(material, false);
+            }
             ++styled;
         }
         uint64_t syncs = g_tmp_material_syncs.fetch_add(
