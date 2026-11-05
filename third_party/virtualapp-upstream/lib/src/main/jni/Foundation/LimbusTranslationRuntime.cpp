@@ -409,6 +409,18 @@ std::atomic<uint64_t> g_material_pin_failures{0};
  * TMP can rebuild arrays and trigger a GC between field lookups, so using the
  * raw il2cpp object address without a temporary strong handle is unsafe.
  */
+bool is_unity_object_alive(void *object) {
+    if (object == nullptr) return false;
+    // 64-bit Unity IL2CPP: UnityEngine.Object.m_CachedPtr is located at offset 16 (sizeof(void*) * 2).
+    // Native C++ Object destruction clears m_CachedPtr to 0. A managed wrapper with m_CachedPtr == 0
+    // evaluates to null in Unity C# and throws ArgumentNullException when passed to Material/Mesh APIs.
+    intptr_t cached_ptr = 0;
+    memcpy(&cached_ptr,
+           reinterpret_cast<const uint8_t *>(object) + sizeof(void *) * 2,
+           sizeof(cached_ptr));
+    return cached_ptr != 0;
+}
+
 class ManagedObjectPin {
 public:
     explicit ManagedObjectPin(void *object) : object_(object) {
@@ -428,7 +440,8 @@ public:
     bool alive() const {
         return object_ != nullptr && handle_ != 0 &&
                 g_gchandle_get_target != nullptr &&
-                g_gchandle_get_target(handle_) == object_;
+                g_gchandle_get_target(handle_) == object_ &&
+                is_unity_object_alive(object_);
     }
 
 private:
@@ -449,7 +462,8 @@ void *resolve_live_object(uintptr_t handle, void *expected) {
         return nullptr;
     }
     void *target = g_gchandle_get_target(handle);
-    return target == expected ? target : nullptr;
+    if (target != expected) return nullptr;
+    return is_unity_object_alive(target) ? target : nullptr;
 }
 
 void release_object_handle(uintptr_t handle) {
@@ -1530,6 +1544,10 @@ bool restore_ellipsis_truncated_translation(const std::string &text,
     pthread_mutex_lock(&g_font_state_lock);
     for (const std::string &entry : g_translated_managed_texts) {
         if (entry == text) continue;
+        if (entry.find("...") != std::string::npos ||
+            entry.find("\xe2\x80\xa6") != std::string::npos) {
+            continue;
+        }
         if (entry.size() > prefix_len &&
             entry.find('\n') == std::string::npos &&
             entry.compare(0, prefix_len, text, 0, prefix_len) == 0) {
@@ -3433,7 +3451,7 @@ void *read_tmp_material_collection(void *instance) {
 }
 
 bool apply_chinese_material_underlay(void *material, bool force) {
-    if (material == nullptr || g_runtime_invoke == nullptr) return false;
+    if (material == nullptr || !is_unity_object_alive(material) || g_runtime_invoke == nullptr) return false;
     ManagedObjectPin material_pin(material);
     if (!material_pin.alive()) {
         uint64_t failures = g_material_pin_failures.fetch_add(
@@ -4152,7 +4170,7 @@ bool find_tmp_component_state(void *instance, TmpComponentState *state) {
 }
 
 void set_tmp_component_font_material(void *instance, void *material) {
-    if (instance == nullptr || material == nullptr) return;
+    if (instance == nullptr || material == nullptr || !is_unity_object_alive(material)) return;
     if (g_original_tmp_set_material != nullptr) {
         g_original_tmp_set_material(
                 instance, material, g_tmp_set_font_material_info);
@@ -4334,6 +4352,9 @@ void *ensure_translated_tmp_material(void *instance) {
 }
 
 void *translated_tmp_material(void *instance, void *requested_material) {
+    if (!is_unity_object_alive(requested_material)) {
+        requested_material = nullptr;
+    }
     // 游戏会在页签选择、胜率状态切换和角色刷新时重新写入原日文字体预设材质。
     // 若传入的是新的日文源材质预设，先同步其颜色与描边参数，再绑定中文克隆材质。
     if (instance != nullptr && requested_material != nullptr) {
@@ -4814,9 +4835,11 @@ bool apply_translated_tmp_style(void *instance, void *managed_text,
              state.overflow_mode == 3 || state.overflow_mode == 5);
     const bool single_line_needs_fit =
             single_line && !explicit_break &&
-            (skill_title || egogift_or_shop_name || overflow_could_clip ||
-             (rect.valid && rect.width > 0.0f && state.font_size > 0.0f &&
-              static_cast<float>(visible_length) * state.font_size * 0.80f > rect.width));
+            (skill_title || egogift_or_shop_name ||
+             (overflow_could_clip &&
+              ((state.has_auto_sizing && state.auto_sizing) ||
+               (rect.valid && rect.width > 0.0f && state.font_size > 0.0f &&
+                static_cast<float>(visible_length) * state.font_size * 0.80f > rect.width))));
     const bool translated_is_longer = state.source_visible_codepoints > 0 &&
             visible_length > state.source_visible_codepoints;
     if (single_line_needs_fit) {
@@ -5062,6 +5085,20 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     battle_winrate_label || general_ui_cjk;
             if (battle_skill_banner) {
                 translated = true;
+                size_t banner_chars = count_visible_codepoints(display_text);
+                if (banner_chars > 6 && g_tmp_set_font_size_info != nullptr) {
+                    // 长技能名在 36px 基础字号下 preferredWidth 会超过横幅宽度上限 (~240px)，
+                    // 从而触发游戏 C# while 循环截断字符并追加 "..."。
+                    // 提前将基础字号下调，使 preferredWidth <= 240px，彻底阻止游戏截断并保证底框饱满。
+                    float adapted_size = std::max(10.0f, 230.0f / (static_cast<float>(banner_chars) * 1.02f));
+                    invoke_float_setter(g_tmp_set_font_size_info, instance, adapted_size);
+                } else if (banner_chars > 0 && g_tmp_set_font_size_info != nullptr) {
+                    TmpComponentState banner_state;
+                    if (find_tmp_component_state(instance, &banner_state) &&
+                        banner_state.has_font_size && banner_state.font_size >= 28.0f) {
+                        invoke_float_setter(g_tmp_set_font_size_info, instance, banner_state.font_size);
+                    }
+                }
             }
             bool promoted_egogift = false;
             if (!translated && !already_chinese && current_font != nullptr &&
