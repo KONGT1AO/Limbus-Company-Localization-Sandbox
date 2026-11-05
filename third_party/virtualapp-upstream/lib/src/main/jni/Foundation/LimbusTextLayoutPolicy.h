@@ -21,9 +21,12 @@ constexpr float kChineseBattleWinRateDilateRatio = 0.55f;
 // PC 版中文使用白字下方的窄黑托底。Underlay 不再扩边或向右偏移，
 // 只把同尺寸的黑色字形轻微下移；否则小字号字腔仍会被四周黑边填暗。
 constexpr float kChineseUnderlayDilate = 0.0f;
-constexpr float kChineseUnderlayOffsetX = 0.0f;
-constexpr float kChineseUnderlayOffsetY = -0.035f;
+constexpr float kChineseUnderlayOffsetX = 0.16f;
+constexpr float kChineseUnderlayOffsetY = -0.20f;
 constexpr float kChineseUnderlayAlpha = 0.9f;
+
+constexpr float kChineseTitleUnderlayOffsetX = 0.16f;
+constexpr float kChineseTitleUnderlayOffsetY = -0.20f;
 // Japanese controls commonly use offsets around 0.3. Applying that value
 // unchanged to the denser CJK SDF atlas makes the underlay look like a second
 // glyph. Scale it into the same pixel range as the game's Japanese small text.

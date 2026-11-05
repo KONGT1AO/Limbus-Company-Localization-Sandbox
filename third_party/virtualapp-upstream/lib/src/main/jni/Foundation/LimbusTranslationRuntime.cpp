@@ -3140,13 +3140,13 @@ void apply_material_visual_style(
         write_material_keyword_property(material, "UNDERLAY_OFF", !underlay_enabled);
     } else {
         const float offset_x = (style.has_underlay_offset_x &&
-                std::abs(style.underlay_offset_x) >= 0.005f) ?
+                std::abs(style.underlay_offset_x) >= 0.08f) ?
                 limbus_text_layout::cjk_underlay_offset(style.underlay_offset_x) :
-                limbus_text_layout::kChineseUnderlayOffsetX;
+                limbus_text_layout::kChineseTitleUnderlayOffsetX;
         const float offset_y = (style.has_underlay_offset_y &&
-                std::abs(style.underlay_offset_y) >= 0.005f) ?
+                std::abs(style.underlay_offset_y) >= 0.10f) ?
                 limbus_text_layout::cjk_underlay_offset(style.underlay_offset_y) :
-                limbus_text_layout::kChineseUnderlayOffsetY;
+                limbus_text_layout::kChineseTitleUnderlayOffsetY;
         write_material_float_property(material, "_UnderlayOffsetX", offset_x);
         write_material_float_property(material, "_UnderlayOffsetY", offset_y);
         write_material_float_property(
@@ -3527,8 +3527,8 @@ bool apply_chinese_material_underlay(void *material, bool force) {
         void *exception = nullptr;
         g_runtime_invoke(g_material_set_color_info, material, args, &exception);
     }
-    const float underlay_offset_x = limbus_text_layout::kChineseUnderlayOffsetX;
-    const float underlay_offset_y = limbus_text_layout::kChineseUnderlayOffsetY;
+    const float underlay_offset_x = limbus_text_layout::kChineseTitleUnderlayOffsetX;
+    const float underlay_offset_y = limbus_text_layout::kChineseTitleUnderlayOffsetY;
     const float underlay_dilate = limbus_text_layout::kChineseUnderlayDilate;
     if (underlay_offset_x_name != nullptr && g_material_set_float_info != nullptr) {
         float value = underlay_offset_x;
