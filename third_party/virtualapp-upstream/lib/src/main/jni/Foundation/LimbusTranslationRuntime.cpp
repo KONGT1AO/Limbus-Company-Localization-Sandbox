@@ -3108,54 +3108,63 @@ void apply_material_visual_style(
         write_material_keyword_property(material, "OUTLINE_ON", false);
         write_material_keyword_property(material, "OUTLINE_OFF", true);
     }
-    if (style.has_underlay_offset_x) {
+    if (preserve_source_outline) {
+        if (style.has_underlay_offset_x) {
+            write_material_float_property(
+                    material, "_UnderlayOffsetX",
+                    style.underlay_offset_x * underlay_ratio);
+        }
+        if (style.has_underlay_offset_y) {
+            write_material_float_property(
+                    material, "_UnderlayOffsetY",
+                    style.underlay_offset_y * underlay_ratio);
+        }
         write_material_float_property(
-                material, "_UnderlayOffsetX",
-                preserve_source_outline ?
-                        style.underlay_offset_x * underlay_ratio :
-                        limbus_text_layout::cjk_underlay_offset(
-                                style.underlay_offset_x));
-    }
-    if (style.has_underlay_offset_y) {
+                material, "_UnderlayDilate",
+                style.has_underlay_dilate ?
+                        style.underlay_dilate * underlay_ratio :
+                        limbus_text_layout::kChineseUnderlayDilate);
         write_material_float_property(
-                material, "_UnderlayOffsetY",
-                preserve_source_outline ?
-                        style.underlay_offset_y * underlay_ratio :
-                        limbus_text_layout::cjk_underlay_offset(
-                                style.underlay_offset_y));
+                material, "_UnderlaySoftness",
+                style.has_underlay_softness ?
+                        style.underlay_softness : 0.0f);
+        if (style.has_underlay_color) {
+            write_material_color_property(
+                    material, "_UnderlayColor", style.underlay_color);
+        } else {
+            write_material_color_property(material, "_UnderlayColor", transparent_black);
+        }
+        bool underlay_enabled = style.has_underlay_color &&
+                style.underlay_color[3] > 0.001f;
+        write_material_keyword_property(material, "UNDERLAY_ON", underlay_enabled);
+        write_material_keyword_property(material, "UNDERLAY_OFF", !underlay_enabled);
+    } else {
+        const float offset_x = (style.has_underlay_offset_x &&
+                std::abs(style.underlay_offset_x) >= 0.005f) ?
+                limbus_text_layout::cjk_underlay_offset(style.underlay_offset_x) :
+                limbus_text_layout::kChineseUnderlayOffsetX;
+        const float offset_y = (style.has_underlay_offset_y &&
+                std::abs(style.underlay_offset_y) >= 0.005f) ?
+                limbus_text_layout::cjk_underlay_offset(style.underlay_offset_y) :
+                limbus_text_layout::kChineseUnderlayOffsetY;
+        write_material_float_property(material, "_UnderlayOffsetX", offset_x);
+        write_material_float_property(material, "_UnderlayOffsetY", offset_y);
+        write_material_float_property(
+                material, "_UnderlayDilate", limbus_text_layout::kChineseUnderlayDilate);
+        write_material_float_property(material, "_UnderlaySoftness", 0.0f);
+        const float black_underlay[4] = {
+                0.0f, 0.0f, 0.0f, limbus_text_layout::kChineseUnderlayAlpha
+        };
+        write_material_color_property(material, "_UnderlayColor", black_underlay);
+        write_material_keyword_property(material, "UNDERLAY_ON", true);
+        write_material_keyword_property(material, "UNDERLAY_OFF", false);
     }
-    write_material_float_property(
-            material, "_UnderlayDilate",
-            preserve_source_outline && style.has_underlay_dilate ?
-                    style.underlay_dilate * underlay_ratio :
-                    limbus_text_layout::kChineseUnderlayDilate);
-    write_material_float_property(
-            material, "_UnderlaySoftness",
-            preserve_source_outline && style.has_underlay_softness ?
-                    style.underlay_softness : 0.0f);
     if (style.has_face_color && style.face_color[3] > 0.001f) {
         write_material_color_property(material, "_FaceColor", style.face_color);
     } else if (!preserve_source_outline) {
         float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         write_material_color_property(material, "_FaceColor", white);
     }
-    if (preserve_source_outline && style.has_underlay_color) {
-        write_material_color_property(
-                material, "_UnderlayColor", style.underlay_color);
-    } else if (style.has_underlay_color) {
-        const float black_underlay[4] = {
-                0.0f, 0.0f, 0.0f,
-                std::min(style.underlay_color[3],
-                         limbus_text_layout::kChineseUnderlayAlpha)
-        };
-        write_material_color_property(material, "_UnderlayColor", black_underlay);
-    } else {
-        write_material_color_property(material, "_UnderlayColor", transparent_black);
-    }
-    bool underlay_enabled = style.has_underlay_color &&
-            style.underlay_color[3] > 0.001f;
-    write_material_keyword_property(material, "UNDERLAY_ON", underlay_enabled);
-    write_material_keyword_property(material, "UNDERLAY_OFF", !underlay_enabled);
 }
 
 MaterialOutlineStyle read_material_outline(void *material) {
