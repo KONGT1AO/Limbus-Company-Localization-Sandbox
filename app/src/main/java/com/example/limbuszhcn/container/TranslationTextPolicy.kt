@@ -104,6 +104,23 @@ internal object TranslationTextPolicy {
     }
 
     /**
+     * 判断资源是否为可提供稳定关键词 ID 的词典。
+     *
+     * 这些表同时包含 `id` 与 `name`，可在每次汉化包更新时自动生成
+     * `id -> 中文名称` 映射，不依赖宿主维护固定词表。
+     *
+     * @param path 日文源资源的相对或绝对路径。
+     * @return 属于战斗关键词或状态词典时返回 `true`。
+     */
+    fun isKeywordDictionarySource(path: String): Boolean {
+        val fileName = path.replace('\\', '/').substringAfterLast('/')
+            .lowercase()
+            .removePrefix("en_")
+            .removePrefix("jp_")
+        return fileName.startsWith("bufs") || fileName.startsWith("battlekeywords")
+    }
+
+    /**
      * 判断字段是否适合按相同行号派生格式化后的前置条件术语。
      *
      * @param field JSON 字段名。

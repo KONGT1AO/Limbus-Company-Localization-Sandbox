@@ -34,14 +34,19 @@
 namespace {
 
 const unsigned char kIndexMagic[] = {'L', 'Z', 'T', 'I', '1', 0};
-const uint32_t kIndexSchema = 14;
+const uint32_t kIndexSchema = 16;
 const uint32_t kMaxEntries = 1000000;
 const uint32_t kMaxStringBytes = 16 * 1024 * 1024;
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t g_font_state_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t g_skill_title_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 char g_active_pointer[PATH_MAX] = {};
 std::unordered_map<std::string, std::string> g_index;
+// Story text can gain ruby/furigana markup after the resource lookup. This
+// index drops TMP control tags while preserving visible characters, so the
+// formatted runtime string can still resolve to the package translation.
+std::unordered_map<std::string, std::string> g_rich_text_canonical_index;
 std::unordered_map<std::string, std::string> g_terms;
 // 同文异译的完整文本回退。严格索引仍优先；回退表只用于避免低票冲突直接显示日文。
 std::unordered_map<std::string, std::string> g_fallback_index;
@@ -49,6 +54,10 @@ std::unordered_map<std::string, std::string> g_fallback_index;
 std::unordered_map<std::string, std::string> g_context_index;
 // 小贴士表按资源名和数字 ID 保存兼容译文，兼容游戏更新后仍被调用的旧版原文。
 std::unordered_map<std::string, std::string> g_battle_hint_index;
+// 关键词词典 ID 到中文显示名的自动映射，例如 HowlingCocoonAlly。
+std::unordered_map<std::string, std::string> g_keyword_alias_index;
+// 关键词词典的日文显示名到中文显示名映射，只用于 TMP 富文本可见文本节点。
+std::unordered_map<std::string, std::string> g_keyword_name_index;
 // 部分人格列表会把汉化包标题中的换行压成空格或直接移除；该索引只保存由包内译文
 // 推导出的原始分行，让运行时兼容不同页面，而无需硬编码任何人格名称或译文。
 std::unordered_map<std::string, std::string> g_package_line_breaks;
@@ -58,6 +67,7 @@ struct TermTrieNode {
     const std::string *translation = nullptr;
 };
 std::vector<TermTrieNode> g_term_trie;
+std::vector<TermTrieNode> g_keyword_name_trie;
 bool g_configured = false;
 bool g_resolver_reported = false;
 bool g_probe_started = false;
@@ -211,11 +221,30 @@ std::atomic<uint64_t> g_navigation_refreshes{0};
 std::atomic<uint64_t> g_food_title_diagnostics{0};
 std::atomic<uint64_t> g_multiline_matches{0};
 std::atomic<uint64_t> g_tag_repair_matches{0};
+std::atomic<uint64_t> g_keyword_get_text_hits{0};
+std::atomic<uint64_t> g_rich_text_keyword_hits{0};
+std::atomic<uint64_t> g_rich_text_keyword_misses{0};
+std::atomic<uint64_t> g_rich_text_keyword_diagnostics{0};
+std::atomic<uint64_t> g_rich_text_probe_count{0};
+std::atomic<uint64_t> g_rich_text_canonical_matches{0};
+std::atomic<uint64_t> g_rich_text_source_probes{0};
 std::atomic<uint64_t> g_unmatched_texts{0};
 std::atomic<uint64_t> g_long_text_fit_actions{0};
 std::atomic<uint64_t> g_egogift_name_diagnostics{0};
 std::atomic<uint64_t> g_fallback_primary_promotions{0};
 std::atomic<uint64_t> g_tmp_font_reset_blocks{0};
+std::atomic<uint64_t> g_skill_title_cache_actions{0};
+struct SkillTitleCacheEntry {
+    uintptr_t instance_weak_handle = 0;
+    std::string full_text;
+    int64_t restore_window_start_ns = 0;
+    uint32_t restore_count = 0;
+    bool rate_limit_logged = false;
+    float original_margin[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool has_original_margin = false;
+    bool two_line_margin_applied = false;
+};
+std::unordered_map<void *, SkillTitleCacheEntry> g_skill_title_full_cache;
 char g_il2cpp_path[PATH_MAX] = {};
 
 struct Il2CppStringLayout {
@@ -295,6 +324,7 @@ tmp_set_text_range_fn g_original_tmp_set_char_array_range = nullptr;
 tmp_set_text_string_fn g_original_tmp_set_text_string = nullptr;
 game_object_set_active_fn g_original_game_object_set_active = nullptr;
 thread_local bool g_refreshing_known_tmp_targets = false;
+thread_local bool g_suppress_tmp_text_submission = false;
 tmp_set_color_fn g_original_tmp_set_color = nullptr;
 material_set_color_fn g_original_material_set_color = nullptr;
 material_set_float_fn g_original_material_set_float = nullptr;
@@ -329,6 +359,10 @@ const void *g_tmp_get_overflow_mode_info = nullptr;
 const void *g_tmp_set_overflow_mode_info = nullptr;
 const void *g_tmp_get_font_style_info = nullptr;
 const void *g_tmp_set_font_style_info = nullptr;
+const void *g_tmp_get_alignment_info = nullptr;
+const void *g_tmp_set_alignment_info = nullptr;
+const void *g_tmp_get_margin_info = nullptr;
+const void *g_tmp_set_margin_info = nullptr;
 const void *g_tmp_get_alpha_info = nullptr;
 const void *g_tmp_set_alpha_info = nullptr;
 const void *g_tmp_get_max_visible_info = nullptr;
@@ -344,6 +378,7 @@ const void *g_tmp_set_enable_vertex_gradient_info = nullptr;
 const void *g_tmp_force_mesh_update_info = nullptr;
 int32_t g_tmp_force_mesh_update_arg_count = 0;
 const void *g_tmp_get_rect_transform_info = nullptr;
+const void *g_tmp_get_preferred_width_info = nullptr;
 const void *g_ui_get_font_info = nullptr;
 const void *g_ui_set_font_info = nullptr;
 const void *g_ui_font_has_character_info = nullptr;
@@ -404,16 +439,12 @@ std::atomic<uint64_t> g_ui_primary_font_switches{0};
 std::atomic<uint64_t> g_layout_decisions{0};
 std::atomic<uint64_t> g_material_pin_failures{0};
 
-/**
- * Keeps a managed wrapper strongly rooted for the duration of a native call.
- * TMP can rebuild arrays and trigger a GC between field lookups, so using the
- * raw il2cpp object address without a temporary strong handle is unsafe.
- */
 bool is_unity_object_alive(void *object) {
     if (object == nullptr) return false;
-    // 64-bit Unity IL2CPP: UnityEngine.Object.m_CachedPtr is located at offset 16 (sizeof(void*) * 2).
-    // Native C++ Object destruction clears m_CachedPtr to 0. A managed wrapper with m_CachedPtr == 0
-    // evaluates to null in Unity C# and throws ArgumentNullException when passed to Material/Mesh APIs.
+    // 64-bit Unity IL2CPP: UnityEngine.Object.m_CachedPtr is located at offset
+    // 16 (sizeof(void*) * 2). Native C++ destruction clears m_CachedPtr while
+    // the managed wrapper can remain reachable, so a valid GC handle alone is
+    // not enough to prove that the underlying Unity object is still usable.
     intptr_t cached_ptr = 0;
     memcpy(&cached_ptr,
            reinterpret_cast<const uint8_t *>(object) + sizeof(void *) * 2,
@@ -421,6 +452,11 @@ bool is_unity_object_alive(void *object) {
     return cached_ptr != 0;
 }
 
+/**
+ * Keeps a managed wrapper strongly rooted for the duration of a native call.
+ * TMP can rebuild arrays and trigger a GC between field lookups, so using the
+ * raw il2cpp object address without a temporary strong handle is unsafe.
+ */
 class ManagedObjectPin {
 public:
     explicit ManagedObjectPin(void *object) : object_(object) {
@@ -470,6 +506,257 @@ void release_object_handle(uintptr_t handle) {
     if (handle != 0 && g_gchandle_free != nullptr) {
         g_gchandle_free(handle);
     }
+}
+
+bool trailing_ellipsis_prefix_length(const std::string &text, size_t *prefix_length) {
+    if (text == "..." || text == "\xE2\x80\xA6") {
+        if (prefix_length != nullptr) *prefix_length = 0;
+        return true;
+    }
+    if (text.size() > 3 && text.compare(text.size() - 3, 3, "...") == 0) {
+        if (prefix_length != nullptr) *prefix_length = text.size() - 3;
+        return true;
+    }
+    if (text.size() > 3 && text.compare(text.size() - 3, 3, "\xE2\x80\xA6") == 0) {
+        if (prefix_length != nullptr) *prefix_length = text.size() - 3;
+        return true;
+    }
+    return false;
+}
+
+int64_t monotonic_time_ns() {
+    struct timespec value = {};
+    return clock_gettime(CLOCK_MONOTONIC, &value) == 0 ?
+            static_cast<int64_t>(value.tv_sec) * 1000000000LL + value.tv_nsec : 0;
+}
+
+bool read_tmp_margin(void *instance, float margin[4]) {
+    if (instance == nullptr || margin == nullptr ||
+        g_tmp_get_margin_info == nullptr || g_runtime_invoke == nullptr ||
+        g_object_unbox == nullptr) {
+        return false;
+    }
+    void *exception = nullptr;
+    void *boxed = g_runtime_invoke(
+            g_tmp_get_margin_info, instance, nullptr, &exception);
+    void *unboxed = exception == nullptr && boxed != nullptr ?
+            g_object_unbox(boxed) : nullptr;
+    if (unboxed == nullptr) return false;
+    memcpy(margin, unboxed, sizeof(float) * 4);
+    return true;
+}
+
+bool write_tmp_margin(void *instance, const float margin[4]) {
+    if (instance == nullptr || margin == nullptr ||
+        g_tmp_set_margin_info == nullptr || g_runtime_invoke == nullptr) {
+        return false;
+    }
+    void *args[] = {const_cast<float *>(margin)};
+    void *exception = nullptr;
+    g_runtime_invoke(g_tmp_set_margin_info, instance, args, &exception);
+    return exception == nullptr;
+}
+
+void restore_two_line_title_margin(void *instance) {
+    float original[4] = {};
+    bool restore = false;
+    pthread_mutex_lock(&g_skill_title_cache_lock);
+    auto found = g_skill_title_full_cache.find(instance);
+    if (found != g_skill_title_full_cache.end() &&
+        found->second.two_line_margin_applied) {
+        memcpy(original, found->second.original_margin, sizeof(original));
+        found->second.two_line_margin_applied = false;
+        found->second.has_original_margin = false;
+        restore = true;
+    }
+    pthread_mutex_unlock(&g_skill_title_cache_lock);
+    if (restore) write_tmp_margin(instance, original);
+}
+
+bool apply_two_line_title_margin(void *instance) {
+    float current[4] = {};
+    if (!read_tmp_margin(instance, current)) return false;
+    pthread_mutex_lock(&g_skill_title_cache_lock);
+    auto found = g_skill_title_full_cache.find(instance);
+    if (found == g_skill_title_full_cache.end()) {
+        pthread_mutex_unlock(&g_skill_title_cache_lock);
+        return false;
+    }
+    if (found->second.two_line_margin_applied) {
+        pthread_mutex_unlock(&g_skill_title_cache_lock);
+        return true;
+    }
+    memcpy(found->second.original_margin, current, sizeof(current));
+    found->second.has_original_margin = true;
+    found->second.two_line_margin_applied = true;
+    pthread_mutex_unlock(&g_skill_title_cache_lock);
+
+    // TMP margin order is left, top, right, bottom. Move the text area down
+    // without changing its height: add top inset and release the same amount
+    // at the bottom.
+    float adjusted[4] = {current[0], current[1] + 24.0f,
+                         current[2], current[3] - 24.0f};
+    const bool applied = write_tmp_margin(instance, adjusted);
+    if (!applied) {
+        pthread_mutex_lock(&g_skill_title_cache_lock);
+        auto state = g_skill_title_full_cache.find(instance);
+        if (state != g_skill_title_full_cache.end()) {
+            state->second.two_line_margin_applied = false;
+        }
+        pthread_mutex_unlock(&g_skill_title_cache_lock);
+    }
+    return applied;
+}
+
+void prune_skill_title_cache_locked() {
+    if (g_skill_title_full_cache.size() <= 256) return;
+    for (auto entry = g_skill_title_full_cache.begin();
+         entry != g_skill_title_full_cache.end();) {
+        if (resolve_live_object(
+                    entry->second.instance_weak_handle, entry->first) == nullptr) {
+            release_object_handle(entry->second.instance_weak_handle);
+            entry = g_skill_title_full_cache.erase(entry);
+        } else {
+            ++entry;
+        }
+    }
+    while (g_skill_title_full_cache.size() > 256) {
+        auto first = g_skill_title_full_cache.begin();
+        release_object_handle(first->second.instance_weak_handle);
+        g_skill_title_full_cache.erase(first);
+    }
+}
+
+void remember_full_skill_title(void *instance, const std::string &text) {
+    if (instance == nullptr || text.empty()) return;
+    bool changed = false;
+    bool replaced_previous_text = false;
+    pthread_mutex_lock(&g_skill_title_cache_lock);
+    auto found = g_skill_title_full_cache.find(instance);
+    if (found != g_skill_title_full_cache.end() &&
+        resolve_live_object(found->second.instance_weak_handle, instance) != nullptr) {
+        if (found->second.full_text != text) {
+            replaced_previous_text = true;
+            found->second.full_text = text;
+            found->second.restore_window_start_ns = 0;
+            found->second.restore_count = 0;
+            found->second.rate_limit_logged = false;
+            changed = true;
+        }
+    } else {
+        if (found != g_skill_title_full_cache.end()) {
+            release_object_handle(found->second.instance_weak_handle);
+            g_skill_title_full_cache.erase(found);
+        }
+        SkillTitleCacheEntry entry;
+        entry.instance_weak_handle = create_weak_object_handle(instance);
+        entry.full_text = text;
+        g_skill_title_full_cache.emplace(instance, std::move(entry));
+        changed = true;
+    }
+    prune_skill_title_cache_locked();
+    pthread_mutex_unlock(&g_skill_title_cache_lock);
+    if (replaced_previous_text) {
+        restore_two_line_title_margin(instance);
+    }
+    if (!changed) return;
+    uint64_t action = g_skill_title_cache_actions.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (action <= 40) {
+        LT_LOGI("Skill title cache stored instance=%p chars=%zu text=%s",
+                instance, text.size(), text.c_str());
+    }
+}
+
+bool restore_full_skill_title_from_cache(
+        void *instance, const std::string &truncated, std::string *restored) {
+    if (instance == nullptr || restored == nullptr) return false;
+    size_t prefix_length = 0;
+    if (!trailing_ellipsis_prefix_length(truncated, &prefix_length) ||
+        (prefix_length < 3 && truncated.size() > 3)) {
+        return false;
+    }
+    const int64_t now = monotonic_time_ns();
+    bool rate_limited = false;
+    bool log_rate_limit = false;
+    pthread_mutex_lock(&g_skill_title_cache_lock);
+    auto found = g_skill_title_full_cache.find(instance);
+    if (found != g_skill_title_full_cache.end() &&
+        resolve_live_object(found->second.instance_weak_handle, instance) != nullptr &&
+        found->second.full_text.size() > truncated.size() &&
+        found->second.full_text.compare(
+                0, prefix_length, truncated, 0, prefix_length) == 0) {
+        if (found->second.restore_window_start_ns == 0 ||
+            now - found->second.restore_window_start_ns > 1000000000LL) {
+            found->second.restore_window_start_ns = now;
+            found->second.restore_count = 0;
+            found->second.rate_limit_logged = false;
+        }
+        if (found->second.restore_count < 8) {
+            ++found->second.restore_count;
+            *restored = found->second.full_text;
+        } else {
+            rate_limited = true;
+            if (!found->second.rate_limit_logged) {
+                found->second.rate_limit_logged = true;
+                log_rate_limit = true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_skill_title_cache_lock);
+    if (rate_limited) {
+        g_suppress_tmp_text_submission = true;
+        if (log_rate_limit) {
+            LT_LOGW("Skill title cache rate limited instance=%p truncatedChars=%zu",
+                    instance, truncated.size());
+        }
+        return false;
+    }
+    if (restored->empty()) return false;
+    uint64_t action = g_skill_title_cache_actions.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (action <= 40) {
+        LT_LOGI("Skill title cache restored instance=%p truncatedChars=%zu"
+                " restoredChars=%zu text=%s",
+                instance, truncated.size(), restored->size(), restored->c_str());
+    }
+    return true;
+}
+
+std::string wrap_skill_title_two_lines(const std::string &text) {
+    if (text.empty() || text.find('\n') != std::string::npos) return text;
+    constexpr size_t kFirstLineCodepoints = 12;
+    size_t visible = 0;
+    size_t offset = 0;
+    size_t split_offset = std::string::npos;
+    while (offset < text.size()) {
+        size_t end = offset + 1;
+        if (text[offset] == '<') {
+            size_t tag_end = text.find('>', offset + 1);
+            if (tag_end != std::string::npos) {
+                offset = tag_end + 1;
+                continue;
+            }
+        }
+        unsigned char byte = static_cast<unsigned char>(text[offset]);
+        if ((byte & 0xE0) == 0xC0) end = offset + 2;
+        else if ((byte & 0xF0) == 0xE0) end = offset + 3;
+        else if ((byte & 0xF8) == 0xF0) end = offset + 4;
+        if (end > text.size()) end = text.size();
+        ++visible;
+        offset = end;
+        if (visible == kFirstLineCodepoints) {
+            split_offset = offset;
+            break;
+        }
+    }
+    if (split_offset == std::string::npos || split_offset >= text.size()) return text;
+    while (split_offset < text.size() &&
+           (text[split_offset] == ' ' || text[split_offset] == '\t')) {
+        ++split_offset;
+    }
+    if (split_offset >= text.size()) return text;
+    return text.substr(0, split_offset) + "\n" + text.substr(split_offset);
 }
 
 void register_source_material_owner(void *material, uintptr_t instance_handle) {
@@ -761,6 +1048,33 @@ void rebuild_term_trie() {
     }
 }
 
+void rebuild_keyword_name_trie() {
+    g_keyword_name_trie.clear();
+    g_keyword_name_trie.emplace_back();
+    for (const auto &entry : g_keyword_name_index) {
+        if (entry.first.empty() || entry.second.empty() ||
+            entry.first == entry.second ||
+            !is_usable_display_text(entry.first) ||
+            !is_usable_display_text(entry.second)) {
+            continue;
+        }
+        size_t node = 0;
+        for (unsigned char byte : entry.first) {
+            auto child = g_keyword_name_trie[node].children.find(byte);
+            if (child == g_keyword_name_trie[node].children.end()) {
+                size_t next = g_keyword_name_trie.size();
+                g_keyword_name_trie[node].children[byte] = next;
+                g_keyword_name_trie.emplace_back();
+                node = next;
+            } else {
+                node = child->second;
+            }
+        }
+        g_keyword_name_trie[node].source = &entry.first;
+        g_keyword_name_trie[node].translation = &entry.second;
+    }
+}
+
 /**
  * Skips invisible Unicode separators that a formatter may inject inside a
  * localized term for line-breaking or bidirectional text handling.
@@ -961,6 +1275,247 @@ bool translate_embedded_terms(
     return changed;
 }
 
+bool rich_text_ascii_space(char value) {
+    return value == ' ' || value == '\t' || value == '\n' || value == '\r';
+}
+
+/**
+ * Extracts the stable keyword ID from a TMP link opening tag.
+ *
+ * TMP renders both `<link="ID">` and `<link=ID>` forms. Keeping this parser
+ * deliberately narrow avoids interpreting unrelated rich-text tags as links.
+ */
+bool parse_rich_text_link_id(const std::string &tag, std::string *keyword_id) {
+    if (keyword_id == nullptr || tag.compare(0, 5, "<link") != 0) return false;
+    size_t offset = 5;
+    while (offset < tag.size() && rich_text_ascii_space(tag[offset])) ++offset;
+    if (offset >= tag.size() || tag[offset] != '=') return false;
+    ++offset;
+    while (offset < tag.size() && rich_text_ascii_space(tag[offset])) ++offset;
+    if (offset >= tag.size() || tag[offset] == '>') return false;
+
+    size_t end = offset;
+    const char quote = tag[offset];
+    if (quote == '"' || quote == '\'') {
+        ++offset;
+        end = tag.find(quote, offset);
+        if (end == std::string::npos) return false;
+    } else {
+        while (end < tag.size() && !rich_text_ascii_space(tag[end]) &&
+               tag[end] != '>') {
+            ++end;
+        }
+    }
+    if (end <= offset) return false;
+    keyword_id->assign(tag, offset, end - offset);
+    return !keyword_id->empty();
+}
+
+/** Resolves exact and common path-prefixed keyword IDs against the generated alias index. */
+const std::string *keyword_alias_for_rich_text_id(const std::string &keyword_id) {
+    if (keyword_id.empty() || g_keyword_alias_index.empty()) return nullptr;
+    auto exact = g_keyword_alias_index.find(keyword_id);
+    if (exact != g_keyword_alias_index.end()) return &exact->second;
+
+    const size_t separator = keyword_id.find_last_of("/:");
+    if (separator != std::string::npos && separator + 1 < keyword_id.size()) {
+        exact = g_keyword_alias_index.find(keyword_id.substr(separator + 1));
+        if (exact != g_keyword_alias_index.end()) return &exact->second;
+    }
+    if (keyword_id.size() > 2 && keyword_id.front() == '[' &&
+        keyword_id.back() == ']') {
+        exact = g_keyword_alias_index.find(
+                keyword_id.substr(1, keyword_id.size() - 2));
+        if (exact != g_keyword_alias_index.end()) return &exact->second;
+    }
+    return nullptr;
+}
+
+/** Removes TMP markup and compact whitespace from the display text of one link. */
+std::string compact_rich_text_visible_text(const std::string &source) {
+    std::string visible;
+    visible.reserve(source.size());
+    for (size_t offset = 0; offset < source.size();) {
+        if (source[offset] == '<') {
+            const size_t end = source.find('>', offset + 1);
+            if (end != std::string::npos) {
+                offset = end + 1;
+                continue;
+            }
+        }
+        if (!rich_text_ascii_space(source[offset])) {
+            visible.push_back(source[offset]);
+        }
+        ++offset;
+    }
+    return visible;
+}
+
+/**
+ * Replaces the dominant visible text run inside one link.
+ *
+ * Nested color/style tags remain byte-for-byte intact. Longest-run selection
+ * preserves separate icon glyphs when the game supplies them as another text
+ * span, while still translating the complete keyword name in normal markup.
+ */
+bool replace_rich_text_link_visible_text(
+        const std::string &source, const std::string &translation,
+        std::string *output) {
+    if (output == nullptr || translation.empty()) return false;
+    size_t best_begin = std::string::npos;
+    size_t best_end = std::string::npos;
+    size_t best_score = 0;
+    for (size_t offset = 0; offset < source.size();) {
+        if (source[offset] == '<') {
+            const size_t end = source.find('>', offset + 1);
+            if (end != std::string::npos) {
+                offset = end + 1;
+                continue;
+            }
+        }
+        size_t end = source.find('<', offset);
+        if (end == std::string::npos) end = source.size();
+        size_t score = 0;
+        for (size_t cursor = offset; cursor < end; ++cursor) {
+            if (!rich_text_ascii_space(source[cursor])) ++score;
+        }
+        if (score > best_score) {
+            best_begin = offset;
+            best_end = end;
+            best_score = score;
+        }
+        offset = end;
+    }
+    if (best_begin == std::string::npos || best_score == 0) return false;
+
+    size_t core_begin = best_begin;
+    while (core_begin < best_end && rich_text_ascii_space(source[core_begin])) {
+        ++core_begin;
+    }
+    size_t core_end = best_end;
+    while (core_end > core_begin && rich_text_ascii_space(source[core_end - 1])) {
+        --core_end;
+    }
+    output->assign(source, 0, core_begin);
+    output->append(translation);
+    output->append(source, core_end, std::string::npos);
+    return true;
+}
+
+/**
+ * Replaces visible keyword names in TMP rich text.
+ *
+ * The stable `<link>` ID is the primary lookup key. This avoids depending on a
+ * complete Japanese-name trie and prevents one unresolved link from rolling the
+ * entire paragraph back to Japanese. Every tag remains byte-for-byte intact, so
+ * click targets, color and style markup are preserved.
+ */
+bool translate_rich_text_keyword_names(
+        const std::string &source, std::string *output) {
+    if (output == nullptr || source.empty() ||
+        source.find("<link") == std::string::npos ||
+        (g_keyword_alias_index.empty() && g_keyword_name_trie.size() <= 1)) {
+        return false;
+    }
+    output->clear();
+    output->reserve(source.size());
+    bool changed = false;
+    size_t tag_count = 0;
+    size_t link_count = 0;
+    size_t id_hits = 0;
+    size_t name_hits = 0;
+    size_t unresolved_links = 0;
+    for (size_t offset = 0; offset < source.size();) {
+        if (source[offset] != '<') {
+            output->push_back(source[offset++]);
+            continue;
+        }
+        const size_t tag_end = source.find('>', offset + 1);
+        if (tag_end == std::string::npos) {
+            output->push_back(source[offset++]);
+            continue;
+        }
+        const std::string opening_tag = source.substr(offset, tag_end - offset + 1);
+        std::string keyword_id;
+        const bool is_link = parse_rich_text_link_id(opening_tag, &keyword_id);
+        if (!is_link) {
+            output->append(opening_tag);
+            offset = tag_end + 1;
+            ++tag_count;
+            continue;
+        }
+
+        ++tag_count;
+        ++link_count;
+        const size_t closing = source.find("</link>", tag_end + 1);
+        if (closing == std::string::npos) {
+            output->append(opening_tag);
+            offset = tag_end + 1;
+            ++unresolved_links;
+            continue;
+        }
+
+        const std::string inner =
+                source.substr(tag_end + 1, closing - tag_end - 1);
+        const std::string *translation = keyword_alias_for_rich_text_id(keyword_id);
+        bool used_id = translation != nullptr;
+        std::string fallback_translation;
+        if (translation == nullptr && g_keyword_name_trie.size() > 1) {
+            const std::string visible = compact_rich_text_visible_text(inner);
+            auto exact = g_keyword_name_index.find(visible);
+            if (exact != g_keyword_name_index.end()) {
+                fallback_translation = exact->second;
+                translation = &fallback_translation;
+            }
+        }
+
+        std::string localized_inner;
+        if (translation != nullptr && is_usable_display_text(*translation) &&
+            replace_rich_text_link_visible_text(inner, *translation, &localized_inner)) {
+            output->append(opening_tag);
+            output->append(localized_inner);
+            output->append("</link>");
+            changed = true;
+            if (used_id) ++id_hits;
+            else ++name_hits;
+        } else {
+            output->append(source, offset, closing + 7 - offset);
+            ++unresolved_links;
+        }
+        offset = closing + 7;
+        tag_count += 1;
+    }
+
+    if (!changed) {
+        if (unresolved_links > 0) {
+            uint64_t misses = g_rich_text_keyword_misses.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            if (misses <= 20 || misses % 250 == 0) {
+                LT_LOGI("TMP rich-text keyword names unresolved misses=%llu links=%zu "
+                        "aliasIndex=%zu names=%zu",
+                        static_cast<unsigned long long>(misses), link_count,
+                        g_keyword_alias_index.size(), g_keyword_name_index.size());
+            }
+        }
+        output->clear();
+        return false;
+    }
+
+    uint64_t hits = g_rich_text_keyword_hits.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    uint64_t diagnostics = g_rich_text_keyword_diagnostics.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (diagnostics <= 20 || hits % 250 == 0) {
+        LT_LOGI("TMP rich-text keyword names translated hits=%llu tags=%zu links=%zu "
+                "id=%zu name=%zu unresolved=%zu kana=%d chars=%zu->%zu",
+                static_cast<unsigned long long>(hits), tag_count, link_count,
+                id_hits, name_hits, unresolved_links,
+                contains_japanese_kana(*output) ? 1 : 0,
+                source.size(), output->size());
+    }
+    return true;
+}
+
 bool strip_line_height_tags(const std::string &source, std::string *output) {
     output->clear();
     output->reserve(source.size());
@@ -983,6 +1538,88 @@ bool strip_line_height_tags(const std::string &source, std::string *output) {
         output->push_back(source[offset++]);
     }
     return changed;
+}
+
+bool rich_text_control_tag_end(
+        const std::string &source, size_t offset, size_t *tag_end) {
+    if (tag_end == nullptr || offset >= source.size() || source[offset] != '<') {
+        return false;
+    }
+    const size_t end = source.find('>', offset + 1);
+    if (end == std::string::npos) return false;
+    size_t name = offset + 1;
+    if (name < end && source[name] == '/') ++name;
+    size_t name_end = name;
+    while (name_end < end &&
+           ((source[name_end] >= 'a' && source[name_end] <= 'z') ||
+            (source[name_end] >= 'A' && source[name_end] <= 'Z') ||
+            source[name_end] == '-')) {
+        ++name_end;
+    }
+    if (name_end == name || name_end >= end) return false;
+    const char boundary = source[name_end];
+    if (boundary != '=' && boundary != '>' && boundary != ' ' &&
+        boundary != '/' && boundary != '\t') {
+        return false;
+    }
+    *tag_end = end;
+    return true;
+}
+
+/** Removes TMP display-control tags while retaining all visible characters. */
+std::string canonicalize_rich_text_for_lookup(const std::string &source) {
+    std::string output;
+    output.reserve(source.size());
+    for (size_t offset = 0; offset < source.size();) {
+        size_t tag_end = 0;
+        if (rich_text_control_tag_end(source, offset, &tag_end)) {
+            offset = tag_end + 1;
+            continue;
+        }
+        output.push_back(source[offset++]);
+    }
+    return output;
+}
+
+std::string compact_rich_text_lookup_key(const std::string &source) {
+    std::string compact;
+    compact.reserve(source.size());
+    for (size_t offset = 0; offset < source.size();) {
+        const size_t separator_end = invisible_term_separator_end(source, offset);
+        if (separator_end != offset) {
+            offset = separator_end;
+            continue;
+        }
+        if (!rich_text_ascii_space(source[offset])) compact.push_back(source[offset]);
+        ++offset;
+    }
+    return compact;
+}
+
+/**
+ * Builds a conflict-safe canonical index from translations whose source
+ * contains TMP markup. Hidden ruby readings are discarded with their tags;
+ * the visible base character remains part of the key.
+ */
+void rebuild_rich_text_canonical_index() {
+    g_rich_text_canonical_index.clear();
+    std::unordered_set<std::string> conflicts;
+    for (const auto &entry : g_index) {
+        const std::string visible =
+                canonicalize_rich_text_for_lookup(entry.first);
+        const std::string canonical = compact_rich_text_lookup_key(visible);
+        if (canonical.empty() || canonical == entry.first ||
+            conflicts.find(canonical) != conflicts.end()) {
+            continue;
+        }
+        auto existing = g_rich_text_canonical_index.find(canonical);
+        if (existing == g_rich_text_canonical_index.end()) {
+            g_rich_text_canonical_index.emplace(canonical, entry.second);
+        } else if (existing->second != entry.second) {
+            g_rich_text_canonical_index.erase(existing);
+            conflicts.insert(canonical);
+        }
+    }
 }
 
 std::string apply_dante_line_height(const std::string &translation) {
@@ -1544,14 +2181,10 @@ bool restore_ellipsis_truncated_translation(const std::string &text,
     pthread_mutex_lock(&g_font_state_lock);
     for (const std::string &entry : g_translated_managed_texts) {
         if (entry == text) continue;
-        if (entry.find("...") != std::string::npos ||
-            entry.find("\xe2\x80\xa6") != std::string::npos) {
-            continue;
-        }
         if (entry.size() > prefix_len &&
             entry.find('\n') == std::string::npos &&
             entry.compare(0, prefix_len, text, 0, prefix_len) == 0) {
-            if (!found || entry.size() > best_match.size()) {
+            if (!found || entry.size() < best_match.size()) {
                 best_match = entry;
                 found = true;
             }
@@ -1607,6 +2240,22 @@ void *translate_managed_string(
                 probe_kind, stage, source, result, translated, incomplete,
                 probe_template_count);
     };
+    if (source.find("<link") != std::string::npos) {
+        uint64_t probes = g_rich_text_probe_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+        if (probes <= 20 || probes % 250 == 0) {
+            size_t link_count = 0;
+            size_t offset = 0;
+            while ((offset = source.find("<link", offset)) != std::string::npos) {
+                ++link_count;
+                offset += 5;
+            }
+            LT_LOGI("TMP rich-text probe count=%llu links=%zu chars=%zu"
+                    " keywordNameMatches=%d",
+                    static_cast<unsigned long long>(probes), link_count,
+                    source.size(), g_keyword_name_trie.size() > 1 ? 1 : 0);
+        }
+    }
     // Formatter/object hooks can hand the same translated value to TMP after the
     // original managed object has been copied. Never feed a known Chinese output
     // back through the short-term trie: terms such as 最高 are also valid Japanese
@@ -1684,6 +2333,26 @@ void *translate_managed_string(
             match = g_index.find(normalized);
             fallback_match = g_fallback_index.find(normalized);
         }
+        std::string canonical_source;
+        std::unordered_map<std::string, std::string>::const_iterator canonical_match =
+                g_rich_text_canonical_index.end();
+        bool canonical_index_match = false;
+        std::unordered_map<std::string, std::string>::const_iterator canonical_fallback =
+                g_fallback_index.end();
+        if (protected_spans.empty()) {
+            canonical_source = compact_rich_text_lookup_key(
+                    canonicalize_rich_text_for_lookup(source));
+            if (!canonical_source.empty() && canonical_source != source) {
+                canonical_match =
+                        g_rich_text_canonical_index.find(canonical_source);
+                canonical_index_match =
+                        canonical_match != g_rich_text_canonical_index.end();
+                if (!canonical_index_match) {
+                    canonical_match = g_index.find(canonical_source);
+                }
+                canonical_fallback = g_fallback_index.find(canonical_source);
+            }
+        }
         if (line_height_normalized && match != g_index.end()) {
             translated = apply_dante_line_height(match->second);
             probe_stage = "normalized-index-match";
@@ -1692,12 +2361,29 @@ void *translate_managed_string(
             translated = apply_dante_line_height(fallback_match->second);
             probe_stage = "normalized-fallback-match";
             g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
+        } else if (canonical_index_match || canonical_match != g_index.end()) {
+            translated = canonical_match->second;
+            probe_stage = "rich-text-canonical-match";
+            uint64_t hits = g_rich_text_canonical_matches.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            if (hits <= 40 || hits % 250 == 0) {
+                LT_LOGI("Rich-text canonical story match hits=%llu chars=%zu->%zu",
+                        static_cast<unsigned long long>(hits),
+                        source.size(), canonical_source.size());
+            }
+        } else if (canonical_fallback != g_fallback_index.end()) {
+            translated = canonical_fallback->second;
+            probe_stage = "rich-text-canonical-fallback";
+            g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
         } else if (protected_spans.empty() && translate_sinner_formatted_text(source, &translated)) {
             probe_stage = "sinner-template-match";
             g_exact_matches.fetch_add(1, std::memory_order_relaxed);
         } else if (protected_spans.empty() && translate_multiline_exact(source, &translated)) {
             // The formatter joined several already-localized fields with newlines.
             probe_stage = "multiline-match";
+        } else if (protected_spans.empty() &&
+                   translate_rich_text_keyword_names(source, &translated)) {
+            probe_stage = "rich-text-keyword-match";
         } else if (!translate_embedded_terms(source, &translated, &protected_spans)) {
             if (!protected_spans.empty()) {
                 // 原 formatter 已使用本次汉化字段，即使只替换了数字也要传递新的来源凭据。
@@ -2172,6 +2858,10 @@ void translate_object_graph(void *instance) {
     translate_object_graph_impl(instance, 0, &visited);
 }
 
+std::string read_managed_string_value(void *managed_text);
+bool read_collection_count(void *collection, int32_t *count);
+void *read_collection_item(void *collection, int32_t index);
+
 typedef void *(*acquisition0_fn)(void *, const void *);
 typedef void *(*acquisition1_fn)(void *, void *, const void *);
 typedef void *(*acquisition2_fn)(void *, void *, void *, const void *);
@@ -2181,6 +2871,96 @@ acquisition1_fn g_acquisition1[kAcquisitionSlots] = {};
 acquisition2_fn g_acquisition2[kAcquisitionSlots] = {};
 std::string g_acquisition1_battle_hint_tables[kAcquisitionSlots];
 std::string g_acquisition2_battle_hint_tables[kAcquisitionSlots];
+
+const size_t kKeywordTextGetterSlots = 8;
+typedef void *(*keyword_text_getter_fn)(void *, void *);
+keyword_text_getter_fn g_keyword_text_getters[kKeywordTextGetterSlots] = {};
+std::string g_keyword_text_getter_classes[kKeywordTextGetterSlots];
+bool g_keyword_text_getter_object_arrays[kKeywordTextGetterSlots] = {};
+
+/**
+ * Resolves a translated keyword name by the stable ID passed to a game
+ * TextData GetText method. The caller keeps ownership of clickable markup.
+ */
+void *translated_keyword_alias_for_key(void *key, bool object_array) {
+    if (key == nullptr || g_keyword_alias_index.empty()) return nullptr;
+    std::string keyword_id;
+    std::unordered_map<std::string, std::string>::const_iterator match =
+            g_keyword_alias_index.end();
+    if (!object_array) {
+        keyword_id = read_managed_string_value(key);
+        match = g_keyword_alias_index.find(keyword_id);
+    } else {
+        int32_t count = 0;
+        if (!read_collection_count(key, &count)) return nullptr;
+        count = std::min(std::max(count, 0), 16);
+        for (int32_t index = 0; index < count; ++index) {
+            void *item = read_collection_item(key, index);
+            if (item == nullptr) continue;
+            const std::string candidate = read_managed_string_value(item);
+            if (candidate.empty()) continue;
+            auto found = g_keyword_alias_index.find(candidate);
+            if (found != g_keyword_alias_index.end()) {
+                keyword_id = candidate;
+                match = found;
+                break;
+            }
+        }
+    }
+    if (keyword_id.empty() || match == g_keyword_alias_index.end() ||
+        !is_usable_display_text(match->second)) return nullptr;
+    void *replacement = new_managed_string(match->second);
+    if (replacement == nullptr ||
+        !remember_translation_owned_string(replacement)) {
+        return nullptr;
+    }
+    remember_formatter_translation(match->second);
+    pthread_mutex_lock(&g_font_state_lock);
+    g_translated_managed_texts.insert(match->second);
+    pthread_mutex_unlock(&g_font_state_lock);
+    uint64_t hits = g_keyword_get_text_hits.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (hits <= 20 || hits % 500 == 0) {
+        LT_LOGI("Translated keyword GetText hit=%llu id=%s",
+                static_cast<unsigned long long>(hits), keyword_id.c_str());
+    }
+    return replacement;
+}
+
+void *invoke_keyword_text_getter(size_t slot, void *instance, void *key) {
+    if (slot >= kKeywordTextGetterSlots || g_keyword_text_getters[slot] == nullptr) {
+        return nullptr;
+    }
+    void *formatted = g_keyword_text_getters[slot](instance, key);
+    void *translated = translate_managed_string(formatted);
+    if (translated == formatted) {
+        void *alias = translated_keyword_alias_for_key(
+                key, g_keyword_text_getter_object_arrays[slot]);
+        if (alias != nullptr) translated = alias;
+    }
+    return translated == nullptr ? formatted : translated;
+}
+
+#define DEFINE_KEYWORD_TEXT_GETTER(N) \
+    void *replacement_keyword_text_getter_##N(void *instance, void *key) { \
+        return invoke_keyword_text_getter(N, instance, key); \
+    }
+#define KEYWORD_TEXT_GETTER_SLOTS(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
+KEYWORD_TEXT_GETTER_SLOTS(DEFINE_KEYWORD_TEXT_GETTER)
+#undef DEFINE_KEYWORD_TEXT_GETTER
+#define KEYWORD_TEXT_GETTER_ENTRY(N) replacement_keyword_text_getter_##N,
+keyword_text_getter_fn const kKeywordTextGetterReplacements[] = {
+        KEYWORD_TEXT_GETTER_SLOTS(KEYWORD_TEXT_GETTER_ENTRY)
+};
+#undef KEYWORD_TEXT_GETTER_ENTRY
+#undef KEYWORD_TEXT_GETTER_SLOTS
+
+bool keyword_text_formatter_class(const std::string &class_name) {
+    return class_name == "TextData_BattleKeywords" ||
+           class_name == "TextData_Buf" ||
+           class_name == "TextData_BuffAbility" ||
+           class_name == "TextData_KeywordDictionary";
+}
 
 bool battle_hint_table_name(
         const std::string &class_name, std::string *table_name) {
@@ -2276,6 +3056,9 @@ void clear_tmp_font_fallback_table(void *asset);
 void prepend_tmp_font_fallback(void *asset, void *chinese_font);
 bool is_mirror_dungeon_gift_or_shop_name(const std::string &component_name,
                                          const std::string &parent_name);
+bool should_preserve_mirror_dungeon_source_color(
+        void *instance, const TmpComponentState &state,
+        const std::string &component_name, const std::string &parent_name);
 bool is_battle_winrate_control(
         const std::string &component_name, const std::string &parent_name,
         const std::string &display_text = std::string());
@@ -3451,7 +4234,10 @@ void *read_tmp_material_collection(void *instance) {
 }
 
 bool apply_chinese_material_underlay(void *material, bool force) {
-    if (material == nullptr || !is_unity_object_alive(material) || g_runtime_invoke == nullptr) return false;
+    if (material == nullptr || !is_unity_object_alive(material) ||
+        g_runtime_invoke == nullptr) {
+        return false;
+    }
     ManagedObjectPin material_pin(material);
     if (!material_pin.alive()) {
         uint64_t failures = g_material_pin_failures.fetch_add(
@@ -3630,6 +4416,8 @@ void sync_translated_tmp_materials(void *instance, bool force = false) {
             is_top_battle_state_control(component_name, parent_name);
     const bool bottom_status =
             is_bottom_battle_status_control(component_name, parent_name);
+    const bool preserve_source_color = should_preserve_mirror_dungeon_source_color(
+            instance, state, component_name, parent_name);
     if (top_status) {
         restore_tmp_visual_colors(instance, state);
     }
@@ -3641,7 +4429,8 @@ void sync_translated_tmp_materials(void *instance, bool force = false) {
     const bool is_battle_control_sync = top_status || bottom_status ||
             is_battle_skill_banner_control(component_name, parent_name) ||
             is_battle_winrate_control(component_name, parent_name) ||
-            state.preserve_source_outline || state.use_regular_title_font;
+            state.preserve_source_outline || state.use_regular_title_font ||
+            preserve_source_color;
     void *materials = read_tmp_material_collection(instance);
     if (materials != nullptr) {
         ManagedObjectPin materials_pin(materials);
@@ -4033,18 +4822,40 @@ bool is_mirror_dungeon_gift_or_shop_name(const std::string &component_name,
     return false;
 }
 
-bool is_battle_skill_banner_control(const std::string &component_name,
-                                    const std::string &parent_name) {
-    if (component_name == "SkillNameText") {
-        return parent_name.find("SkillNameField") != std::string::npos ||
-               parent_name.find("Banner") != std::string::npos ||
-               parent_name.find("Duel") != std::string::npos ||
-               parent_name.find("Skill") != std::string::npos;
-    }
-    if (component_name == "Name" && parent_name.find("NameField") != std::string::npos) {
+bool should_preserve_mirror_dungeon_source_color(
+        void *instance, const TmpComponentState &state,
+        const std::string &component_name, const std::string &parent_name) {
+    const MaterialVisualStyle &style = state.source_material_style;
+    if (!style.has_face_color || style.face_color[3] <= 0.001f) return false;
+    const float max_rgb = std::max(
+            style.face_color[0],
+            std::max(style.face_color[1], style.face_color[2]));
+    if (max_rgb <= 0.01f) return false;
+    const bool non_white =
+            std::abs(style.face_color[0] - 1.0f) > 0.02f ||
+            std::abs(style.face_color[1] - 1.0f) > 0.02f ||
+            std::abs(style.face_color[2] - 1.0f) > 0.02f ||
+            max_rgb > 1.01f;
+    if (!non_white) return false;
+
+    if (!is_unity_object_alive(instance)) return false;
+    auto is_mirror_dungeon = [](const std::string &name) {
+        return name.find("MirrorDungeon") != std::string::npos;
+    };
+    if (is_mirror_dungeon(component_name) || is_mirror_dungeon(parent_name)) {
         return true;
     }
-    return false;
+    const std::vector<std::string> ancestors =
+            read_unity_ancestor_names(instance, 12);
+    return std::any_of(
+            ancestors.begin(), ancestors.end(),
+            [&](const std::string &name) { return is_mirror_dungeon(name); });
+}
+
+bool is_battle_skill_banner_control(const std::string &component_name,
+                                    const std::string &parent_name) {
+    return (component_name == "SkillNameText" && parent_name == "SkillNameField") ||
+           (component_name == "Name" && parent_name == "NameField");
 }
 
 bool is_loading_screen_hint_title(const std::string &display_text) {
@@ -4170,7 +4981,10 @@ bool find_tmp_component_state(void *instance, TmpComponentState *state) {
 }
 
 void set_tmp_component_font_material(void *instance, void *material) {
-    if (instance == nullptr || material == nullptr || !is_unity_object_alive(material)) return;
+    if (instance == nullptr || material == nullptr ||
+        !is_unity_object_alive(material)) {
+        return;
+    }
     if (g_original_tmp_set_material != nullptr) {
         g_original_tmp_set_material(
                 instance, material, g_tmp_set_font_material_info);
@@ -4223,6 +5037,8 @@ void *ensure_translated_tmp_material(void *instance) {
             is_top_battle_state_control(component_name, parent_name);
     const bool bottom_status =
             is_bottom_battle_status_control(component_name, parent_name);
+    const bool preserve_source_color = should_preserve_mirror_dungeon_source_color(
+            instance, state, component_name, parent_name);
     if (top_status) {
         restore_tmp_visual_colors(instance, state);
     }
@@ -4240,7 +5056,8 @@ void *ensure_translated_tmp_material(void *instance) {
     const bool is_battle_control = top_status || bottom_status ||
             is_battle_skill_banner_control(component_name, parent_name) ||
             is_battle_winrate_control(component_name, parent_name) ||
-            state.preserve_source_outline || state.use_regular_title_font;
+            state.preserve_source_outline || state.use_regular_title_font ||
+            preserve_source_color;
     if (mirror_reward || !is_battle_control) {
         return invoke_object_getter(g_tmp_font_get_material_info, active_asset);
     }
@@ -4851,11 +5668,6 @@ bool apply_translated_tmp_style(void *instance, void *managed_text,
             maximum = std::max(maximum, state.font_size_max);
         }
         float minimum = std::max(10.0f, maximum * 0.45f);
-        if (skill_title && visible_length > 0) {
-            float available_width = rect.valid && rect.width > 30.0f ? rect.width : 280.0f;
-            float required_min = available_width / (static_cast<float>(visible_length) * 1.05f);
-            minimum = std::fmax(8.0f, std::fmin(minimum, required_min));
-        }
         invoke_bool_setter(g_tmp_set_word_wrapping_info, instance, false);
         invoke_float_setter(g_tmp_set_font_size_min_info, instance, minimum);
         invoke_float_setter(g_tmp_set_font_size_max_info, instance, maximum);
@@ -4982,6 +5794,28 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
             bool needs_fallback = std::any_of(source.begin(), source.end(),
                     [](unsigned char byte) { return (byte & 0x80) != 0; });
             if (needs_fallback) ensure_tmp_font();
+            if (source.find("<ruby") != std::string::npos) {
+                uint64_t probes = g_rich_text_source_probes.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                if (probes <= 40) {
+                    const std::string canonical =
+                            compact_rich_text_lookup_key(
+                                    canonicalize_rich_text_for_lookup(source));
+                    const bool exact = g_index.find(source) != g_index.end();
+                    const bool canonical_match =
+                            (!canonical.empty() &&
+                             (g_rich_text_canonical_index.find(canonical) !=
+                                      g_rich_text_canonical_index.end() ||
+                              g_index.find(canonical) != g_index.end()));
+                    LT_LOGI("TMP ruby source probe count=%llu name=%s parent=%s"
+                            " chars=%zu canonicalChars=%zu exact=%d canonical=%d",
+                            static_cast<unsigned long long>(probes),
+                            read_unity_object_name(instance).c_str(),
+                            read_unity_parent_name(instance).c_str(),
+                            source.size(), canonical.size(), exact ? 1 : 0,
+                            canonical_match ? 1 : 0);
+                }
+            }
             replacement = translate_managed_string(managed_text);
             // Shop costs use ASCII question marks as a deliberate game-font
             // placeholder. Replacing them with full-width Chinese question marks
@@ -5055,7 +5889,6 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     display_text = restored_full_text;
                 }
             }
-            bool translated = is_translated_managed_string(replacement);
             void *current_font = g_tmp_get_font == nullptr ? nullptr :
                     g_tmp_get_font(instance, g_tmp_get_font_info);
             bool already_chinese = current_font == g_tmp_font_asset ||
@@ -5069,6 +5902,23 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     is_mirror_dungeon_reward_control(component_name, parent_name, source);
             const bool battle_skill_banner =
                     is_battle_skill_banner_control(component_name, parent_name);
+            if (battle_skill_banner) {
+                if (trailing_ellipsis_prefix_length(display_text, nullptr)) {
+                    std::string cached_full_text;
+                    if (restore_full_skill_title_from_cache(
+                                instance, display_text, &cached_full_text)) {
+                        void *unabbreviated = new_managed_string(cached_full_text);
+                        if (unabbreviated != nullptr &&
+                            remember_translation_owned_string(unabbreviated)) {
+                            replacement = unabbreviated;
+                            display_text = cached_full_text;
+                        }
+                    }
+                } else {
+                    remember_full_skill_title(instance, display_text);
+                }
+            }
+            bool translated = is_translated_managed_string(replacement);
             const bool loading_hint_title =
                     is_loading_screen_hint_title(display_text);
             const bool battle_winrate_label =
@@ -5083,23 +5933,6 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
             const bool may_be_composed_cjk_ui =
                     egogift_name || mirror_reward_ui || battle_skill_banner ||
                     battle_winrate_label || general_ui_cjk;
-            if (battle_skill_banner) {
-                translated = true;
-                size_t banner_chars = count_visible_codepoints(display_text);
-                if (banner_chars > 6 && g_tmp_set_font_size_info != nullptr) {
-                    // 长技能名在 36px 基础字号下 preferredWidth 会超过横幅宽度上限 (~240px)，
-                    // 从而触发游戏 C# while 循环截断字符并追加 "..."。
-                    // 提前将基础字号下调，使 preferredWidth <= 240px，彻底阻止游戏截断并保证底框饱满。
-                    float adapted_size = std::max(10.0f, 230.0f / (static_cast<float>(banner_chars) * 1.02f));
-                    invoke_float_setter(g_tmp_set_font_size_info, instance, adapted_size);
-                } else if (banner_chars > 0 && g_tmp_set_font_size_info != nullptr) {
-                    TmpComponentState banner_state;
-                    if (find_tmp_component_state(instance, &banner_state) &&
-                        banner_state.has_font_size && banner_state.font_size >= 28.0f) {
-                        invoke_float_setter(g_tmp_set_font_size_info, instance, banner_state.font_size);
-                    }
-                }
-            }
             bool promoted_egogift = false;
             if (!translated && !already_chinese && current_font != nullptr &&
                 may_be_composed_cjk_ui) {
@@ -5388,10 +6221,7 @@ void finalize_tmp_text(void *instance, void *managed_text) {
         return;
     }
     const bool promoted_rebuild = has_pending_tmp_rebuild(instance);
-    const std::string component_name = read_unity_object_name(instance);
-    const std::string parent_name = read_unity_parent_name(instance);
-    const bool is_skill_banner = is_battle_skill_banner_control(component_name, parent_name);
-    if (!is_translated_managed_string(managed_text) && !promoted_rebuild && !is_skill_banner) {
+    if (!is_translated_managed_string(managed_text) && !promoted_rebuild) {
         return;
     }
     TmpComponentState state;
@@ -5402,6 +6232,44 @@ void finalize_tmp_text(void *instance, void *managed_text) {
         apply_translated_tmp_style(instance, managed_text, state);
     }
     const std::string finalized_text = read_managed_string_value(managed_text);
+    if (found_state && g_original_tmp_set_text != nullptr &&
+        is_battle_skill_banner_control(
+                read_unity_object_name(instance), read_unity_parent_name(instance)) &&
+        finalized_text.find('\n') == std::string::npos) {
+        float preferred_width = 0.0f;
+        const bool measured = invoke_float_getter(
+                g_tmp_get_preferred_width_info, instance, &preferred_width);
+        if ((measured && preferred_width > 460.0f) ||
+            (!measured && count_visible_codepoints(finalized_text) > 12)) {
+            const std::string wrapped_text =
+                    wrap_skill_title_two_lines(finalized_text);
+            if (wrapped_text.find('\n') != std::string::npos) {
+                void *wrapped_managed = new_managed_string(wrapped_text);
+                if (wrapped_managed != nullptr &&
+                    remember_translation_owned_string(wrapped_managed)) {
+                    g_original_tmp_set_text(
+                            instance, wrapped_managed, g_tmp_set_text_one_info);
+                    invoke_float_setter(g_tmp_set_font_size_info, instance, 36.0f);
+                    invoke_bool_setter(g_tmp_set_auto_sizing_info, instance, false);
+                    invoke_bool_setter(g_tmp_set_word_wrapping_info, instance, false);
+                    invoke_int_setter(g_tmp_set_overflow_mode_info, instance, 0);
+                    invoke_float_setter(g_tmp_set_line_spacing_info, instance, -8.0f);
+                    const bool shifted = apply_two_line_title_margin(instance);
+                    force_tmp_mesh_update(instance);
+                    static std::atomic<uint64_t> two_line_logs{0};
+                    uint64_t hit = two_line_logs.fetch_add(
+                            1, std::memory_order_relaxed) + 1;
+                    if (hit <= 40) {
+                        LT_LOGI("Skill title two-line layout instance=%p"
+                                " preferred=%.1f firstChars=12 marginShift=%d"
+                                " text=%s",
+                                instance, preferred_width, shifted ? 1 : 0,
+                                wrapped_text.c_str());
+                    }
+                }
+            }
+        }
+    }
     const char *probe_kind = known_text_probe_kind(finalized_text);
     const bool requested_rebuild = consume_tmp_rebuild_request(instance);
     if (requested_rebuild) {
@@ -5756,6 +6624,7 @@ void invoke_tmp_char_text(
         void *instance, void *array, int32_t start, int32_t length,
         const void *method, tmp_set_text_fn original_char,
         tmp_set_text_range_fn original_range) {
+    g_suppress_tmp_text_submission = false;
     const int32_t total = char_array_length(array);
     if (total < 0) {
         if (original_range != nullptr) {
@@ -5789,6 +6658,9 @@ void invoke_tmp_char_text(
     const std::string source = read_managed_string_value(managed_text);
     const char *probe_kind = known_text_probe_kind(source);
     void *replacement = prepare_tmp_text(instance, managed_text);
+    if (g_suppress_tmp_text_submission) {
+        return;
+    }
     if (replacement != managed_text && g_original_tmp_set_text_one != nullptr) {
         if (probe_kind != nullptr) {
             LT_LOGI("Known text renderer kind=%s renderer=TMP-char-array instance=%p"
@@ -5869,13 +6741,21 @@ void replacement_game_object_set_active(
 }
 
 void replacement_tmp_set_text(void *instance, void *managed_text, const void *method) {
+    g_suppress_tmp_text_submission = false;
     void *replacement = prepare_tmp_text(instance, managed_text);
+    if (g_suppress_tmp_text_submission) {
+        return;
+    }
     g_original_tmp_set_text(instance, replacement, method);
     finalize_tmp_text(instance, replacement);
 }
 
 void replacement_tmp_set_text_one(void *instance, void *managed_text, const void *method) {
+    g_suppress_tmp_text_submission = false;
     void *replacement = prepare_tmp_text(instance, managed_text);
+    if (g_suppress_tmp_text_submission) {
+        return;
+    }
     g_original_tmp_set_text_one(instance, replacement, method);
     finalize_tmp_text(instance, replacement);
 }
@@ -5909,7 +6789,11 @@ void replacement_text_mesh_set_text(
 
 void replacement_tmp_set_text_string(void *instance, void *managed_text, bool sync_input,
                                      const void *method) {
+    g_suppress_tmp_text_submission = false;
     void *replacement = prepare_tmp_text(instance, managed_text);
+    if (g_suppress_tmp_text_submission) {
+        return;
+    }
     g_original_tmp_set_text_string(instance, replacement, sync_input, method);
     finalize_tmp_text(instance, replacement);
 }
@@ -5991,6 +6875,8 @@ bool load_index_file(const char *path) {
     uint32_t fallback_count = 0;
     uint32_t context_count = 0;
     uint32_t battle_hint_count = 0;
+    uint32_t keyword_alias_count = 0;
+    uint32_t keyword_name_count = 0;
     bool valid = read_exact(file, magic, sizeof(magic)) &&
                  memcmp(magic, kIndexMagic, sizeof(magic)) == 0 &&
                  read_u32(file, &schema) && schema == kIndexSchema &&
@@ -5999,12 +6885,18 @@ bool load_index_file(const char *path) {
                  read_u32(file, &fallback_count) && fallback_count <= kMaxEntries &&
                  read_u32(file, &context_count) && context_count <= kMaxEntries &&
                  read_u32(file, &battle_hint_count) &&
-                 battle_hint_count <= kMaxEntries;
+                 battle_hint_count <= kMaxEntries &&
+                 read_u32(file, &keyword_alias_count) &&
+                 keyword_alias_count <= kMaxEntries &&
+                 read_u32(file, &keyword_name_count) &&
+                 keyword_name_count <= kMaxEntries;
     std::unordered_map<std::string, std::string> loaded;
     std::unordered_map<std::string, std::string> loaded_terms;
     std::unordered_map<std::string, std::string> loaded_fallback;
     std::unordered_map<std::string, std::string> loaded_context;
     std::unordered_map<std::string, std::string> loaded_battle_hint;
+    std::unordered_map<std::string, std::string> loaded_keyword_aliases;
+    std::unordered_map<std::string, std::string> loaded_keyword_names;
     if (valid) {
         loaded.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
@@ -6057,31 +6949,67 @@ bool load_index_file(const char *path) {
             }
             loaded_battle_hint[key] = translation;
         }
+        loaded_keyword_aliases.reserve(keyword_alias_count);
+        for (uint32_t i = 0; valid && i < keyword_alias_count; ++i) {
+            std::string keyword_id;
+            std::string translation;
+            if (!read_string(file, &keyword_id) ||
+                !read_string(file, &translation) ||
+                keyword_id.empty()) {
+                valid = false;
+                break;
+            }
+            loaded_keyword_aliases[keyword_id] = translation;
+        }
+        loaded_keyword_names.reserve(keyword_name_count);
+        for (uint32_t i = 0; valid && i < keyword_name_count; ++i) {
+            std::string source;
+            std::string translation;
+            if (!read_string(file, &source) ||
+                !read_string(file, &translation) ||
+                source.empty()) {
+                valid = false;
+                break;
+            }
+            loaded_keyword_names[source] = translation;
+        }
     }
     fclose(file);
     if (!valid || loaded.size() != count || loaded_terms.size() != term_count ||
         loaded_fallback.size() != fallback_count || loaded_context.size() != context_count ||
-        loaded_battle_hint.size() != battle_hint_count) {
+        loaded_battle_hint.size() != battle_hint_count ||
+        loaded_keyword_aliases.size() != keyword_alias_count ||
+        loaded_keyword_names.size() != keyword_name_count) {
         LT_LOGW("Reject invalid translation index path=%s schema=%u "
-                "declared=%u/%u/%u/%u/%u loaded=%zu/%zu/%zu/%zu/%zu",
+                "declared=%u/%u/%u/%u/%u/%u/%u loaded=%zu/%zu/%zu/%zu/%zu/%zu/%zu",
                 path, schema, count, term_count, fallback_count, context_count,
-                battle_hint_count, loaded.size(), loaded_terms.size(),
+                battle_hint_count, keyword_alias_count, keyword_name_count,
+                loaded.size(), loaded_terms.size(),
                 loaded_fallback.size(), loaded_context.size(),
-                loaded_battle_hint.size());
+                loaded_battle_hint.size(), loaded_keyword_aliases.size(),
+                loaded_keyword_names.size());
         return false;
     }
     g_index.swap(loaded);
+    rebuild_rich_text_canonical_index();
     g_terms.swap(loaded_terms);
     g_fallback_index.swap(loaded_fallback);
     g_context_index.swap(loaded_context);
     g_battle_hint_index.swap(loaded_battle_hint);
+    g_keyword_alias_index.swap(loaded_keyword_aliases);
+    g_keyword_name_index.swap(loaded_keyword_names);
     rebuild_package_line_break_index(g_index);
     rebuild_package_line_break_index(g_fallback_index);
     rebuild_term_trie();
+    rebuild_keyword_name_trie();
     LT_LOGI("Loaded Japanese full-text translation index entries=%zu terms=%zu fallback=%zu "
-            "context=%zu battleHints=%zu lineBreaks=%zu path=%s",
+            "context=%zu battleHints=%zu keywordAliases=%zu keywordNames=%zu"
+            " richTextCanonical=%zu lineBreaks=%zu path=%s",
             g_index.size(), g_terms.size(), g_fallback_index.size(),
             g_context_index.size(), g_battle_hint_index.size(),
+            g_keyword_alias_index.size(),
+            g_keyword_name_index.size(),
+            g_rich_text_canonical_index.size(),
             g_package_line_breaks.size(), path);
     return true;
 }
@@ -6356,6 +7284,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
     const void *tmp_set_char_array_method = nullptr;
     const void *tmp_set_char_array_range_method = nullptr;
     void *tmp_text_class = nullptr;
+    void *tmp_text_ugui_class = nullptr;
+    void *tmp_text_3d_class = nullptr;
     void *ui_text_class = nullptr;
     void *text_mesh_class = nullptr;
     void *game_object_class = nullptr;
@@ -6396,6 +7326,14 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                 tmp_text_class = klass;
                 tmp_method = class_get_method_from_name(klass, "set_text", 1);
             }
+        }
+        if (tmp_text_ugui_class == nullptr) {
+            tmp_text_ugui_class =
+                    class_from_name(image, "TMPro", "TextMeshProUGUI");
+        }
+        if (tmp_text_3d_class == nullptr) {
+            tmp_text_3d_class =
+                    class_from_name(image, "TMPro", "TextMeshPro");
         }
         if (ui_method == nullptr) {
             void *klass = class_from_name(image, "UnityEngine.UI", "Text");
@@ -6481,12 +7419,35 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             assembly_count, tmp_method, tmp_pointer, ui_method, ui_pointer,
             text_mesh_method, text_mesh_pointer, game_object_set_active_method,
             game_object_set_active_pointer, g_index.size());
+    auto has_inline_hook_space_probe = [&](void *klass, void *pointer) {
+        if (klass == nullptr || pointer == nullptr || class_get_methods == nullptr) {
+            return false;
+        }
+        std::vector<uintptr_t> pointers;
+        void *iterator = nullptr;
+        const void *candidate = nullptr;
+        while ((candidate = class_get_methods(klass, &iterator)) != nullptr) {
+            void *candidate_pointer = nullptr;
+            memcpy(&candidate_pointer, candidate, sizeof(candidate_pointer));
+            if (candidate_pointer != nullptr) {
+                pointers.push_back(reinterpret_cast<uintptr_t>(candidate_pointer));
+            }
+        }
+        std::sort(pointers.begin(), pointers.end());
+        pointers.erase(std::unique(pointers.begin(), pointers.end()), pointers.end());
+        const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+        auto position = std::lower_bound(pointers.begin(), pointers.end(), address);
+        return position != pointers.end() && *position == address &&
+                (position + 1 == pointers.end() || *(position + 1) - address >= 16);
+    };
     if (class_get_methods != nullptr && method_get_name != nullptr &&
         method_get_param_count != nullptr && method_get_param != nullptr &&
         type_get_name != nullptr && il2cpp_free != nullptr) {
         struct TargetClass { const char *label; void *klass; };
         TargetClass targets[] = {
                 {"TMP_Text", tmp_text_class},
+                {"TextMeshProUGUI", tmp_text_ugui_class},
+                {"TextMeshPro", tmp_text_3d_class},
                 {"TMP_FontAsset", tmp_font_class},
                 {"UnityEngine.Font", unity_font_class},
                 {"UnityEngine.TextMesh", text_mesh_class},
@@ -6498,7 +7459,10 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                 "get_materialArray", "get_MaterialArray", "get_fontMaterial",
                 "get_fontMaterials", "get_fontSharedMaterial",
                 "get_fontSharedMaterials", "get_fontStyle", "set_fontStyle",
-                "HasCharacter", "TryAddCharacters", "TryAddCharacterInternal"
+                "HasCharacter", "TryAddCharacters", "TryAddCharacterInternal",
+                "ForceMeshUpdate", "UpdateGeometry", "UpdateVertexData",
+                "OnPreRenderCanvas", "Rebuild", "PopulateText",
+                "GenerateTextMesh", "UpdateMesh", "InternalUpdate"
         };
         for (const TargetClass &target : targets) {
             void *iterator = nullptr;
@@ -6520,8 +7484,11 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                 }
                 void *pointer = nullptr;
                 memcpy(&pointer, method, sizeof(pointer));
-                LT_LOGI("IL2CPP method inventory class=%s method=%s params=(%s) info=%p pointer=%p",
-                        target.label, method_name, signature.c_str(), method, pointer);
+                LT_LOGI("IL2CPP method inventory class=%s method=%s params=(%s)"
+                        " info=%p pointer=%p hookSpace=%d",
+                        target.label, method_name, signature.c_str(), method, pointer,
+                        target.klass != nullptr && pointer != nullptr &&
+                        has_inline_hook_space_probe(target.klass, pointer) ? 1 : 0);
                 if (target.klass == tmp_font_class && strcmp(method_name, "CreateFontAsset") == 0 &&
                     signature.find("System.String,") == 0 && parameter_count == 9) {
                     create_tmp_font_method = method;
@@ -6663,6 +7630,14 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             class_get_method_from_name(tmp_text_class, "get_fontStyle", 0);
     const void *tmp_set_font_style_method = tmp_text_class == nullptr ? nullptr :
             class_get_method_from_name(tmp_text_class, "set_fontStyle", 1);
+    const void *tmp_get_alignment_method = tmp_text_class == nullptr ? nullptr :
+            class_get_method_from_name(tmp_text_class, "get_alignment", 0);
+    const void *tmp_set_alignment_method = tmp_text_class == nullptr ? nullptr :
+            class_get_method_from_name(tmp_text_class, "set_alignment", 1);
+    const void *tmp_get_margin_method = tmp_text_class == nullptr ? nullptr :
+            class_get_method_from_name(tmp_text_class, "get_margin", 0);
+    const void *tmp_set_margin_method = tmp_text_class == nullptr ? nullptr :
+            class_get_method_from_name(tmp_text_class, "set_margin", 1);
     const void *tmp_get_alpha_method = tmp_text_class == nullptr ? nullptr :
             class_get_method_from_name(tmp_text_class, "get_alpha", 0);
     const void *tmp_set_alpha_method = tmp_text_class == nullptr ? nullptr :
@@ -6755,6 +7730,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             class_get_method_from_name(ui_text_class, "get_rectTransform", 0);
     const void *rect_transform_get_rect_method = rect_transform_class == nullptr ? nullptr :
             class_get_method_from_name(rect_transform_class, "get_rect", 0);
+    const void *tmp_get_preferred_width_method = tmp_text_class == nullptr ? nullptr :
+            class_get_method_from_name(tmp_text_class, "get_preferredWidth", 0);
     const void *object_get_name_method = unity_object_class == nullptr ? nullptr :
             class_get_method_from_name(unity_object_class, "get_name", 0);
     const void *component_get_transform_method = component_class == nullptr ? nullptr :
@@ -6917,6 +7894,10 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         g_tmp_set_overflow_mode_info = tmp_set_overflow_mode_method;
         g_tmp_get_font_style_info = tmp_get_font_style_method;
         g_tmp_set_font_style_info = tmp_set_font_style_method;
+        g_tmp_get_alignment_info = tmp_get_alignment_method;
+        g_tmp_set_alignment_info = tmp_set_alignment_method;
+        g_tmp_get_margin_info = tmp_get_margin_method;
+        g_tmp_set_margin_info = tmp_set_margin_method;
         g_tmp_get_alpha_info = tmp_get_alpha_method;
         g_tmp_set_alpha_info = tmp_set_alpha_method;
         g_tmp_get_max_visible_info = tmp_get_max_visible_method;
@@ -6934,6 +7915,7 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         g_tmp_force_mesh_update_info = tmp_force_mesh_update_method;
         g_tmp_force_mesh_update_arg_count = tmp_force_mesh_update_arg_count;
         g_tmp_get_rect_transform_info = tmp_get_rect_transform_method;
+        g_tmp_get_preferred_width_info = tmp_get_preferred_width_method;
         g_tmp_get_text_info_info = tmp_get_text_info_method;
         g_tmp_get_mesh_info = tmp_get_mesh_method;
         g_tmp_get_text_value_info = tmp_get_text_value_method;
@@ -7189,6 +8171,7 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                        reinterpret_cast<void *>(replacement_global_get_language),
                        reinterpret_cast<void **>(&g_original_global_get_language));
         size_t acquisition_counts[] = {0, 0, 0};
+        size_t keyword_text_getter_count = 0;
         std::unordered_set<void *> acquisition_pointers;
         bool acquisition_ready = class_get_methods != nullptr && method_get_name != nullptr &&
                 method_get_param_count != nullptr && method_get_return_type != nullptr &&
@@ -7216,15 +8199,26 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                     uint32_t parameter_count = method_get_param_count(method);
                     bool selected_formatter = parameter_count >= 1 && parameter_count <= 2;
                     if (!returns_string || !selected_formatter) continue;
+                    std::string first_param_type;
+                    if (parameter_count >= 1) {
+                        char *first_param_name =
+                                type_get_name(method_get_param(method, 0));
+                        if (first_param_name != nullptr) {
+                            first_param_type = first_param_name;
+                            il2cpp_free(first_param_name);
+                        }
+                    }
                     std::string battle_hint_table;
                     bool battle_hint_id_method = false;
                     if (battle_hint_table_name(target.name, &battle_hint_table)) {
-                        char *first_param_name =
-                                type_get_name(method_get_param(method, 0));
-                        battle_hint_id_method = first_param_name != nullptr &&
-                                strcmp(first_param_name, "System.Int32") == 0;
-                        if (first_param_name != nullptr) il2cpp_free(first_param_name);
+                        battle_hint_id_method = first_param_type == "System.Int32";
                     }
+                    const bool keyword_text_id_method =
+                            keyword_text_formatter_class(target.name) &&
+                            strcmp(method_name, "GetText") == 0 &&
+                            parameter_count == 1 &&
+                            (first_param_type == "System.String" ||
+                             first_param_type == "System.Object[]");
                     void *pointer = nullptr;
                     memcpy(&pointer, method, sizeof(pointer));
                     if (pointer == nullptr || acquisition_pointers.count(pointer) != 0 ||
@@ -7232,8 +8226,48 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                         continue;
                     }
                     if (!has_inline_hook_space(target.klass, pointer)) {
-                        LT_LOGW("Skip unsafe adjacent text formatter class=%s method=%s pointer=%p",
-                                target.name.c_str(), method_name, pointer);
+                        if (keyword_text_id_method) {
+                            if (keyword_text_getter_count >=
+                                kKeywordTextGetterSlots) {
+                                LT_LOGW("Text keyword GetText slot capacity full class=%s",
+                                        target.name.c_str());
+                            } else {
+                                const size_t keyword_slot =
+                                        keyword_text_getter_count;
+                                const bool slot_hooked =
+                                        install_method_info_hook(
+                                                method,
+                                                reinterpret_cast<void *>(
+                                                        kKeywordTextGetterReplacements[
+                                                                keyword_slot]),
+                                                &g_keyword_text_getters[
+                                                        keyword_slot]);
+                                LT_LOGI("Text keyword GetText slot install class=%s"
+                                        " method=%s param0=%s success=%d"
+                                        " slot=%zu original=%p",
+                                        target.name.c_str(), method_name,
+                                        first_param_type.c_str(), slot_hooked,
+                                        keyword_slot,
+                                        reinterpret_cast<void *>(
+                                                g_keyword_text_getters[
+                                                        keyword_slot]));
+                                if (slot_hooked &&
+                                    g_keyword_text_getters[keyword_slot] !=
+                                            nullptr) {
+                                    keyword_text_getter_count++;
+                                    g_keyword_text_getter_classes[keyword_slot] =
+                                            target.name;
+                                    g_keyword_text_getter_object_arrays[keyword_slot] =
+                                            first_param_type == "System.Object[]";
+                                    acquisition_pointers.insert(pointer);
+                                    continue;
+                                }
+                            }
+                        }
+                        LT_LOGW("Skip unsafe adjacent text formatter class=%s method=%s"
+                                " argc=%u param0=%s pointer=%p",
+                                target.name.c_str(), method_name, parameter_count,
+                                first_param_type.c_str(), pointer);
                         continue;
                     }
                     size_t slot = acquisition_counts[parameter_count];
@@ -7431,16 +8465,21 @@ void configure_limbus_translation_runtime(const char *active_index_pointer) {
     g_probe_started = false;
     g_il2cpp_path[0] = 0;
     g_index.clear();
+    g_rich_text_canonical_index.clear();
     g_terms.clear();
     g_fallback_index.clear();
     g_context_index.clear();
     g_battle_hint_index.clear();
+    g_keyword_alias_index.clear();
+    g_keyword_name_index.clear();
     g_package_line_breaks.clear();
     g_term_trie.clear();
+    g_keyword_name_trie.clear();
     bool index_loaded = load_active_index();
     g_configured = index_loaded &&
             (!g_index.empty() || !g_terms.empty() || !g_fallback_index.empty() ||
-             !g_context_index.empty() || !g_battle_hint_index.empty());
+             !g_context_index.empty() || !g_battle_hint_index.empty() ||
+             !g_keyword_alias_index.empty() || !g_keyword_name_index.empty());
     if (!g_configured) {
         LT_LOGI("Pure vanilla mode active (no translation index loaded); skipping dlsym and IL2CPP inline hooks");
     }
@@ -7451,7 +8490,8 @@ void activate_limbus_translation_lifecycle_hook() {
     pthread_mutex_lock(&g_lock);
     bool active = g_configured &&
             (!g_index.empty() || !g_terms.empty() || !g_fallback_index.empty() ||
-             !g_context_index.empty() || !g_battle_hint_index.empty());
+             !g_context_index.empty() || !g_battle_hint_index.empty() ||
+             !g_keyword_alias_index.empty() || !g_keyword_name_index.empty());
     pthread_mutex_unlock(&g_lock);
     if (!active) return;
     install_global_dlsym_lifecycle_hook();

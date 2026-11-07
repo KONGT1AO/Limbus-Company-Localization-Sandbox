@@ -159,10 +159,12 @@ class ContainerPatchInstaller(
             val japaneseSource = resolveJapaneseSource(target, caseInsensitiveJp)
             val japaneseJson = storage.read(japaneseSource) ?: return@forEach
             availableFiles += 1
+            val translationText = source.readText(Charsets.UTF_8)
+            val originalText = japaneseJson.toString(Charsets.UTF_8)
             val records = collectTranslationIndexRecords(
                 path = japaneseSource,
-                originalJson = japaneseJson.toString(Charsets.UTF_8),
-                translationJson = source.readText(Charsets.UTF_8)
+                originalJson = originalText,
+                translationJson = translationText
             )
             if (records.isNotEmpty()) {
                 records.forEach(indexCompiler::add)

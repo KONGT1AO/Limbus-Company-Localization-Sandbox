@@ -45,7 +45,6 @@ static void jni_nativeConfigureLimbusTranslationRuntime(JNIEnv *env, jclass claz
     configure_limbus_translation_runtime(pointer.c_str());
 }
 
-
 static void
 jni_nativeEnableIORedirect(JNIEnv *env, jclass, jstring soPath, jstring soPath64,
                            jstring nativePath, jint apiLevel,

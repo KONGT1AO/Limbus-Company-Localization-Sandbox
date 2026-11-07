@@ -377,7 +377,92 @@ class TranslationIndexCompilerTest {
         assertEquals(1, compiled.conflictCount)
     }
 
-    /** 发布二进制索引和原子指针时，必须使用与 native 一致的 schema 14。 */
+    /** 关键词词典的稳定 ID 必须在每次编译时自动派生中文别名。 */
+    @Test
+    fun derivesKeywordAliasIndexFromPairedGlossaryRecords() {
+        val compiler = TranslationIndexCompiler().apply {
+            TranslationRecordCollector().collect(
+                "jp/JP_BattleKeywords.json",
+                """{"dataList":[{"id":"HowlingCocoonAlly","name":"繭の泣き声 - 微弱","desc":"説明"},{"id":"TransformSinclair","name":"高貴な品格","desc":"説明"}]}""",
+                """{"dataList":[{"id":"HowlingCocoonAlly","name":"茧的悲鸣 - 微弱","desc":"说明"},{"id":"TransformSinclair","name":"高贵的品格","desc":"说明"}]}"""
+            ).forEach(::add)
+        }
+
+        val compiled = compiler.compile("2026110601", "archive")
+
+        assertEquals("茧的悲鸣 - 微弱", compiled.keywordAliasEntries["HowlingCocoonAlly"])
+        assertEquals("高贵的品格", compiled.keywordAliasEntries["TransformSinclair"])
+        assertEquals(
+            "茧的悲鸣 - 微弱",
+            compiled.keywordNameEntries["繭の泣き声 - 微弱"]
+        )
+        assertEquals(
+            "茧的悲鸣 - 微弱",
+            compiled.keywordNameEntries["繭の泣き声-微弱"]
+        )
+        assertTrue(TranslationTextPolicy.isKeywordDictionarySource("jp/JP_Bufs.json"))
+        assertFalse(TranslationTextPolicy.isKeywordDictionarySource("jp/JP_Passives.json"))
+    }
+
+    /** 非关键词资源即使含同形 ID，也不能进入自动关键词别名索引。 */
+    @Test
+    fun ignoresKeywordShapedIdsOutsideGlossaryResources() {
+        val compiler = TranslationIndexCompiler().apply {
+            TranslationRecordCollector().collect(
+                "jp/JP_MainUIText.json",
+                """{"dataList":[{"id":"TransformSinclair","name":"高貴な品格"}]}""",
+                """{"dataList":[{"id":"TransformSinclair","name":"高贵的品格"}]}"""
+            ).forEach(::add)
+        }
+
+        val compiled = compiler.compile("2026110601", "archive")
+        assertTrue(compiled.keywordAliasEntries.isEmpty())
+        assertTrue(compiled.keywordNameEntries.isEmpty())
+    }
+
+    /** 自动派生的关键词别名必须进入二进制索引，供 native 运行时读取。 */
+    @Test
+    fun serializesGeneratedKeywordAliasEntries() {
+        val root = Files.createTempDirectory("limbus-keyword-alias-index-test")
+        val compiler = TranslationIndexCompiler().apply {
+            TranslationRecordCollector().collect(
+                "jp/JP_BattleKeywords.json",
+                """{"dataList":[{"id":"HowlingCocoonAlly","name":"繭の泣き声 - 微弱"},{"id":"TransformSinclair","name":"高貴な品格"}]}""",
+                """{"dataList":[{"id":"HowlingCocoonAlly","name":"茧的悲鸣 - 微弱"},{"id":"TransformSinclair","name":"高贵的品格"}]}"""
+            ).forEach(::add)
+        }
+        val indexFile = TranslationIndexStore(root).activate(
+            compiler.compile("2026110601", "archive-sha")
+        )
+
+        DataInputStream(indexFile.inputStream()).use { input ->
+            assertEquals("LZTI1\u0000", String(input.readNBytes(6), Charsets.US_ASCII))
+            assertEquals(16, input.readInt())
+            val entryCount = input.readInt()
+            val termCount = input.readInt()
+            val fallbackCount = input.readInt()
+            val contextCount = input.readInt()
+            val battleHintCount = input.readInt()
+            val keywordAliasCount = input.readInt()
+            val keywordNameCount = input.readInt()
+            repeat(entryCount + termCount + fallbackCount + contextCount + battleHintCount) {
+                input.readSizedUtf8()
+                input.readSizedUtf8()
+            }
+            assertEquals(2, keywordAliasCount)
+            assertEquals("HowlingCocoonAlly", input.readSizedUtf8())
+            assertEquals("茧的悲鸣 - 微弱", input.readSizedUtf8())
+            assertEquals("TransformSinclair", input.readSizedUtf8())
+            assertEquals("高贵的品格", input.readSizedUtf8())
+            assertEquals(3, keywordNameCount)
+            repeat(keywordNameCount) {
+                input.readSizedUtf8()
+                input.readSizedUtf8()
+            }
+        }
+    }
+
+    /** 发布二进制索引和原子指针时，必须使用与 native 一致的 schema 16。 */
     @Test
     fun activatesImmutableBinaryIndexAndPointer() {
         val root = Files.createTempDirectory("limbus-index-test")
@@ -389,15 +474,17 @@ class TranslationIndexCompilerTest {
         val indexFile = TranslationIndexStore(root).activate(compiled)
 
         assertTrue(indexFile.exists())
-        assertTrue(indexFile.parent.fileName.toString().contains("-s14-"))
+        assertTrue(indexFile.parent.fileName.toString().contains("-s16-"))
         assertEquals(indexFile.toString().replace('\\', '/'), root.resolve("active-index.path").readText().trim())
         DataInputStream(indexFile.inputStream()).use { input ->
             assertEquals("LZTI1\u0000", String(input.readNBytes(6), Charsets.US_ASCII))
-            assertEquals(14, input.readInt())
+            assertEquals(16, input.readInt())
             assertEquals(1, input.readInt())
             assertEquals(1, input.readInt())
             assertEquals(0, input.readInt())
             assertEquals(1, input.readInt())
+            assertEquals(0, input.readInt())
+            assertEquals(0, input.readInt())
             assertEquals(0, input.readInt())
             assertEquals("Sinner", input.readSizedUtf8())
             assertEquals("罪人", input.readSizedUtf8())
@@ -409,13 +496,15 @@ class TranslationIndexCompilerTest {
         val properties = Properties().apply {
             indexFile.parent.resolve("manifest.properties").inputStream().use(::load)
         }
-        assertEquals("14", properties.getProperty("schema"))
+        assertEquals("16", properties.getProperty("schema"))
         assertEquals(TranslationIndexStore.COMPILER_VERSION, properties.getProperty("compilerVersion"))
         assertEquals("1", properties.getProperty("uniqueEntryCount"))
         assertEquals("1", properties.getProperty("termEntryCount"))
         assertEquals("0", properties.getProperty("fallbackEntryCount"))
         assertEquals("1", properties.getProperty("contextEntryCount"))
         assertEquals("0", properties.getProperty("battleHintEntryCount"))
+        assertEquals("0", properties.getProperty("keywordAliasEntryCount"))
+        assertEquals("0", properties.getProperty("keywordNameEntryCount"))
         assertEquals("1", properties.getProperty("sourceRecordCount"))
         assertEquals("0", properties.getProperty("conflictCount"))
     }
@@ -437,11 +526,13 @@ class TranslationIndexCompilerTest {
         assertFalse(compiled.termEntries.containsKey("詳細情報"))
         DataInputStream(indexFile.inputStream()).use { input ->
             assertEquals("LZTI1\u0000", String(input.readNBytes(6), Charsets.US_ASCII))
-            assertEquals(14, input.readInt())
+            assertEquals(16, input.readInt())
             assertEquals(0, input.readInt())
             assertEquals(0, input.readInt())
             assertEquals(1, input.readInt())
             assertEquals(2, input.readInt())
+            assertEquals(0, input.readInt())
+            assertEquals(0, input.readInt())
             assertEquals(0, input.readInt())
             assertEquals("詳細情報", input.readSizedUtf8())
             assertEquals("更多信息", input.readSizedUtf8())
@@ -525,17 +616,21 @@ class TranslationIndexCompilerTest {
         val indexFile = TranslationIndexStore(root).activate(compiled)
         DataInputStream(indexFile.inputStream()).use { input ->
             assertEquals("LZTI1\u0000", String(input.readNBytes(6), Charsets.US_ASCII))
-            assertEquals(14, input.readInt())
+            assertEquals(16, input.readInt())
             val entryCount = input.readInt()
             val termCount = input.readInt()
             val fallbackCount = input.readInt()
             val contextCount = input.readInt()
             val battleHintCount = input.readInt()
+            val keywordAliasCount = input.readInt()
+            val keywordNameCount = input.readInt()
             repeat(entryCount + termCount + fallbackCount + contextCount) {
                 input.readSizedUtf8()
                 input.readSizedUtf8()
             }
             assertEquals(2, battleHintCount)
+            assertEquals(0, keywordAliasCount)
+            assertEquals(0, keywordNameCount)
             assertEquals("BattleHint\u001f14", input.readSizedUtf8())
             assertEquals(
                 "战斗开始时，罪人的罪孽抗性为其所装备最低等级E.G.O的抗性。",
@@ -548,6 +643,8 @@ class TranslationIndexCompilerTest {
             indexFile.parent.resolve("manifest.properties").inputStream().use(::load)
         }
         assertEquals("2", properties.getProperty("battleHintEntryCount"))
+        assertEquals("0", properties.getProperty("keywordAliasEntryCount"))
+        assertEquals("0", properties.getProperty("keywordNameEntryCount"))
     }
 
     /** 停用只移除生效指针，保留不可变索引供下次激活或回退。 */

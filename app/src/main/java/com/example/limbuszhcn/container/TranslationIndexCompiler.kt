@@ -21,13 +21,15 @@ import kotlin.io.path.writeText
  * @property field 已通过显示文本白名单的字段名。
  * @property source 容器内官方日文原文。
  * @property translation 与原文结构对齐的中文译文。
+ * @property keywordId 关键词词典中的稳定 ID；非关键词记录为空。
  */
 internal data class TranslationIndexRecord(
     val path: String,
     val id: String,
     val field: String,
     val source: String,
-    val translation: String
+    val translation: String,
+    val keywordId: String? = null
 )
 
 /**
@@ -41,6 +43,8 @@ internal data class TranslationIndexRecord(
  * @property fallbackEntries 同文异译时按出现次数与来源优先级选择的完整文本回退映射。
  * @property contextEntries 带稳定资源对象 ID 的精确上下文映射，优先于全局字符串映射。
  * @property battleHintEntries 按小贴士资源表和数字 ID 建立的兼容映射。
+ * @property keywordAliasEntries 由包内关键词词典自动生成的 `ID -> 中文名称` 映射。
+ * @property keywordNameEntries 由包内关键词词典生成的 `日文名称 -> 中文名称` 映射。
  * @property sourceRecordCount 参与本次编译的去重源记录数量。
  * @property conflictCount 因译文冲突而未进入完整索引的原文数量。
  * @property dominantEntryCount 通过优势阈值解决冲突的原文数量。
@@ -56,6 +60,8 @@ internal data class CompiledTranslationIndex(
     val fallbackEntries: Map<String, String>,
     val contextEntries: Map<String, String>,
     val battleHintEntries: Map<String, String>,
+    val keywordAliasEntries: Map<String, String>,
+    val keywordNameEntries: Map<String, String>,
     val sourceRecordCount: Int,
     val conflictCount: Int,
     val dominantEntryCount: Int,
@@ -120,7 +126,8 @@ internal class TranslationIndexCompiler {
                 TranslationIndexRecord::translation,
                 TranslationIndexRecord::path,
                 TranslationIndexRecord::id,
-                TranslationIndexRecord::field
+                TranslationIndexRecord::field,
+                TranslationIndexRecord::keywordId
             )
         )
         val bySource = sorted.groupBy(TranslationIndexRecord::source)
@@ -129,6 +136,8 @@ internal class TranslationIndexCompiler {
         val fallback = linkedMapOf<String, String>()
         val context = linkedMapOf<String, String>()
         val battleHint = linkedMapOf<String, String>()
+        val keywordAliases = linkedMapOf<String, String>()
+        val keywordNames = linkedMapOf<String, String>()
         var conflicts = 0
         var dominantEntries = 0
         sorted.mapNotNull { record ->
@@ -147,6 +156,31 @@ internal class TranslationIndexCompiler {
                 battleHint[key] = translation
             }
         }
+        sorted.filter { it.keywordId != null && it.field == "name" }
+            .groupBy { it.keywordId!! }
+            .toSortedMap()
+            .forEach { (keywordId, occurrences) ->
+                val translations = occurrences.groupingBy(TranslationIndexRecord::translation).eachCount()
+                resolveTranslation(translations)?.let { translation ->
+                    keywordAliases[keywordId] = translation
+                }
+            }
+        sorted.filter { it.keywordId != null && it.field == "name" }
+            .groupBy(TranslationIndexRecord::source)
+            .toSortedMap()
+            .forEach { (source, occurrences) ->
+                val translations =
+                    occurrences.groupingBy(TranslationIndexRecord::translation).eachCount()
+                resolveTranslation(translations)?.let { translation ->
+                    if (source != translation) {
+                        keywordNames[source] = translation
+                        val compactSource = source.filterNot(Char::isWhitespace)
+                        if (compactSource != source) {
+                            keywordNames[compactSource] = translation
+                        }
+                    }
+                }
+            }
         bySource.toSortedMap().forEach { (source, occurrences) ->
             val authoritative = occurrences.filter(::isCanonicalTerm)
             val candidates = authoritative.ifEmpty { occurrences }
@@ -207,7 +241,14 @@ internal class TranslationIndexCompiler {
             digest.update(bytes)
         }
         sorted.forEach { record ->
-            listOf(record.path, record.id, record.field, record.source, record.translation)
+            listOf(
+                record.path,
+                record.id,
+                record.field,
+                record.source,
+                record.translation,
+                record.keywordId ?: ""
+            )
                 .forEach(::updateDigest)
         }
         return CompiledTranslationIndex(
@@ -219,6 +260,8 @@ internal class TranslationIndexCompiler {
             fallbackEntries = fallback,
             contextEntries = context,
             battleHintEntries = battleHint,
+            keywordAliasEntries = keywordAliases,
+            keywordNameEntries = keywordNames,
             sourceRecordCount = sorted.size,
             conflictCount = conflicts,
             dominantEntryCount = dominantEntries,
@@ -502,7 +545,9 @@ internal class TranslationIndexStore(private val root: Path) {
                 index.termEntries,
                 index.fallbackEntries,
                 index.contextEntries,
-                index.battleHintEntries
+                index.battleHintEntries,
+                index.keywordAliasEntries,
+                index.keywordNameEntries
             )
             writeManifest(staging.resolve(MANIFEST_FILE), index)
             moveAtomically(staging, versionDirectory)
@@ -529,7 +574,9 @@ internal class TranslationIndexStore(private val root: Path) {
         terms: Map<String, String>,
         fallback: Map<String, String>,
         context: Map<String, String>,
-        battleHint: Map<String, String>
+        battleHint: Map<String, String>,
+        keywordAliases: Map<String, String>,
+        keywordNames: Map<String, String>
     ) {
         DataOutputStream(BufferedOutputStream(path.outputStream())).use { output ->
             output.write(INDEX_MAGIC)
@@ -539,6 +586,8 @@ internal class TranslationIndexStore(private val root: Path) {
             output.writeInt(fallback.size)
             output.writeInt(context.size)
             output.writeInt(battleHint.size)
+            output.writeInt(keywordAliases.size)
+            output.writeInt(keywordNames.size)
             entries.forEach { (source, translation) ->
                 output.writeSizedUtf8(source)
                 output.writeSizedUtf8(translation)
@@ -559,6 +608,14 @@ internal class TranslationIndexStore(private val root: Path) {
                 output.writeSizedUtf8(key)
                 output.writeSizedUtf8(translation)
             }
+            keywordAliases.forEach { (keywordId, translation) ->
+                output.writeSizedUtf8(keywordId)
+                output.writeSizedUtf8(translation)
+            }
+            keywordNames.forEach { (source, translation) ->
+                output.writeSizedUtf8(source)
+                output.writeSizedUtf8(translation)
+            }
         }
     }
 
@@ -574,6 +631,8 @@ internal class TranslationIndexStore(private val root: Path) {
             setProperty("fallbackEntryCount", index.fallbackEntries.size.toString())
             setProperty("contextEntryCount", index.contextEntries.size.toString())
             setProperty("battleHintEntryCount", index.battleHintEntries.size.toString())
+            setProperty("keywordAliasEntryCount", index.keywordAliasEntries.size.toString())
+            setProperty("keywordNameEntryCount", index.keywordNameEntries.size.toString())
             setProperty("sourceRecordCount", index.sourceRecordCount.toString())
             setProperty("conflictCount", index.conflictCount.toString())
             setProperty("dominantEntryCount", index.dominantEntryCount.toString())
@@ -622,13 +681,13 @@ internal class TranslationIndexStore(private val root: Path) {
         /** 每个不可变索引版本目录内的二进制正文文件名。 */
         const val INDEX_FILE = "index.bin"
         private const val MANIFEST_FILE = "manifest.properties"
-        // schema 14 增加小贴士表 ID 兼容映射，避免游戏更新后的旧文案无法命中。
+        // schema 16 增加用于 TMP 富文本保留链接标签的中文名称映射。
         // 与 native 端 kIndexSchema 保持同步。
-        internal const val INDEX_SCHEMA = 14
+        internal const val INDEX_SCHEMA = 16
         /**
          * 索引布局或选择策略变化时递增，启动前可据此强制重建旧缓存。
          */
-        internal const val COMPILER_VERSION = "battle-hint-index-v1"
+        internal const val COMPILER_VERSION = "keyword-rich-text-v1"
         private val INDEX_MAGIC = byteArrayOf('L'.code.toByte(), 'Z'.code.toByte(), 'T'.code.toByte(), 'I'.code.toByte(), '1'.code.toByte(), 0)
     }
 }

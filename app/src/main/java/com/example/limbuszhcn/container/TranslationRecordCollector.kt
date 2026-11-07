@@ -49,7 +49,22 @@ internal class TranslationRecordCollector(private val audit: Boolean = false) {
                     val target = translated?.opt(field)
                     if (source is String) {
                         if (shouldCollect(field, source, target)) {
-                            output += TranslationIndexRecord(path, objectContext, field, source, target as? String ?: "")
+                            val keywordId = if (
+                                field == "name" &&
+                                TranslationTextPolicy.isKeywordDictionarySource(path)
+                            ) {
+                                stableKeywordId(original.opt("id"))
+                            } else {
+                                null
+                            }
+                            output += TranslationIndexRecord(
+                                path,
+                                objectContext,
+                                field,
+                                source,
+                                target as? String ?: "",
+                                keywordId
+                            )
                         }
                     } else if (source is JSONObject || source is JSONArray) {
                         if (target is JSONObject || target is JSONArray || audit) {
@@ -124,6 +139,25 @@ internal class TranslationRecordCollector(private val audit: Boolean = false) {
             if (id is String || id is Number) return "$field=$id"
         }
         return null
+    }
+
+    /**
+     * 提取适合作为方括号占位符 ID 的词典标识。
+     *
+     * @param value 关键词对象的原始 `id` 字段。
+     * @return 无空白、无方括号且长度安全的 ID；其他元数据返回空。
+     */
+    private fun stableKeywordId(value: Any?): String? {
+        val raw = when (value) {
+            is String -> value.trim()
+            is Number -> value.toString()
+            else -> return null
+        }
+        if (raw.isEmpty() || raw.length > 128) return null
+        if (raw.any { it.isWhitespace() || it == '[' || it == ']' || it == '<' || it == '>' }) {
+            return null
+        }
+        return raw
     }
 
     private companion object {
