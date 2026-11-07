@@ -404,6 +404,34 @@ class TranslationIndexCompilerTest {
         assertFalse(TranslationTextPolicy.isKeywordDictionarySource("jp/JP_Passives.json"))
     }
 
+    /**
+     * 可点击关键词和普通 SkillTag 方框条件位于同一段说明时，两条索引通道
+     * 必须同时可用；Native 运行时会在富文本关键词替换后继续处理这些术语。
+     */
+    @Test
+    fun retainsSkillTagTermsAlongsideRichTextKeywordAliases() {
+        val compiler = TranslationIndexCompiler().apply {
+            TranslationRecordCollector().collect(
+                "jp/JP_BattleKeywords.json",
+                """{"dataList":[{"id":"HowlingCocoonAlly","name":"繭の泣き声 - 微弱"}]}""",
+                """{"dataList":[{"id":"HowlingCocoonAlly","name":"茧的悲鸣 - 微弱"}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_SkillTag.json",
+                """{"dataList":[{"id":"DuelCounter","name":"[マッチ可能反撃]"},{"id":"StartBattle","name":"[戦闘開始時]"},{"id":"WhenUse","name":"[使用時]"},{"id":"OnSucceedAttack","name":"[命中時]"}]}""",
+                """{"dataList":[{"id":"DuelCounter","name":"[可拼点反击]"},{"id":"StartBattle","name":"[战斗开始]"},{"id":"WhenUse","name":"[使用时]"},{"id":"OnSucceedAttack","name":"[命中时]"}]}"""
+            ).forEach(::add)
+        }
+
+        val compiled = compiler.compile("2026110701", "archive")
+
+        assertEquals("茧的悲鸣 - 微弱", compiled.keywordAliasEntries["HowlingCocoonAlly"])
+        assertEquals("可拼点反击", compiled.termEntries["マッチ可能反撃"])
+        assertEquals("战斗开始", compiled.termEntries["戦闘開始時"])
+        assertEquals("使用时", compiled.termEntries["使用時"])
+        assertEquals("命中时", compiled.termEntries["命中時"])
+    }
+
     /** 非关键词资源即使含同形 ID，也不能进入自动关键词别名索引。 */
     @Test
     fun ignoresKeywordShapedIdsOutsideGlossaryResources() {

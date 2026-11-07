@@ -2384,6 +2384,17 @@ void *translate_managed_string(
         } else if (protected_spans.empty() &&
                    translate_rich_text_keyword_names(source, &translated)) {
             probe_stage = "rich-text-keyword-match";
+            // A passive line can contain both clickable keyword links and
+            // ordinary SkillTag tokens such as [戦闘開始時]. The rich-text pass
+            // above only rewrites link-visible names, so continue with the
+            // embedded-term pass on its result instead of returning early and
+            // leaving those condition labels in Japanese.
+            std::string translated_terms;
+            if (translate_embedded_terms(translated, &translated_terms)) {
+                translated = std::move(translated_terms);
+                probe_stage = "rich-text-keyword-and-term-match";
+                g_term_matches.fetch_add(1, std::memory_order_relaxed);
+            }
         } else if (!translate_embedded_terms(source, &translated, &protected_spans)) {
             if (!protected_spans.empty()) {
                 // 原 formatter 已使用本次汉化字段，即使只替换了数字也要传递新的来源凭据。
