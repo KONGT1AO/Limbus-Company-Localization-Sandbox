@@ -196,6 +196,9 @@ class MainActivity : ComponentActivity() {
             var resourceCancellation by remember { mutableStateOf<AtomicBoolean?>(null) }
             var pendingDiagnosticArchive by remember { mutableStateOf<File?>(null) }
             var showPackSelectionDialog by remember { mutableStateOf(false) }
+            var isPackManageMode by remember { mutableStateOf(false) }
+            var packToDelete by remember { mutableStateOf<CachedPatchMetadata?>(null) }
+            var candidateToDelete by remember { mutableStateOf<GeminiLangPackImporter.DropInCandidate?>(null) }
             var screenOrientationMode by remember {
                 mutableStateOf(LimbusOrientationManager.getOrientationMode(this@MainActivity))
             }
@@ -751,23 +754,51 @@ class MainActivity : ComponentActivity() {
                         bottomStart = 8.dp
                     )
                     AlertDialog(
-                        onDismissRequest = { showPackSelectionDialog = false },
+                        onDismissRequest = {
+                            showPackSelectionDialog = false
+                            isPackManageMode = false
+                        },
                         title = {
                             Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Box(
-                                    modifier = Modifier
-                                        .width(4.dp)
-                                        .height(20.dp)
-                                        .background(MaterialTheme.colorScheme.primary)
-                                )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text(
-                                    text = "汉化包管理与切换",
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.titleLarge
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(4.dp)
+                                            .height(20.dp)
+                                            .background(MaterialTheme.colorScheme.primary)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = "汉化包管理与切换",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.titleLarge
+                                    )
+                                }
+                                Surface(
+                                    shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                    color = if (isPackManageMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isPackManageMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+                                    ),
+                                    modifier = Modifier.clickable {
+                                        isPackManageMode = !isPackManageMode
+                                    }
+                                ) {
+                                    Text(
+                                        text = if (isPackManageMode) "✓ 完成" else "⚙ 管理",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isPackManageMode) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                    )
+                                }
                             }
                         },
                         text = {
@@ -779,9 +810,13 @@ class MainActivity : ComponentActivity() {
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text(
-                                    text = "点击即可切换生效对应汉化包；启动游戏时将锁定所选版本，防止被覆盖：",
+                                    text = if (isPackManageMode) {
+                                        "⚠️ 管理模式已开启：点击任意条目右侧「删除」可清理不需要的历史包，释放存储空间："
+                                    } else {
+                                        "点击即可切换生效对应汉化包；启动游戏时将锁定所选版本，防止被覆盖："
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = if (isPackManageMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(bottom = 4.dp)
                                 )
 
@@ -813,26 +848,30 @@ class MainActivity : ComponentActivity() {
                                                 .fillMaxWidth()
                                                 .defaultMinSize(minHeight = 64.dp)
                                                 .clickable {
-                                                    showPackSelectionDialog = false
-                                                    runTask("正在解压并切换至汉化包 ${candidate.name}...") {
-                                                        val imported = if (candidate.isArchive) {
-                                                            geminiImporter.importFromArchiveFile(
-                                                                archiveFile = candidate.file,
-                                                                originalNameHint = candidate.name,
-                                                                sourceLabel = "热投递专区 (${candidate.name})"
+                                                    if (isPackManageMode) {
+                                                        candidateToDelete = candidate
+                                                    } else {
+                                                        showPackSelectionDialog = false
+                                                        runTask("正在解压并切换至汉化包 ${candidate.name}...") {
+                                                            val imported = if (candidate.isArchive) {
+                                                                geminiImporter.importFromArchiveFile(
+                                                                    archiveFile = candidate.file,
+                                                                    originalNameHint = candidate.name,
+                                                                    sourceLabel = "热投递专区 (${candidate.name})"
+                                                                )
+                                                            } else {
+                                                                geminiImporter.importFromLocalDirectory(
+                                                                    sourceDir = candidate.file.toPath(),
+                                                                    sourceLabel = "热投递文件夹 (${candidate.name})"
+                                                                )
+                                                            }
+                                                            pendingGameRestartForNewIndex = true
+                                                            val summary = createInstaller().activateRedirect(
+                                                                imported.extraction.outputDirectory,
+                                                                imported.extraction.manifest
                                                             )
-                                                        } else {
-                                                            geminiImporter.importFromLocalDirectory(
-                                                                sourceDir = candidate.file.toPath(),
-                                                                sourceLabel = "热投递文件夹 (${candidate.name})"
-                                                            )
+                                                            installResultMessage(summary, imported.sourceLabel)
                                                         }
-                                                        pendingGameRestartForNewIndex = true
-                                                        val summary = createInstaller().activateRedirect(
-                                                            imported.extraction.outputDirectory,
-                                                            imported.extraction.manifest
-                                                        )
-                                                        installResultMessage(summary, imported.sourceLabel)
                                                     }
                                                 }
                                         ) {
@@ -869,18 +908,34 @@ class MainActivity : ComponentActivity() {
                                                     )
                                                 }
                                                 Spacer(modifier = Modifier.width(8.dp))
-                                                Surface(
-                                                    shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
-                                                    color = MaterialTheme.colorScheme.primaryContainer,
-                                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
-                                                ) {
-                                                    Text(
-                                                        text = "导入并生效",
-                                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        fontWeight = FontWeight.Bold,
-                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
-                                                    )
+                                                if (isPackManageMode) {
+                                                    Surface(
+                                                        shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f),
+                                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f))
+                                                    ) {
+                                                        Text(
+                                                            text = "✕ 删除",
+                                                            color = MaterialTheme.colorScheme.error,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = FontWeight.Bold,
+                                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                                        )
+                                                    }
+                                                } else {
+                                                    Surface(
+                                                        shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                                        color = MaterialTheme.colorScheme.primaryContainer,
+                                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+                                                    ) {
+                                                        Text(
+                                                            text = "导入并生效",
+                                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = FontWeight.Bold,
+                                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
@@ -924,7 +979,9 @@ class MainActivity : ComponentActivity() {
                                                 .fillMaxWidth()
                                                 .defaultMinSize(minHeight = 64.dp)
                                                 .clickable {
-                                                    if (!patch.isActive) {
+                                                    if (isPackManageMode) {
+                                                        packToDelete = patch
+                                                    } else if (!patch.isActive) {
                                                         showPackSelectionDialog = false
                                                         runTask("正在切换至汉化包 v${patch.version}...") {
                                                             val summary = createInstaller().activatePatchByVersion(patch.version)
@@ -981,7 +1038,21 @@ class MainActivity : ComponentActivity() {
                                                         )
                                                     }
                                                     Spacer(modifier = Modifier.width(8.dp))
-                                                    if (patch.isActive) {
+                                                    if (isPackManageMode) {
+                                                        Surface(
+                                                            shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
+                                                            color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f),
+                                                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f))
+                                                        ) {
+                                                            Text(
+                                                                text = "✕ 删除",
+                                                                color = MaterialTheme.colorScheme.error,
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                fontWeight = FontWeight.Bold,
+                                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                                            )
+                                                        }
+                                                    } else if (patch.isActive) {
                                                         Surface(
                                                             shape = CutCornerShape(topEnd = 4.dp, bottomStart = 4.dp),
                                                             color = MaterialTheme.colorScheme.primary
@@ -1028,8 +1099,116 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                         confirmButton = {
-                            TextButton(onClick = { showPackSelectionDialog = false }) {
+                            TextButton(onClick = {
+                                showPackSelectionDialog = false
+                                isPackManageMode = false
+                            }) {
                                 Text("关闭")
+                            }
+                        }
+                    )
+                }
+
+                val targetPack = packToDelete
+                if (targetPack != null) {
+                    AlertDialog(
+                        onDismissRequest = { packToDelete = null },
+                        title = {
+                            Text(
+                                text = if (targetPack.isActive) "⚠️ 警告：删除当前生效包" else "确认删除汉化包？",
+                                fontWeight = FontWeight.Bold,
+                                color = if (targetPack.isActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                            )
+                        },
+                        text = {
+                            Text(
+                                text = if (targetPack.isActive) {
+                                    "汉化包 v${targetPack.version} 当前正在生效中！\n删除后将停用汉化模式并清除运行时索引，需重启游戏生效。\n\n是否确认永久删除？"
+                                } else {
+                                    "确定要删除汉化包 v${targetPack.version} 吗？\n将彻底清除该版本的本地解压缓存（${targetPack.jsonFileCount} 个文件），释放存储空间。"
+                                },
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    val toDel = targetPack
+                                    packToDelete = null
+                                    runTask("正在删除汉化包 v${toDel.version}...") {
+                                        val installer = createInstaller()
+                                        installer.deleteInstalledPatch(toDel.version)
+                                        val refreshed = runCatching { installer.listInstalledPatches() }.getOrNull().orEmpty()
+                                        runOnUiThread {
+                                            installedPatches = refreshed
+                                        }
+                                        if (toDel.isActive) {
+                                            pendingGameRestartForNewIndex = true
+                                            "已删除当前生效的汉化包并停用汉化，请重启游戏或选择其它汉化包"
+                                        } else {
+                                            "已成功删除汉化包 v${toDel.version}，释放了存储空间"
+                                        }
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                    contentColor = MaterialTheme.colorScheme.onError
+                                ),
+                                shape = CutCornerShape(topEnd = 6.dp, bottomStart = 6.dp)
+                            ) {
+                                Text("确认删除", fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { packToDelete = null }) {
+                                Text("取消")
+                            }
+                        }
+                    )
+                }
+
+                val targetCandidate = candidateToDelete
+                if (targetCandidate != null) {
+                    AlertDialog(
+                        onDismissRequest = { candidateToDelete = null },
+                        title = {
+                            Text(
+                                text = "确认删除待导入文件？",
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        text = {
+                            Text(
+                                text = "确定要从热投递专区永久删除「${targetCandidate.name}」吗？",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    val toDel = targetCandidate
+                                    candidateToDelete = null
+                                    runTask("正在删除待导入文件 ${toDel.name}...") {
+                                        geminiImporter.deleteDropInCandidate(toDel)
+                                        val refreshed = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
+                                        runOnUiThread {
+                                            dropInCandidates = refreshed
+                                        }
+                                        "已从热投递专区删除 ${toDel.name}"
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                    contentColor = MaterialTheme.colorScheme.onError
+                                ),
+                                shape = CutCornerShape(topEnd = 6.dp, bottomStart = 6.dp)
+                            ) {
+                                Text("确认删除", fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { candidateToDelete = null }) {
+                                Text("取消")
                             }
                         }
                     )

@@ -549,6 +549,31 @@ class ContainerPatchInstaller(
     }
 
     /**
+     * 删除指定版本的已导入汉化包缓存，释放存储空间。
+     * 若该版本当前处于激活或锁定状态，会自动安全停用汉化索引并解绑锁定。
+     *
+     * @param version 待删除的汉化包版本号
+     * @return 是否成功删除该目录
+     */
+    fun deleteInstalledPatch(version: String): Boolean {
+        val patchDirectory = cacheRoot.resolve("patch-cache").resolve(version)
+        if (!patchDirectory.isDirectory()) return false
+
+        val pinned = pinnedPatchVersion()
+        if (pinned == version) {
+            val pinFile = cacheRoot.resolve(PINNED_PATCH_FILE)
+            Files.deleteIfExists(pinFile)
+        }
+
+        val activeVer = activeInstallSummary()?.version ?: pinned
+        if (activeVer == version) {
+            deactivateIndexOnly()
+        }
+
+        return patchDirectory.toFile().deleteRecursively()
+    }
+
+    /**
      * 列出所有已导入缓存的汉化包，并标注当前哪个包处于激活生效状态。
      */
     fun listInstalledPatches(): List<CachedPatchMetadata> {

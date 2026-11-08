@@ -62,6 +62,13 @@ class GeminiLangPackImporter(
     )
 
     /**
+     * 删除指定的热投递候选文件或文件夹，释放存储空间。
+     */
+    fun deleteDropInCandidate(candidate: DropInCandidate): Boolean {
+        return runCatching { candidate.file.deleteRecursively() }.getOrDefault(false)
+    }
+
+    /**
      * 确保固定公共热投递目录存在并生成使用说明文件。
      * 优先使用公共可直接访问的 /storage/emulated/0/Download/LimbusLocalizer/。
      */
