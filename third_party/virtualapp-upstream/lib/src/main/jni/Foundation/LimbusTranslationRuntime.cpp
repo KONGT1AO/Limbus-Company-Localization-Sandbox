@@ -1556,7 +1556,7 @@ bool rich_text_control_tag_end(
             source[name_end] == '-')) {
         ++name_end;
     }
-    if (name_end == name || name_end >= end) return false;
+    if (name_end == name || name_end > end) return false;
     const char boundary = source[name_end];
     if (boundary != '=' && boundary != '>' && boundary != ' ' &&
         boundary != '/' && boundary != '\t') {
@@ -1571,6 +1571,15 @@ std::string canonicalize_rich_text_for_lookup(const std::string &source) {
     std::string output;
     output.reserve(source.size());
     for (size_t offset = 0; offset < source.size();) {
+        // Discard RubyTMP superscript readings: <voffset=...>...</voffset>
+        // along with their tags so only the base kanji/character remains.
+        if (source.compare(offset, 9, "<voffset=") == 0) {
+            const size_t voffset_close = source.find("</voffset>", offset + 9);
+            if (voffset_close != std::string::npos) {
+                offset = voffset_close + 10;
+                continue;
+            }
+        }
         size_t tag_end = 0;
         if (rich_text_control_tag_end(source, offset, &tag_end)) {
             offset = tag_end + 1;
@@ -2043,6 +2052,128 @@ bool lookup_template_translation(const std::string &template_candidate,
     return false;
 }
 
+bool translate_story_theater_compound_title(const std::string &source,
+                                           std::string *translated) {
+    if (translated == nullptr || source.empty()) return false;
+
+    // 检查是否存在确认弹窗包装（如 "要查看\n{0}吗？"）
+    std::string prefix_wrap;
+    std::string suffix_wrap;
+    std::string inner = source;
+    if (inner.rfind("要查看\n", 0) == 0 && inner.size() >= 16 &&
+        inner.compare(inner.size() - 6, 6, "吗？") == 0) {
+        prefix_wrap = "要查看\n";
+        suffix_wrap = "吗？";
+        inner = inner.substr(10, inner.size() - 16);
+    }
+
+    struct SinnerNamePair {
+        const char *jp;
+        const char *zh;
+    };
+    static const SinnerNamePair kSinnerNames[] = {
+            {"ドンキホーテ", "堂吉诃德"},
+            {"ヒースクリフ", "希斯克利夫"},
+            {"イシュメール", "以实玛利"},
+            {"ジア・シーチュン", "贾惜春"},
+            {"ファウスト", "浮士德"},
+            {"シンクレア", "辛克莱"},
+            {"ウーティス", "奥提斯"},
+            {"グレゴール", "格里高尔"},
+            {"ムルソー", "默尔索"},
+            {"ロージャ", "罗佳"},
+            {"イサン", "李箱"},
+            {"ホンル", "鸿璐"},
+            {"良秀", "良秀"},
+    };
+
+    static const char *const kStorySuffixes[] = {
+            "的故事", "の物語", "の話"
+    };
+
+    static const char *const kSeparators[] = {
+            ", ", ", \n", ",\n", ",", "，", "、"
+    };
+
+    for (const SinnerNamePair &pair : kSinnerNames) {
+        const char *const candidates[] = {pair.jp, pair.zh};
+        for (const char *sinner : candidates) {
+            for (const char *suffix : kStorySuffixes) {
+                const std::string sinner_suffix = std::string(sinner) + suffix;
+                const size_t pos = inner.rfind(sinner_suffix);
+                if (pos == std::string::npos || pos + sinner_suffix.size() != inner.size()) {
+                    continue;
+                }
+                for (const char *sep : kSeparators) {
+                    const size_t sep_len = strlen(sep);
+                    if (pos >= sep_len && inner.compare(pos - sep_len, sep_len, sep) == 0) {
+                        std::string raw_title = inner.substr(0, pos - sep_len);
+                        while (!raw_title.empty() &&
+                               (raw_title.front() == ' ' || raw_title.front() == '\n' || raw_title.front() == '\r')) {
+                            raw_title.erase(raw_title.begin());
+                        }
+                        while (!raw_title.empty() &&
+                               (raw_title.back() == ' ' || raw_title.back() == '\n' || raw_title.back() == '\r')) {
+                            raw_title.pop_back();
+                        }
+                        if (raw_title.empty()) continue;
+
+                        std::string zh_title;
+                        auto try_lookup = [&](const std::string &cand) -> bool {
+                            if (cand.empty()) return false;
+                            auto it = g_index.find(cand);
+                            if (it != g_index.end()) { zh_title = it->second; return true; }
+                            auto it_f = g_fallback_index.find(cand);
+                            if (it_f != g_fallback_index.end()) { zh_title = it_f->second; return true; }
+                            return false;
+                        };
+
+                        bool found = try_lookup(raw_title);
+                        if (!found) {
+                            // 移除内部由于 UI 宽度自动折行插入的 \n 换行符
+                            std::string compact_folded = raw_title;
+                            compact_folded.erase(
+                                    std::remove(compact_folded.begin(), compact_folded.end(), '\n'),
+                                    compact_folded.end());
+                            found = try_lookup(compact_folded);
+                            if (!found) {
+                                std::string spaced_folded = raw_title;
+                                std::replace(spaced_folded.begin(), spaced_folded.end(), '\n', ' ');
+                                found = try_lookup(spaced_folded);
+                            }
+                            if (!found) {
+                                // 尝试将空格反向转换为 \n（匹配数据表中原生的两行头衔）
+                                for (size_t si = 0; si < compact_folded.size(); ++si) {
+                                    if (compact_folded[si] == ' ') {
+                                        std::string nl_cand = compact_folded;
+                                        nl_cand[si] = '\n';
+                                        found = try_lookup(nl_cand);
+                                        if (found) break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (found && !zh_title.empty()) {
+                            // 规范化单行卡片标题，将译文内部的 \n 统一替换为单空格
+                            std::string clean_zh_title = zh_title;
+                            std::replace(clean_zh_title.begin(), clean_zh_title.end(), '\n', ' ');
+                            size_t dbl = 0;
+                            while ((dbl = clean_zh_title.find("  ", dbl)) != std::string::npos) {
+                                clean_zh_title.replace(dbl, 2, " ");
+                            }
+                            std::string result = prefix_wrap + clean_zh_title + "，" + pair.zh + "的故事" + suffix_wrap;
+                            *translated = std::move(result);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 bool translate_sinner_formatted_text(const std::string &source,
                                      std::string *translated) {
     if (translated == nullptr || source.empty()) return false;
@@ -2375,6 +2506,9 @@ void *translate_managed_string(
             translated = canonical_fallback->second;
             probe_stage = "rich-text-canonical-fallback";
             g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
+        } else if (protected_spans.empty() && translate_story_theater_compound_title(source, &translated)) {
+            probe_stage = "story-theater-compound-match";
+            g_exact_matches.fetch_add(1, std::memory_order_relaxed);
         } else if (protected_spans.empty() && translate_sinner_formatted_text(source, &translated)) {
             probe_stage = "sinner-template-match";
             g_exact_matches.fetch_add(1, std::memory_order_relaxed);
@@ -5805,7 +5939,7 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
             bool needs_fallback = std::any_of(source.begin(), source.end(),
                     [](unsigned char byte) { return (byte & 0x80) != 0; });
             if (needs_fallback) ensure_tmp_font();
-            if (source.find("<ruby") != std::string::npos) {
+            if (source.find("<ruby") != std::string::npos || source.find("<voffset=") != std::string::npos) {
                 uint64_t probes = g_rich_text_source_probes.fetch_add(
                         1, std::memory_order_relaxed) + 1;
                 if (probes <= 40) {
@@ -5827,6 +5961,7 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                             canonical_match ? 1 : 0);
                 }
             }
+
             replacement = translate_managed_string(managed_text);
             // Shop costs use ASCII question marks as a deliberate game-font
             // placeholder. Replacing them with full-width Chinese question marks
@@ -6862,14 +6997,35 @@ void rebuild_package_line_break_index(
         }
     };
     for (const auto &entry : translations) {
+        const std::string &source_jp = entry.first;
         const std::string &translation = entry.second;
-        if (translation.find('\n') == std::string::npos) continue;
-        std::string spaced = translation;
-        std::replace(spaced.begin(), spaced.end(), '\n', ' ');
-        register_variant(spaced, translation);
-        std::string compact = translation;
-        compact.erase(std::remove(compact.begin(), compact.end(), '\n'), compact.end());
-        register_variant(compact, translation);
+        if (translation.find('\n') != std::string::npos) {
+            std::string spaced = translation;
+            std::replace(spaced.begin(), spaced.end(), '\n', ' ');
+            register_variant(spaced, translation);
+            std::string compact = translation;
+            compact.erase(std::remove(compact.begin(), compact.end(), '\n'), compact.end());
+            register_variant(compact, translation);
+        }
+        // 展平日文原文并建立回退索引，使得被 UI 压成单行显示的人格头衔与长词条能直接查到对应中文
+        if (source_jp.find('\n') != std::string::npos && !translation.empty()) {
+            std::string jp_spaced = source_jp;
+            std::replace(jp_spaced.begin(), jp_spaced.end(), '\n', ' ');
+            std::string zh_spaced = translation;
+            std::replace(zh_spaced.begin(), zh_spaced.end(), '\n', ' ');
+            if (g_index.find(jp_spaced) == g_index.end() &&
+                g_fallback_index.find(jp_spaced) == g_fallback_index.end()) {
+                g_fallback_index.emplace(std::move(jp_spaced), std::move(zh_spaced));
+            }
+            std::string jp_compact = source_jp;
+            jp_compact.erase(std::remove(jp_compact.begin(), jp_compact.end(), '\n'), jp_compact.end());
+            std::string zh_compact = translation;
+            zh_compact.erase(std::remove(zh_compact.begin(), zh_compact.end(), '\n'), zh_compact.end());
+            if (g_index.find(jp_compact) == g_index.end() &&
+                g_fallback_index.find(jp_compact) == g_fallback_index.end()) {
+                g_fallback_index.emplace(std::move(jp_compact), std::move(zh_compact));
+            }
+        }
     }
 }
 
@@ -7193,6 +7349,7 @@ static bool install_method_info_hook(const void *method_info, void *replacement,
     memcpy(writable_slot, &replacement, sizeof(replacement));
     return true;
 }
+
 
 bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain) {
     typedef void *(*domain_get_fn)();
@@ -7986,6 +8143,7 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             return position != pointers.end() && *position == address &&
                     (position + 1 == pointers.end() || *(position + 1) - address >= 16);
         };
+
         if (tmp_set_font_pointer != nullptr &&
             has_inline_hook_space(tmp_text_class, tmp_set_font_pointer)) {
             void *hooked_tmp_set_font = nullptr;
