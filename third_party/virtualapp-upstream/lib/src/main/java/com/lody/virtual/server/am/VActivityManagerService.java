@@ -1063,11 +1063,17 @@ public class VActivityManagerService extends IActivityManager.Stub {
                         continue;
                     }
                 }
+                boolean clientRunning = false;
                 try {
-                    running |= r.client != null && r.client.isAppRunning();
+                    clientRunning = r.client != null && r.client.isAppRunning();
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    // 当进程被系统冻结（Freezer）时，跨进程 Binder 调用可能抛错；
+                    // 此时通过 OS 运行进程表验证其存活性，绝不误判为死亡。
+                    List<ActivityManager.RunningAppProcessInfo> runningProcesses =
+                            VirtualCore.get().getRunningAppProcessesEx();
+                    clientRunning = isStubProcessAlive(r.vpid, r.is64bit, runningProcesses);
                 }
+                running |= clientRunning;
                 if(foreground) {
                     //foreground=true是只找主进程，false是全部进程任意一个存在
                     break;

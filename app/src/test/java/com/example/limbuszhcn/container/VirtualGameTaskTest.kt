@@ -53,4 +53,31 @@ class VirtualGameTaskTest {
             )
         )
     }
+
+    /**
+     * 当 Intent MIME Type 丢失但具有会话 task id 或 UnityPlayerActivity 时仍可精准识别。
+     */
+    @Test
+    fun `matches limbus task by session task id or unity player activity`() {
+        // 会话 taskId 匹配
+        assertTrue(
+            isVirtualGameTask(
+                packageName = "com.ProjectMoon.LimbusCompany",
+                baseIntentType = null,
+                baseActivityClassName = "com.example.limbuszhcn.MainActivity",
+                topActivityClassName = "com.example.limbuszhcn.MainActivity",
+                taskId = 10086,
+                sessionTaskId = 10086
+            )
+        )
+        // UnityPlayerActivity 匹配
+        assertTrue(
+            isVirtualGameTask(
+                packageName = "com.ProjectMoon.LimbusCompany",
+                baseIntentType = null,
+                baseActivityClassName = "com.ProjectMoon.LimbusCompany.UnityPlayerActivity",
+                topActivityClassName = "com.ProjectMoon.LimbusCompany.UnityPlayerActivity"
+            )
+        )
+    }
 }

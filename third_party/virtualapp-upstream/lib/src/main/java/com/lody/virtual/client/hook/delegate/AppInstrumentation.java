@@ -650,6 +650,7 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
         applyLimbusThreadContextClassLoader(mirror.android.app.Activity.mActivityInfo.get(activity), "callActivityOnResume");
         if (activity != null && LIMBUS_PACKAGE.equals(activity.getPackageName())) {
             LimbusOrientationManager.get().onResume(activity);
+            scheduleLimbusUnityPlayerFocusHeal(activity);
         }
         super.callActivityOnResume(activity);
         Intent intent = activity.getIntent();
@@ -869,4 +870,77 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
             Log.w("LimbusVA", "Failed to set Limbus activity thread context classloader reason=" + reason, error);
         }
     }
+    private void scheduleLimbusUnityPlayerFocusHeal(final Activity activity) {
+        if (activity == null || !LIMBUS_PACKAGE.equals(activity.getPackageName())) {
+            return;
+        }
+        android.view.View decor = null;
+        try {
+            decor = activity.getWindow() != null ? activity.getWindow().peekDecorView() : null;
+        } catch (Throwable ignored) {}
+        if (decor == null) {
+            return;
+        }
+        final android.view.View finalDecor = decor;
+        final Runnable healTask = new Runnable() {
+            @Override
+            public void run() {
+                healLimbusUnityPlayerFocus(activity, finalDecor);
+            }
+        };
+        finalDecor.postDelayed(healTask, 100);
+        finalDecor.postDelayed(healTask, 350);
+        finalDecor.postDelayed(healTask, 800);
+    }
+
+    private void healLimbusUnityPlayerFocus(Activity activity, android.view.View decor) {
+        if (activity == null || activity.isFinishing()) {
+            return;
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed()) {
+                return;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (decor != null && !decor.hasFocus()) {
+                decor.requestFocus();
+            }
+            activity.onWindowFocusChanged(true);
+        } catch (Throwable error) {
+            Log.w("LimbusVA", "Failed to heal activity window focus", error);
+        }
+
+        try {
+            Field unityPlayerField = null;
+            Class<?> clazz = activity.getClass();
+            while (clazz != null && clazz != Activity.class) {
+                try {
+                    unityPlayerField = clazz.getDeclaredField("mUnityPlayer");
+                    unityPlayerField.setAccessible(true);
+                    break;
+                } catch (NoSuchFieldException e) {
+                    clazz = clazz.getSuperclass();
+                }
+            }
+            if (unityPlayerField != null) {
+                Object player = unityPlayerField.get(activity);
+                if (player != null) {
+                    try {
+                        Method focusMethod = player.getClass().getMethod("windowFocusChanged", boolean.class);
+                        focusMethod.setAccessible(true);
+                        focusMethod.invoke(player, true);
+                    } catch (Throwable ignored) {}
+                    try {
+                        Method resumeMethod = player.getClass().getMethod("resume");
+                        resumeMethod.setAccessible(true);
+                        resumeMethod.invoke(player);
+                    } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable error) {
+            Log.w("LimbusVA", "Failed to heal UnityPlayer focus", error);
+        }
+    }
+
 }

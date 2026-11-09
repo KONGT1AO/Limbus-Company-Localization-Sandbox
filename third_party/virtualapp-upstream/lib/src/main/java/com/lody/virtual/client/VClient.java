@@ -855,7 +855,13 @@ public final class VClient extends IVClient.Stub {
         Log.i("LimbusVA", "VClient.bindApplication before register lifecycle");
         mInitialApplication.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
             @Override
-            public void onActivityCreated(Activity activity, Bundle bundle) { }
+            public void onActivityCreated(Activity activity, Bundle bundle) {
+                if (LIMBUS_PACKAGE_NAME.equals(activity.getPackageName())) {
+                    ClientConfig config = getClientConfig();
+                    int vpid = config != null ? config.vpid : 0;
+                    com.lody.virtual.client.hook.delegate.LimbusGameSessionTracker.get().onActivityCreated(activity, vpid);
+                }
+            }
             @Override
             public void onActivityStarted(Activity activity) {
                 ActivityCounterManager.get().activityCountAdd(activity.getPackageName(),activity.getClass().getName(), android.os.Process.myPid());
@@ -872,6 +878,9 @@ public final class VClient extends IVClient.Stub {
                         Log.i("LimbusVA", "Cleared Limbus FLAG_SECURE on Activity resume activity="
                                 + activity.getClass().getName());
                     }
+                    ClientConfig config = getClientConfig();
+                    int vpid = config != null ? config.vpid : 0;
+                    com.lody.virtual.client.hook.delegate.LimbusGameSessionTracker.get().onActivityResumed(activity, vpid);
                     requestLimbusGameGuard(activity);
                     return;
                 }
@@ -895,7 +904,12 @@ public final class VClient extends IVClient.Stub {
             public void onActivitySaveInstanceState(Activity activity, Bundle bundle) { }
             @Override
             public void onActivityDestroyed(Activity activity) {
-
+                if (LIMBUS_PACKAGE_NAME.equals(activity.getPackageName())) {
+                    com.lody.virtual.client.hook.delegate.LimbusGameSessionTracker.get().onActivityDestroyed(activity);
+                    ClientConfig config = getClientConfig();
+                    int vpid = config != null ? config.vpid : 0;
+                    ShadowService.stopLimbusGameGuard(activity.getApplicationContext(), vpid);
+                }
             }
         });
         Log.i("LimbusVA", "VClient.bindApplication after register lifecycle");

@@ -40,10 +40,13 @@ class LauncherTaskWatcherService : Service() {
             PersistentDiagnosticLog.info(TAG, "LauncherTaskWatcherService onTaskRemoved, isGameRunning=$isGameRunning")
 
             if (!isGameRunning) {
-                // 1. 通知容器进程停止 KeepAliveService
+                // 1. 清理可能残留的失效游戏会话
+                com.lody.virtual.client.hook.delegate.LimbusGameSessionTracker.get().clearSession(applicationContext)
+
+                // 2. 通知容器进程停止 KeepAliveService
                 KeepAliveService.stop(applicationContext)
 
-                // 2. 清除 2781 守护通知
+                // 3. 清除 2781 守护通知
                 val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 notificationManager?.cancel(HiddenForeNotification.FOREGROUND_NOTIFICATION_ID)
                 notificationManager?.cancelAll()

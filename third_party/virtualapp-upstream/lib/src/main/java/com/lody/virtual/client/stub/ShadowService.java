@@ -5,71 +5,54 @@ import android.app.Service;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.ServiceInfo;
 import android.content.res.Configuration;
 import android.os.Build;
-import android.os.Handler;
 import android.os.IBinder;
-import android.os.Looper;
 import android.os.Process;
 
 import com.lody.virtual.client.VClient;
 import com.lody.virtual.client.core.VirtualCore;
-import com.lody.virtual.client.ipc.VActivityManager;
+import com.lody.virtual.client.hook.delegate.LimbusGameSessionTracker;
 import com.lody.virtual.client.service.ServiceManager;
 import com.lody.virtual.helper.utils.VLog;
-import com.lody.virtual.os.VUserHandle;
-import com.lody.virtual.remote.ClientConfig;
 
 /**
+ * 虚拟进程宿主守护服务，运行于具体的虚拟进程槽位 (:p0 ~ :p99)。
+ *
+ * <p>全新架构：
+ * 1. 独占唯一的 2781 前台服务通知（仅在游戏活跃时由游戏主进程发起，无第二条通知，无多进程冲突）；
+ * 2. 彻底拔除周期性后台 Binder 心跳，顺应现代 Android Freezer 冻结调度，杜绝后台唤醒造成的死锁；
+ * 3. 通过 bindService(KeepAliveService, BIND_IMPORTANT) 将前台优先级传递给容器服务进程 (:x)；
+ * 4. 游戏退出或任务划掉时，彻底清理通知并解除对引擎进程的绑定。</p>
+ *
  * @author Lody
  */
 public abstract class ShadowService extends Service {
     private static final ServiceManager sServiceManager = ServiceManager.get();
     public static final String ACTION_LIMBUS_GAME_GUARD_START =
             "com.lody.virtual.action.LIMBUS_GAME_GUARD_START";
-    private static final long LIMBUS_GAME_GUARD_HEARTBEAT_MS = 30_000L;
-    private static final java.util.concurrent.ScheduledExecutorService sLimbusGuardExecutor =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new java.util.concurrent.ThreadFactory() {
-                @Override
-                public Thread newThread(Runnable r) {
-                    Thread t = new Thread(r, "LimbusGuardHeartbeat");
-                    t.setDaemon(true);
-                    return t;
-                }
-            });
+    public static final String ACTION_LIMBUS_GAME_GUARD_STOP =
+            "com.lody.virtual.action.LIMBUS_GAME_GUARD_STOP";
 
     private boolean limbusGameGuardForeground;
-    private boolean limbusGameGuardHeartbeatStarted;
-    private java.util.concurrent.ScheduledFuture<?> limbusGameGuardFuture;
-    private final Runnable limbusGameGuardHeartbeat = new Runnable() {
+    private boolean mEngineBound = false;
+
+    private final ServiceConnection mEngineConnection = new ServiceConnection() {
         @Override
-        public void run() {
-            if (!limbusGameGuardForeground) {
-                return;
-            }
-            try {
-                ClientConfig config = VClient.get().getClientConfig();
-                if (config != null) {
-                    VActivityManager.get().processRestarted(
-                            config.packageName,
-                            config.processName,
-                            VUserHandle.getUserId(config.vuid)
-                    );
-                }
-            } catch (Throwable e) {
-                VLog.w("LimbusVA", "Guard heartbeat error: " + e);
-            }
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            VLog.i("LimbusVA", "Connected to engine KeepAliveService from game guard pid=" + Process.myPid());
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            VLog.i("LimbusVA", "Disconnected from engine KeepAliveService pid=" + Process.myPid());
         }
     };
 
     /**
      * Starts the foreground guard in the virtual process slot that hosts the game.
-     *
-     * <p>Starting from the resumed virtual Activity keeps the request inside the
-     * foreground-service launch window. The explicit host component ensures that
-     * Android creates or reuses the process represented by {@code vpid}, rather
-     * than the engine process.</p>
      */
     public static boolean startLimbusGameGuard(Context context, int vpid) {
         if (context == null || vpid < 0 || vpid >= StubManifest.STUB_COUNT) {
@@ -89,8 +72,25 @@ public abstract class ShadowService extends Service {
             }
             return true;
         } catch (Throwable error) {
-            VLog.w("LimbusVA", "Unable to start Limbus game guard vpid=" + vpid
-                    + ": " + error);
+            VLog.w("LimbusVA", "Unable to start Limbus game guard vpid=" + vpid + ": " + error);
+            return false;
+        }
+    }
+
+    public static boolean stopLimbusGameGuard(Context context, int vpid) {
+        if (context == null || vpid < 0 || vpid >= StubManifest.STUB_COUNT) {
+            return false;
+        }
+        Intent intent = new Intent(ACTION_LIMBUS_GAME_GUARD_STOP);
+        intent.setComponent(new ComponentName(
+                StubManifest.PACKAGE_NAME,
+                StubManifest.getStubServiceName(vpid)
+        ));
+        try {
+            context.startService(intent);
+            return true;
+        } catch (Throwable error) {
+            VLog.w("LimbusVA", "Unable to stop Limbus game guard vpid=" + vpid + ": " + error);
             return false;
         }
     }
@@ -99,8 +99,39 @@ public abstract class ShadowService extends Service {
         return intent != null && ACTION_LIMBUS_GAME_GUARD_START.equals(intent.getAction());
     }
 
+    public static boolean isLimbusGameGuardStopAction(Intent intent) {
+        return intent != null && ACTION_LIMBUS_GAME_GUARD_STOP.equals(intent.getAction());
+    }
+
     public static boolean usesSpecialUseForegroundType(int sdkInt) {
         return sdkInt >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+    }
+
+    private void bindKeepAliveEngine() {
+        if (mEngineBound) {
+            return;
+        }
+        try {
+            Intent intent = new Intent(this, KeepAliveService.class);
+            mEngineBound = bindService(intent, mEngineConnection, Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT);
+            VLog.i("LimbusVA", "Bound to engine KeepAliveService bound=" + mEngineBound);
+        } catch (Throwable error) {
+            VLog.w("LimbusVA", "Failed to bind KeepAliveService: " + error);
+        }
+    }
+
+    private void unbindKeepAliveEngine() {
+        if (!mEngineBound) {
+            return;
+        }
+        try {
+            unbindService(mEngineConnection);
+            VLog.i("LimbusVA", "Unbound from engine KeepAliveService");
+        } catch (Throwable error) {
+            VLog.w("LimbusVA", "Failed to unbind KeepAliveService: " + error);
+        } finally {
+            mEngineBound = false;
+        }
     }
 
     private void promoteLimbusGameGuard() {
@@ -119,58 +150,25 @@ public abstract class ShadowService extends Service {
                 startForeground(HiddenForeNotification.FOREGROUND_NOTIFICATION_ID, notification);
             }
             limbusGameGuardForeground = true;
-            startLimbusGameGuardHeartbeat();
-            VLog.i("LimbusVA", "Limbus game guard foreground active pid="
-                    + Process.myPid());
+            bindKeepAliveEngine();
+            VLog.i("LimbusVA", "Limbus game guard foreground active pid=" + Process.myPid());
         } catch (Throwable error) {
             VLog.w("LimbusVA", "Unable to promote Limbus game guard: " + error);
         }
     }
 
-    private void startLimbusGameGuardHeartbeat() {
-        if (limbusGameGuardHeartbeatStarted) {
-            return;
-        }
-        limbusGameGuardHeartbeatStarted = true;
-        try {
-            limbusGameGuardFuture = sLimbusGuardExecutor.scheduleWithFixedDelay(
-                    limbusGameGuardHeartbeat,
-                    LIMBUS_GAME_GUARD_HEARTBEAT_MS,
-                    LIMBUS_GAME_GUARD_HEARTBEAT_MS,
-                    java.util.concurrent.TimeUnit.MILLISECONDS
-            );
-        } catch (Throwable error) {
-            VLog.w("LimbusVA", "Unable to schedule Limbus game guard heartbeat: " + error);
-        }
-    }
-
-    private void stopLimbusGameGuardHeartbeat() {
-        limbusGameGuardHeartbeatStarted = false;
-        if (limbusGameGuardFuture != null) {
-            try {
-                limbusGameGuardFuture.cancel(false);
-            } catch (Throwable ignored) {}
-            limbusGameGuardFuture = null;
-        }
-    }
-
-    private void stopLimbusGameGuard() {
-        stopLimbusGameGuard(false);
-    }
-
     private void stopLimbusGameGuard(boolean removeNotification) {
-        if (!limbusGameGuardForeground) {
+        if (!limbusGameGuardForeground && !mEngineBound) {
             return;
         }
         try {
-            stopLimbusGameGuardHeartbeat();
+            unbindKeepAliveEngine();
             if (removeNotification) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE);
                 } else {
                     stopForeground(true);
                 }
-                KeepAliveService.stop(this);
                 android.app.NotificationManager nm = (android.app.NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
                 if (nm != null) {
                     nm.cancel(HiddenForeNotification.FOREGROUND_NOTIFICATION_ID);
@@ -194,8 +192,6 @@ public abstract class ShadowService extends Service {
         if (VClient.get().getClientConfig() == null) {
             stopSelf();
             VLog.w("ServiceManager", "checkProcessStatus:false, clientConfig=null");
-            //Process.killProcess(Process.myPid());
-            //杀死会让reject init process错误出现概率变高
             return false;
         }
         return true;
@@ -203,7 +199,7 @@ public abstract class ShadowService extends Service {
 
     @Override
     public IBinder onBind(Intent intent) {
-        if(!checkProcessStatus()){
+        if (!checkProcessStatus()) {
             return null;
         }
         return sServiceManager.onBind(intent);
@@ -211,7 +207,12 @@ public abstract class ShadowService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if(!checkProcessStatus()){
+        if (!checkProcessStatus()) {
+            return START_NOT_STICKY;
+        }
+        if (isLimbusGameGuardStopAction(intent)) {
+            stopLimbusGameGuard(true);
+            stopSelf();
             return START_NOT_STICKY;
         }
         if (isLimbusGameGuardAction(intent)) {
@@ -231,7 +232,7 @@ public abstract class ShadowService extends Service {
 
     @Override
     public boolean onUnbind(Intent intent) {
-        if(!checkProcessStatus()){
+        if (!checkProcessStatus()) {
             return false;
         }
         sServiceManager.onUnbind(intent);
@@ -258,8 +259,9 @@ public abstract class ShadowService extends Service {
         if (VClient.get().isAppRunning()
                 && "com.ProjectMoon.LimbusCompany".equals(VClient.get().getCurrentPackage())) {
             VLog.i("LimbusVA", "Limbus game guard task removed");
+            LimbusGameSessionTracker.get().clearSession(this);
             stopLimbusGameGuard(true);
-            KeepAliveService.stop(this);
+            stopSelf();
         }
         super.onTaskRemoved(rootIntent);
     }

@@ -10,6 +10,7 @@ import android.util.Log
 import java.io.File
 import java.util.zip.ZipFile
 import com.example.limbuszhcn.gamefs.GameResourceTransfer
+import com.lody.virtual.client.hook.delegate.LimbusGameSessionTracker
 
 internal enum class VirtualGameLaunchAction {
     RESUME_EXISTING,
@@ -127,6 +128,12 @@ class VirtualAppContainerRuntime(
      * 准备容器存储和 Google 服务后，通过 VirtualApp 入口启动游戏。
      */
     override fun launchGame() {
+        if (isGameRunning()) {
+            Log.i(TAG, "launchGame requested while game is already running; resuming existing task")
+            if (resumeGameTask()) {
+                return
+            }
+        }
         GameResourceTransfer(
             storage(), context.filesDir.toPath().resolve("resource-transfers"),
             status().importedVersionCode ?: 1L
@@ -271,8 +278,34 @@ private class VirtualAppReflectionBridge(
      * @param packageName 容器内的目标游戏包名。
      * @return 找到并成功恢复任务时返回 `true`。
      */
-    fun isGameRunning(packageName: String): Boolean =
-        runCatching {
+    private fun getRunningGameProcesses(): List<ActivityManager.RunningAppProcessInfo> {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return emptyList()
+        val hostPkg = context.packageName
+        return runCatching {
+            activityManager.runningAppProcesses?.filter { info ->
+                info.processName.startsWith("$hostPkg:p") || info.processName.startsWith("io.limbuspe.box:p")
+            } ?: emptyList()
+        }.getOrDefault(emptyList())
+    }
+
+    fun isGameRunning(packageName: String): Boolean {
+        val liveGameProcesses = getRunningGameProcesses()
+        if (liveGameProcesses.isEmpty()) {
+            return false
+        }
+        val session = LimbusGameSessionTracker.get().readSession(context)
+        if (session != null && session.isValid) {
+            val sessionProcAlive = liveGameProcesses.any { it.pid == session.pid }
+            if (sessionProcAlive) {
+                return true
+            }
+        }
+        val hasTask = findExistingGameTask(packageName) != null
+        if (hasTask && liveGameProcesses.isNotEmpty()) {
+            return true
+        }
+        return runCatching {
             val managerClass = Class.forName("com.lody.virtual.client.ipc.VActivityManager")
             val manager = managerClass.getMethod("get").invoke(null)
             managerClass.getMethod(
@@ -283,31 +316,51 @@ private class VirtualAppReflectionBridge(
             ).invoke(manager, packageName, 0, false) == true
         }.onFailure { error ->
             Log.w(TAG, "Unable to query running VirtualApp game package=$packageName", error)
-        }.getOrDefault(false)
+        }.getOrDefault(liveGameProcesses.isNotEmpty())
+    }
 
     fun resumeExistingGameTask(packageName: String): Boolean {
-        val existingTask = findExistingGameTask(packageName) ?: return false
-        val moved = runCatching {
-            existingTask.moveToFront()
-            true
-        }.onFailure { error ->
-            // 厂商 ROM 若限制任务查询，仍可继续使用标准 VAMS 启动路径。
-            Log.w(TAG, "Unable to resume existing VirtualApp game task package=$packageName", error)
-        }.getOrDefault(false)
-        if (!moved) {
+        val liveGameProcesses = getRunningGameProcesses()
+        if (liveGameProcesses.isEmpty()) {
+            Log.w(TAG, "resumeExistingGameTask: no :p{n} game process alive for $packageName")
             return false
         }
-        val resumed = waitForGameTaskForeground(packageName, timeoutMillis = 1500L)
-        Log.i(
-            TAG,
-            "VirtualApp task resume verification package=$packageName resumed=$resumed"
-        )
-        return resumed
+        val existingTask = findExistingGameTask(packageName)
+        if (existingTask != null) {
+            val moved = runCatching {
+                existingTask.moveToFront()
+                true
+            }.onFailure { error ->
+                Log.w(TAG, "Unable to moveToFront for existing VirtualApp game task package=$packageName", error)
+            }.getOrDefault(false)
+            Log.i(TAG, "resumeExistingGameTask moveToFront result=$moved package=$packageName")
+            if (moved) return true
+        }
+
+        // 兜底唤醒已存活进程：构建带 REORDER_TO_FRONT 的 Intent
+        return runCatching {
+            val core = core()
+            val intent = virtualCoreClass!!
+                .getMethod("getLaunchIntent", String::class.java, Int::class.javaPrimitiveType)
+                .invoke(core, packageName, 0) as? android.content.Intent
+            if (intent != null) {
+                intent.addFlags(
+                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                        android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                        android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
+                startVirtualActivity(intent, packageName)
+                Log.i(TAG, "resumeExistingGameTask fallback intent reorder to front package=$packageName")
+                true
+            } else false
+        }.getOrDefault(false)
     }
 
     private fun findExistingGameTask(packageName: String): ActivityManager.AppTask? {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             ?: return null
+        val session = LimbusGameSessionTracker.get().readSession(context)
+        val sessionTaskId = if (session != null && session.isValid) session.taskId else -1
         return runCatching {
             activityManager.appTasks.firstOrNull { appTask ->
                 val taskInfo = appTask.taskInfo
@@ -315,11 +368,12 @@ private class VirtualAppReflectionBridge(
                     packageName = packageName,
                     baseIntentType = taskInfo.baseIntent?.type,
                     baseActivityClassName = taskInfo.baseActivity?.className,
-                    topActivityClassName = taskInfo.topActivity?.className
+                    topActivityClassName = taskInfo.topActivity?.className,
+                    taskId = taskInfo.id,
+                    sessionTaskId = sessionTaskId
                 )
             }
         }.onFailure { error ->
-            // 厂商 ROM 若限制任务查询，仍可继续使用标准 VAMS 启动路径。
             Log.w(TAG, "Unable to query existing VirtualApp game task package=$packageName", error)
         }.getOrNull()
     }
@@ -331,6 +385,11 @@ private class VirtualAppReflectionBridge(
     private fun discardStaleGameTasks(packageName: String): Int {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             ?: return 0
+        val liveGameProcesses = getRunningGameProcesses()
+        if (liveGameProcesses.isNotEmpty()) {
+            Log.i(TAG, "Preserve game tasks because ${liveGameProcesses.size} game processes are still alive")
+            return 0
+        }
         return runCatching {
             val staleTasks = activityManager.appTasks.filter { appTask ->
                 val taskInfo = appTask.taskInfo
@@ -352,7 +411,6 @@ private class VirtualAppReflectionBridge(
                     }
             }
             if (staleTasks.isNotEmpty()) {
-                // 给系统任务栈完成移除，避免紧接的新启动再次复用旧 stub Intent。
                 Thread.sleep(120L)
             }
             Log.i(
@@ -369,28 +427,6 @@ private class VirtualAppReflectionBridge(
         val deadline = SystemClock.elapsedRealtime() + timeoutMillis
         do {
             if (isGameRunning(packageName)) return true
-            Thread.sleep(50L)
-        } while (SystemClock.elapsedRealtime() < deadline)
-        return false
-    }
-
-    private fun waitForGameTaskForeground(packageName: String, timeoutMillis: Long): Boolean {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-            ?: return false
-        val deadline = SystemClock.elapsedRealtime() + timeoutMillis
-        do {
-            val foregroundTask = runCatching {
-                activityManager.getRunningTasks(1).firstOrNull()
-            }.getOrNull()
-            if (foregroundTask != null && isVirtualGameTask(
-                    packageName = packageName,
-                    baseIntentType = foregroundTask.baseIntent?.type,
-                    baseActivityClassName = foregroundTask.baseActivity?.className,
-                    topActivityClassName = foregroundTask.topActivity?.className
-                )
-            ) {
-                return true
-            }
             Thread.sleep(50L)
         } while (SystemClock.elapsedRealtime() < deadline)
         return false
@@ -772,13 +808,23 @@ internal fun isVirtualGameTask(
     packageName: String,
     baseIntentType: String?,
     baseActivityClassName: String?,
-    topActivityClassName: String?
+    topActivityClassName: String?,
+    taskId: Int = -1,
+    sessionTaskId: Int = -1
 ): Boolean {
-    val targetsPackage = baseIntentType?.startsWith("$packageName/") == true
+    if (sessionTaskId > 0 && taskId == sessionTaskId) {
+        return true
+    }
+    val targetsPackage = baseIntentType?.startsWith("$packageName/") == true ||
+        baseActivityClassName?.contains(packageName) == true ||
+        topActivityClassName?.contains(packageName) == true
     val usesShadowActivity = sequenceOf(baseActivityClassName, topActivityClassName)
         .filterNotNull()
-        .any { className -> className.startsWith("com.lody.virtual.client.stub.ShadowActivity") }
-    return targetsPackage && usesShadowActivity
+        .any { className ->
+            className.startsWith("com.lody.virtual.client.stub.ShadowActivity") ||
+                className.contains("UnityPlayerActivity")
+        }
+    return (targetsPackage && usesShadowActivity) || (sessionTaskId > 0 && taskId == sessionTaskId)
 }
 
 private fun Intent.describeForLog(): String =

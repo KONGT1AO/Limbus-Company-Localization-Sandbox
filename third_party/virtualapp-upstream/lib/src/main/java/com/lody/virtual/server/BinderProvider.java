@@ -82,13 +82,7 @@ public final class BinderProvider extends ContentProvider {
                 NotificationChannelCompat.checkOrCreateChannel(context, NotificationChannelCompat.LIGHT_ID, "light");
             }
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                        && VirtualCore.get().getTargetSdkVersion() >= Build.VERSION_CODES.O
-                        && !VirtualCore.getConfig().isHideForegroundNotification()) {
-                    context.startForegroundService(new Intent(context, KeepAliveService.class));
-                } else {
-                    context.startService(new Intent(context, KeepAliveService.class));
-                }
+                context.startService(new Intent(context, KeepAliveService.class));
             } catch (Exception e) {
                 e.printStackTrace();
             }
