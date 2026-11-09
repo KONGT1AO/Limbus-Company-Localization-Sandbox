@@ -655,7 +655,7 @@ private fun TranslationPage(
             }
             StatusLine(label = "公共热投递专区", value = dropInPath)
             Text(
-                text = "支持直接放入零协会、GEMINI 等任意符合规范的中文汉化包，运行时自动对齐，不改写游戏校验文件。",
+                text = "支持直接放入任意符合官方文件结构的中文汉化包，运行时自动对齐，不改写游戏校验文件。",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
