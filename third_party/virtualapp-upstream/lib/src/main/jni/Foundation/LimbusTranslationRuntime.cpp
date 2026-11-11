@@ -41,6 +41,7 @@ const uint32_t kMaxStringBytes = 16 * 1024 * 1024;
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t g_font_state_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t g_skill_title_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t g_tmp_typewriter_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 char g_active_pointer[PATH_MAX] = {};
 std::unordered_map<std::string, std::string> g_index;
 // Story text can gain ruby/furigana markup after the resource lookup. This
@@ -61,6 +62,8 @@ std::unordered_map<std::string, std::string> g_keyword_name_index;
 // 部分人格列表会把汉化包标题中的换行压成空格或直接移除；该索引只保存由包内译文
 // 推导出的原始分行，让运行时兼容不同页面，而无需硬编码任何人格名称或译文。
 std::unordered_map<std::string, std::string> g_package_line_breaks;
+// 多行原文被剧本演出按 \n 拆分并拼接衔接省略号时，保存各行片段到对应中文分段的无歧义映射。
+std::unordered_map<std::string, std::string> g_line_fragment_index;
 struct TermTrieNode {
     std::unordered_map<unsigned char, size_t> children;
     const std::string *source = nullptr;
@@ -177,6 +180,7 @@ struct TmpComponentState {
     bool use_regular_title_font = false;
     bool use_battle_winrate_bold = false;
     bool preserve_source_outline = false;
+    bool preserve_special_effect = false;
     std::string known_text_kind;
 };
 std::unordered_map<void *, TmpComponentState> g_original_tmp_states;
@@ -245,6 +249,13 @@ struct SkillTitleCacheEntry {
     bool two_line_margin_applied = false;
 };
 std::unordered_map<void *, SkillTitleCacheEntry> g_skill_title_full_cache;
+struct TmpTypewriterTraceEntry {
+    uintptr_t instance_weak_handle = 0;
+    std::string last_text;
+    bool typewriter_active = false;
+};
+std::unordered_map<void *, TmpTypewriterTraceEntry> g_tmp_typewriter_cache;
+std::atomic<uint64_t> g_typewriter_ellipsis_skips{0};
 char g_il2cpp_path[PATH_MAX] = {};
 
 struct Il2CppStringLayout {
@@ -284,9 +295,19 @@ struct RuntimeColor {
     float b;
     float a;
 };
+struct RuntimeVector4 {
+    float x;
+    float y;
+    float z;
+    float w;
+};
 typedef void (*tmp_set_color_fn)(void *, RuntimeColor, const void *);
 typedef void (*material_set_color_fn)(void *, void *, RuntimeColor, const void *);
 typedef void (*material_set_float_fn)(void *, void *, float, const void *);
+typedef void (*material_set_vector_fn)(void *, void *, RuntimeVector4, const void *);
+typedef void (*material_set_float_id_fn)(void *, int32_t, float, const void *);
+typedef void (*material_set_color_id_fn)(void *, int32_t, RuntimeColor, const void *);
+typedef void (*material_set_vector_id_fn)(void *, int32_t, RuntimeVector4, const void *);
 typedef int32_t (*get_language_fn)(void *, const void *);
 typedef void *(*class_get_parent_fn)(void *);
 typedef const void *(*class_get_fields_fn)(void *, void **);
@@ -294,6 +315,24 @@ typedef const char *(*field_get_name_fn)(const void *);
 typedef const void *(*field_get_type_fn)(const void *);
 typedef void (*field_get_value_fn)(void *, const void *, void *);
 typedef void (*field_set_value_fn)(void *, const void *, void *);
+typedef void (*field_static_get_value_fn)(const void *, void *);
+typedef int (*field_get_flags_fn)(const void *);
+typedef const void *(*class_get_type_fn)(void *);
+typedef void *(*type_get_object_fn)(const void *);
+typedef void *(*class_from_type_fn)(const void *);
+typedef bool (*class_is_valuetype_fn)(void *);
+typedef bool (*class_is_enum_fn)(void *);
+typedef uint32_t (*method_get_flags_fn)(const void *, uint32_t *);
+typedef void (*battle_lyrics_init_fn)(void *, void *, float, int32_t, bool, int32_t, const void *);
+typedef void (*battle_lyrics_dot_fn)(void *, float, const void *);
+typedef void (*battle_lyrics_void_fn)(void *, const void *);
+typedef void *(*bgm_lyrics_get_data_fn)(void *, void *, int32_t, int32_t *, const void *);
+typedef void (*material_keyword_fn)(void *, void *, const void *);
+typedef void (*tmp_mat_setter_void_fn)(void *, const void *);
+typedef void (*battle_effect_void_fn)(void *, const void *);
+typedef void (*battle_effect_set_dialog_fn)(void *, void *, float, bool, const void *);
+typedef void (*battle_effect_set_dialog_mid_fn)(void *, void *, float, const void *);
+typedef void (*battle_effect_set_dialog_upper_fn)(void *, void *, float, float, const void *);
 
 string_length_fn g_string_length = nullptr;
 string_chars_fn g_string_chars = nullptr;
@@ -328,6 +367,12 @@ thread_local bool g_suppress_tmp_text_submission = false;
 tmp_set_color_fn g_original_tmp_set_color = nullptr;
 material_set_color_fn g_original_material_set_color = nullptr;
 material_set_float_fn g_original_material_set_float = nullptr;
+material_set_vector_fn g_original_material_set_vector = nullptr;
+material_set_float_id_fn g_original_material_set_float_id = nullptr;
+material_set_color_id_fn g_original_material_set_color_id = nullptr;
+material_set_vector_id_fn g_original_material_set_vector_id = nullptr;
+material_keyword_fn g_original_material_enable_keyword = nullptr;
+material_keyword_fn g_original_material_disable_keyword = nullptr;
 const void *g_create_dynamic_font_info = nullptr;
 const void *g_create_tmp_font_info = nullptr;
 const void *g_tmp_set_font_info = nullptr;
@@ -415,6 +460,43 @@ const void *g_material_set_texture_info = nullptr;
 const void *g_material_enable_keyword_info = nullptr;
 const void *g_material_disable_keyword_info = nullptr;
 const void *g_material_is_keyword_enabled_info = nullptr;
+const void *g_material_has_property_info = nullptr;
+const void *g_material_get_shader_info = nullptr;
+const void *g_material_get_vector_info = nullptr;
+const void *g_material_set_vector_info = nullptr;
+const void *g_material_set_float_id_info = nullptr;
+const void *g_material_set_color_id_info = nullptr;
+const void *g_material_set_vector_id_info = nullptr;
+const void *g_shader_property_to_id_info = nullptr;
+const void *g_object_set_name_info = nullptr;
+const void *g_tmp_get_default_font_asset_path_info = nullptr;
+const void *g_resources_load_info = nullptr;
+const void *g_material_ref_mgr_get_instance_info = nullptr;
+const void *g_material_ref_mgr_add_font_mat_info = nullptr;
+const void *g_tmp_get_simple_hash_code_info = nullptr;
+const void *g_tmp_get_hash_case_insensitive_info = nullptr;
+const void *g_tmp_get_simple_hash_lower_info = nullptr;
+const void *g_shader_utilities_update_ratios_info = nullptr;
+void *g_material_type_object = nullptr;
+void *g_unity_object_class = nullptr;
+void *g_tmp_text_class = nullptr;
+void *g_tmp_text_type_object = nullptr;
+const void *g_component_get_component_type_info = nullptr;
+method_get_flags_fn g_method_get_flags = nullptr;
+battle_lyrics_init_fn g_original_battle_lyrics_init = nullptr;
+battle_lyrics_void_fn g_original_battle_lyrics_create_pres = nullptr;
+battle_lyrics_dot_fn g_original_battle_lyrics_set_dot = nullptr;
+battle_lyrics_void_fn g_original_battle_lyrics_reset_color = nullptr;
+bgm_lyrics_get_data_fn g_original_bgm_lyrics_get_data = nullptr;
+tmp_mat_setter_void_fn g_original_mat_setter_write_props = nullptr;
+tmp_mat_setter_void_fn g_original_mat_setter_write = nullptr;
+tmp_mat_setter_void_fn g_original_mat_setter_reset = nullptr;
+tmp_mat_setter_void_fn g_original_mat_setter_reset_material = nullptr;
+tmp_mat_setter_void_fn g_original_mat_setter_clone = nullptr;
+battle_effect_void_fn g_original_battle_effect_clear_accent = nullptr;
+battle_effect_set_dialog_fn g_original_battle_effect_set_dialog = nullptr;
+battle_effect_set_dialog_mid_fn g_original_battle_effect_set_dialog_mid = nullptr;
+battle_effect_set_dialog_upper_fn g_original_battle_effect_set_dialog_upper = nullptr;
 const void *g_unity_object_instantiate_info = nullptr;
 il2cpp_init_fn g_original_il2cpp_init = nullptr;
 dlsym_fn g_original_unity_dlsym = nullptr;
@@ -426,6 +508,13 @@ field_get_name_fn g_field_get_name = nullptr;
 field_get_type_fn g_field_get_type = nullptr;
 field_get_value_fn g_field_get_value = nullptr;
 field_set_value_fn g_field_set_value = nullptr;
+field_static_get_value_fn g_field_static_get_value = nullptr;
+field_get_flags_fn g_field_get_flags = nullptr;
+class_get_type_fn g_class_get_type = nullptr;
+type_get_object_fn g_type_get_object = nullptr;
+class_from_type_fn g_class_from_type = nullptr;
+class_is_valuetype_fn g_class_is_valuetype = nullptr;
+class_is_enum_fn g_class_is_enum = nullptr;
 typedef char *(*type_get_name_owned_fn)(const void *);
 typedef void (*il2cpp_free_owned_fn)(void *);
 type_get_name_owned_fn g_type_get_name = nullptr;
@@ -608,23 +697,89 @@ bool apply_two_line_title_margin(void *instance) {
     return applied;
 }
 
-void prune_skill_title_cache_locked() {
-    if (g_skill_title_full_cache.size() <= 256) return;
-    for (auto entry = g_skill_title_full_cache.begin();
-         entry != g_skill_title_full_cache.end();) {
+template <typename CacheMap>
+void prune_weak_instance_cache_locked(CacheMap &cache, size_t max_entries = 256) {
+    if (cache.size() <= max_entries) return;
+    for (auto entry = cache.begin(); entry != cache.end();) {
         if (resolve_live_object(
                     entry->second.instance_weak_handle, entry->first) == nullptr) {
             release_object_handle(entry->second.instance_weak_handle);
-            entry = g_skill_title_full_cache.erase(entry);
+            entry = cache.erase(entry);
         } else {
             ++entry;
         }
     }
-    while (g_skill_title_full_cache.size() > 256) {
-        auto first = g_skill_title_full_cache.begin();
+    while (cache.size() > max_entries) {
+        auto first = cache.begin();
         release_object_handle(first->second.instance_weak_handle);
-        g_skill_title_full_cache.erase(first);
+        cache.erase(first);
     }
+}
+
+void prune_skill_title_cache_locked() {
+    prune_weak_instance_cache_locked(g_skill_title_full_cache);
+}
+
+bool is_typewriter_prefix_extension(const std::string &prev, const std::string &curr) {
+    // 逐字打字推进表现为在同一非空前缀后每次追加少量字符，而不是跨词条大幅换词。
+    constexpr size_t kMaxSingleStepAppendBytes = 24;
+    if (prev.empty() || curr.size() <= prev.size()) return false;
+    if (curr.compare(0, prev.size(), prev) != 0) return false;
+    return (curr.size() - prev.size()) <= kMaxSingleStepAppendBytes;
+}
+
+bool is_tmp_typewriter_continuation(void *instance, const std::string &text) {
+    if (instance == nullptr || text.empty()) return false;
+    bool continuation = false;
+    pthread_mutex_lock(&g_tmp_typewriter_cache_lock);
+    auto found = g_tmp_typewriter_cache.find(instance);
+    if (found != g_tmp_typewriter_cache.end() &&
+        resolve_live_object(found->second.instance_weak_handle, instance) != nullptr) {
+        const std::string &prev = found->second.last_text;
+        if (text == prev) {
+            continuation = found->second.typewriter_active;
+        } else if (is_typewriter_prefix_extension(prev, text)) {
+            continuation = true;
+        }
+    }
+    pthread_mutex_unlock(&g_tmp_typewriter_cache_lock);
+    return continuation;
+}
+
+bool update_tmp_typewriter_progression(void *instance, const std::string &text) {
+    if (instance == nullptr) return false;
+    bool active = false;
+    pthread_mutex_lock(&g_tmp_typewriter_cache_lock);
+    auto found = g_tmp_typewriter_cache.find(instance);
+    if (found != g_tmp_typewriter_cache.end() &&
+        resolve_live_object(found->second.instance_weak_handle, instance) != nullptr) {
+        const std::string &prev = found->second.last_text;
+        if (text.empty()) {
+            found->second.typewriter_active = false;
+            found->second.last_text.clear();
+        } else if (text == prev) {
+            active = found->second.typewriter_active;
+        } else if (is_typewriter_prefix_extension(prev, text)) {
+            found->second.typewriter_active = true;
+            found->second.last_text = text;
+            active = true;
+        } else {
+            found->second.typewriter_active = false;
+            found->second.last_text = text;
+        }
+    } else {
+        if (found != g_tmp_typewriter_cache.end()) {
+            release_object_handle(found->second.instance_weak_handle);
+            g_tmp_typewriter_cache.erase(found);
+        }
+        TmpTypewriterTraceEntry entry;
+        entry.instance_weak_handle = create_weak_object_handle(instance);
+        entry.last_text = text;
+        g_tmp_typewriter_cache.emplace(instance, std::move(entry));
+    }
+    prune_weak_instance_cache_locked(g_tmp_typewriter_cache);
+    pthread_mutex_unlock(&g_tmp_typewriter_cache_lock);
+    return active;
 }
 
 void remember_full_skill_title(void *instance, const std::string &text) {
@@ -1613,22 +1768,40 @@ std::string compact_rich_text_lookup_key(const std::string &source) {
 void rebuild_rich_text_canonical_index() {
     g_rich_text_canonical_index.clear();
     std::unordered_set<std::string> conflicts;
-    for (const auto &entry : g_index) {
-        const std::string visible =
-                canonicalize_rich_text_for_lookup(entry.first);
-        const std::string canonical = compact_rich_text_lookup_key(visible);
-        if (canonical.empty() || canonical == entry.first ||
-            conflicts.find(canonical) != conflicts.end()) {
-            continue;
+    std::unordered_set<std::string> primary_locked;
+    auto ingest_canonical = [&](const std::unordered_map<std::string, std::string> &src_map,
+                                bool is_primary) {
+        for (const auto &entry : src_map) {
+            const std::string visible =
+                    canonicalize_rich_text_for_lookup(entry.first);
+            const std::string canonical = compact_rich_text_lookup_key(visible);
+            if (canonical.empty() || canonical == entry.first ||
+                conflicts.find(canonical) != conflicts.end()) {
+                continue;
+            }
+            if (!is_primary && primary_locked.find(canonical) != primary_locked.end()) {
+                continue;
+            }
+            auto existing = g_rich_text_canonical_index.find(canonical);
+            if (existing == g_rich_text_canonical_index.end()) {
+                g_rich_text_canonical_index.emplace(canonical, entry.second);
+                if (is_primary) primary_locked.insert(canonical);
+            } else if (existing->second != entry.second) {
+                // 主词典与回退索引中若仅包有不同颜色等富文本外壳而正文相同，不视作冲突。
+                const std::string existing_plain =
+                        canonicalize_rich_text_for_lookup(existing->second);
+                const std::string incoming_plain =
+                        canonicalize_rich_text_for_lookup(entry.second);
+                if (existing_plain != incoming_plain) {
+                    g_rich_text_canonical_index.erase(existing);
+                    primary_locked.erase(canonical);
+                    conflicts.insert(canonical);
+                }
+            }
         }
-        auto existing = g_rich_text_canonical_index.find(canonical);
-        if (existing == g_rich_text_canonical_index.end()) {
-            g_rich_text_canonical_index.emplace(canonical, entry.second);
-        } else if (existing->second != entry.second) {
-            g_rich_text_canonical_index.erase(existing);
-            conflicts.insert(canonical);
-        }
-    }
+    };
+    ingest_canonical(g_index, true);
+    ingest_canonical(g_fallback_index, false);
 }
 
 std::string apply_dante_line_height(const std::string &translation) {
@@ -2297,16 +2470,387 @@ bool translate_multiline_exact(const std::string &source, std::string *translati
     return true;
 }
 
-bool restore_ellipsis_truncated_translation(const std::string &text,
-                                            std::string *restored) {
-    size_t prefix_len = 0;
-    if (text.size() > 3 && text.compare(text.size() - 3, 3, "...") == 0) {
-        prefix_len = text.size() - 3;
-    } else if (text.size() > 3 &&
-               text.compare(text.size() - 3, 3, "\xe2\x80\xa6") == 0) {
-        prefix_len = text.size() - 3;
+bool decode_next_utf8_codepoint(
+        const std::string &text, size_t *offset, uint32_t *out_codepoint) {
+    if (offset == nullptr || *offset >= text.size()) return false;
+    const size_t pos = *offset;
+    const unsigned char first = static_cast<unsigned char>(text[pos]);
+    uint32_t cp = 0;
+    size_t len = 1;
+    if (first <= 0x7f) {
+        cp = first;
+    } else if ((first & 0xe0) == 0xc0 && pos + 1 < text.size()) {
+        cp = first & 0x1f;
+        len = 2;
+    } else if ((first & 0xf0) == 0xe0 && pos + 2 < text.size()) {
+        cp = first & 0x0f;
+        len = 3;
+    } else if ((first & 0xf8) == 0xf0 && pos + 3 < text.size()) {
+        cp = first & 0x07;
+        len = 4;
+    } else {
+        *offset = pos + 1;
+        if (out_codepoint != nullptr) *out_codepoint = first;
+        return true;
     }
-    if (prefix_len < 6) return false;
+    for (size_t i = 1; i < len; ++i) {
+        const unsigned char next = static_cast<unsigned char>(text[pos + i]);
+        if ((next & 0xc0) != 0x80) {
+            *offset = pos + 1;
+            if (out_codepoint != nullptr) *out_codepoint = first;
+            return true;
+        }
+        cp = (cp << 6) | (next & 0x3f);
+    }
+    *offset = pos + len;
+    if (out_codepoint != nullptr) *out_codepoint = cp;
+    return true;
+}
+
+size_t count_utf8_codepoints(const std::string &text) {
+    size_t count = 0;
+    for (size_t off = 0; off < text.size();) {
+        uint32_t dummy = 0;
+        decode_next_utf8_codepoint(text, &off, &dummy);
+        ++count;
+    }
+    return count;
+}
+
+void trim_spaces_and_fullwidth(std::string *text) {
+    if (text == nullptr) return;
+    static const char *const kSpaces[] = {" ", "\t", "\r", "\n", "\xc2\xa0", "\xe3\x80\x80"};
+    bool changed = true;
+    while (changed && !text->empty()) {
+        changed = false;
+        for (const char *sp : kSpaces) {
+            const size_t slen = strlen(sp);
+            if (text->size() >= slen && text->compare(0, slen, sp) == 0) {
+                text->erase(0, slen);
+                changed = true;
+            }
+            if (text->size() >= slen && text->compare(text->size() - slen, slen, sp) == 0) {
+                text->resize(text->size() - slen);
+                changed = true;
+            }
+        }
+    }
+}
+
+void strip_fragment_ellipsis_and_space(
+        const std::string &text, std::string *stripped_out,
+        bool *has_leading, bool *has_trailing) {
+    if (stripped_out == nullptr) return;
+    *stripped_out = text;
+    if (has_leading != nullptr) *has_leading = false;
+    if (has_trailing != nullptr) *has_trailing = false;
+    static const char *const kEllipsisTokens[] = {
+            "\xe2\x80\xa6",          // … (U+2026)
+            "\xe2\x8b\xaf",          // ⋯ (U+22EF)
+            "\xe3\x83\xbb\xe3\x83\xbb\xe3\x83\xbb",  // ・・・
+            "\xc2\xb7\xc2\xb7\xc2\xb7",              // ···
+            "..."
+    };
+    trim_spaces_and_fullwidth(stripped_out);
+    bool changed = true;
+    while (changed && !stripped_out->empty()) {
+        changed = false;
+        for (const char *tok : kEllipsisTokens) {
+            const size_t tlen = strlen(tok);
+            if (stripped_out->size() >= tlen &&
+                stripped_out->compare(0, tlen, tok) == 0) {
+                stripped_out->erase(0, tlen);
+                if (has_leading != nullptr) *has_leading = true;
+                changed = true;
+            }
+            if (stripped_out->size() >= tlen &&
+                stripped_out->compare(stripped_out->size() - tlen, tlen, tok) == 0) {
+                stripped_out->resize(stripped_out->size() - tlen);
+                if (has_trailing != nullptr) *has_trailing = true;
+                changed = true;
+            }
+        }
+        if (changed) trim_spaces_and_fullwidth(stripped_out);
+    }
+}
+
+bool split_translation_into_line_segments(
+        const std::string &source_jp, const std::string &translation,
+        std::vector<std::string> *out_jp_lines,
+        std::vector<std::string> *out_zh_parts) {
+    if (out_jp_lines == nullptr || out_zh_parts == nullptr ||
+        source_jp.find('\n') == std::string::npos || translation.empty()) {
+        return false;
+    }
+    out_jp_lines->clear();
+    out_zh_parts->clear();
+
+    auto split_nonempty_lines = [](const std::string &src, std::vector<std::string> *out) {
+        size_t pos = 0;
+        while (pos <= src.size()) {
+            const size_t nl = src.find('\n', pos);
+            std::string line = src.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+            trim_spaces_and_fullwidth(&line);
+            if (!line.empty()) out->push_back(std::move(line));
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+    };
+
+    split_nonempty_lines(source_jp, out_jp_lines);
+    const size_t n = out_jp_lines->size();
+    if (n <= 1) return false;
+
+    if (translation.find('\n') != std::string::npos) {
+        std::vector<std::string> zh_lines;
+        split_nonempty_lines(translation, &zh_lines);
+        if (zh_lines.size() == n) {
+            *out_zh_parts = std::move(zh_lines);
+            return true;
+        }
+    }
+
+    std::string flat_zh = translation;
+    std::replace(flat_zh.begin(), flat_zh.end(), '\n', ' ');
+    trim_spaces_and_fullwidth(&flat_zh);
+
+    std::vector<uint32_t> cps;
+    std::vector<size_t> byte_starts;
+    std::vector<bool> safe_after;
+    int angle_depth = 0, bracket_depth = 0, brace_depth = 0;
+    for (size_t off = 0; off < flat_zh.size();) {
+        byte_starts.push_back(off);
+        uint32_t cp = 0;
+        decode_next_utf8_codepoint(flat_zh, &off, &cp);
+        cps.push_back(cp);
+        if (cp == '<') ++angle_depth;
+        else if (cp == '>' && angle_depth > 0) --angle_depth;
+        else if (cp == '[') ++bracket_depth;
+        else if (cp == ']' && bracket_depth > 0) --bracket_depth;
+        else if (cp == '{') ++brace_depth;
+        else if (cp == '}' && brace_depth > 0) --brace_depth;
+        safe_after.push_back(angle_depth == 0 && bracket_depth == 0 && brace_depth == 0);
+    }
+    byte_starts.push_back(flat_zh.size());
+    const size_t total_zh_cps = cps.size();
+    if (total_zh_cps < n * 2) return false;
+
+    std::vector<size_t> jp_cp_lens(n, 0);
+    size_t total_jp_cps = 0;
+    for (size_t i = 0; i < n; ++i) {
+        jp_cp_lens[i] = count_utf8_codepoints((*out_jp_lines)[i]);
+        total_jp_cps += jp_cp_lens[i];
+    }
+    if (total_jp_cps == 0) return false;
+
+    auto is_in_set = [](uint32_t cp, const uint32_t *arr, size_t cnt) {
+        for (size_t i = 0; i < cnt; ++i) {
+            if (arr[i] == cp) return true;
+        }
+        return false;
+    };
+    static const uint32_t kStrongPunct[] = {0x3002, 0xFF01, 0xFF1F, 0x2026};  // 。！？…
+    static const uint32_t kMediumPunct[] = {0xFF0C, 0x3001, 0xFF1B, 0xFF1A, ',', ';'};
+    static const uint32_t kCloseQuotes[] = {0x300D, 0x300F, 0x201D, 0x2019, 0xFF09, ')'};
+    static const uint32_t kFuncAfter[] = {0x7684, 0x4E86, 0x7740, 0x5728, 0x4E0E, 0x548C};  // 的了着在与和
+    static const uint32_t kFuncBefore[] = {
+            0x5E76, 0x6216, 0x800C, 0x4F46, 0x5374, 0x8FD9, 0x90A3, 0x56E0, 0x6240, 0x5176
+    };  // 并或而但却这那因所其
+
+    std::vector<size_t> split_cp_indices;
+    size_t start_cp = 0;
+    size_t cum_jp = 0;
+    for (size_t idx = 0; idx + 1 < n; ++idx) {
+        cum_jp += jp_cp_lens[idx];
+        const size_t rem = n - 1 - idx;
+        const size_t min_pos = start_cp + 2;
+        const size_t max_pos = total_zh_cps - rem * 2;
+        const double ideal = (static_cast<double>(cum_jp) / total_jp_cps) * total_zh_cps;
+
+        size_t best_pos = total_zh_cps;
+        double best_cost = 1e9;
+        for (size_t pos = min_pos; pos <= max_pos; ++pos) {
+            if (!safe_after[pos - 1]) continue;
+            const uint32_t prev_cp = cps[pos - 1];
+            const uint32_t cur_cp = pos < total_zh_cps ? cps[pos] : 0;
+            double pen = -1.0;
+            size_t p = pos;
+            if (is_in_set(prev_cp, kStrongPunct, sizeof(kStrongPunct) / sizeof(uint32_t))) {
+                while (p < max_pos &&
+                       (is_in_set(cps[p], kCloseQuotes, sizeof(kCloseQuotes) / sizeof(uint32_t)) ||
+                        cps[p] == 0x2026 || cps[p] == 0x3002)) {
+                    ++p;
+                }
+                pen = 0.0;
+            } else if (is_in_set(prev_cp, kMediumPunct, sizeof(kMediumPunct) / sizeof(uint32_t))) {
+                while (p < max_pos &&
+                       is_in_set(cps[p], kCloseQuotes, sizeof(kCloseQuotes) / sizeof(uint32_t))) {
+                    ++p;
+                }
+                pen = 0.36;
+            } else if (is_in_set(cur_cp, kFuncBefore, sizeof(kFuncBefore) / sizeof(uint32_t))) {
+                pen = 0.85;
+            } else if (is_in_set(prev_cp, kFuncAfter, sizeof(kFuncAfter) / sizeof(uint32_t))) {
+                pen = 0.95;
+            }
+            if (pen < 0.0 || p < min_pos || p > max_pos) continue;
+            const double dist = std::fabs(static_cast<double>(p) - ideal) /
+                    std::max<size_t>(total_zh_cps, 1);
+            const double cost = dist * 2.8 + pen;
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_pos = p;
+            }
+        }
+        if (best_pos > max_pos) {
+            size_t fallback_pos = static_cast<size_t>(std::llround(ideal));
+            if (fallback_pos < min_pos) fallback_pos = min_pos;
+            if (fallback_pos > max_pos) fallback_pos = max_pos;
+            while (fallback_pos < max_pos && !safe_after[fallback_pos - 1]) ++fallback_pos;
+            best_pos = fallback_pos;
+        }
+        split_cp_indices.push_back(best_pos);
+        start_cp = best_pos;
+    }
+
+    size_t prev_byte = 0;
+    for (size_t cp_idx : split_cp_indices) {
+        std::string part = flat_zh.substr(prev_byte, byte_starts[cp_idx] - prev_byte);
+        trim_spaces_and_fullwidth(&part);
+        out_zh_parts->push_back(std::move(part));
+        prev_byte = byte_starts[cp_idx];
+    }
+    std::string tail = flat_zh.substr(prev_byte);
+    trim_spaces_and_fullwidth(&tail);
+    out_zh_parts->push_back(std::move(tail));
+    return out_zh_parts->size() == n;
+}
+
+bool translate_split_line_fragment(const std::string &source, std::string *translated) {
+    if (translated == nullptr ||
+        (g_line_fragment_index.empty() && g_index.empty() && g_fallback_index.empty()) ||
+        source.find("<link") != std::string::npos) {
+        return false;
+    }
+    const bool source_has_tags = source.find('<') != std::string::npos;
+
+    auto lookup_candidate = [&](const std::string &candidate,
+                                std::string *out_value,
+                                bool *out_leading,
+                                bool *out_trailing,
+                                size_t *out_key_size) -> bool {
+        std::string clean_key;
+        bool has_leading = false;
+        bool has_trailing = false;
+        strip_fragment_ellipsis_and_space(
+                candidate, &clean_key, &has_leading, &has_trailing);
+        if (clean_key.empty()) return false;
+
+        const size_t clean_cps = count_utf8_codepoints(clean_key);
+        // 只有明确带有演出衔接省略号，或者长度足够独特的纯片段，才命中拆行片段索引，防止误伤普通短 UI。
+        if (!has_leading && !has_trailing && clean_cps < 10) {
+            return false;
+        }
+
+        std::string matched;
+        auto frag_hit = g_line_fragment_index.find(clean_key);
+        if (frag_hit == g_line_fragment_index.end()) {
+            std::string trimmed = candidate;
+            trim_spaces_and_fullwidth(&trimmed);
+            frag_hit = g_line_fragment_index.find(trimmed);
+        }
+        if (frag_hit != g_line_fragment_index.end() && !frag_hit->second.empty()) {
+            matched = frag_hit->second;
+        } else if ((has_leading || has_trailing) && clean_cps >= 6) {
+            // 部分单行台词或含颜色外壳台词会在演出中被增删首尾省略号；仅在已存在首尾省略号变化时兜底查询整句/规范化索引。
+            auto idx_hit = g_index.find(clean_key);
+            if (idx_hit != g_index.end()) {
+                matched = idx_hit->second;
+            } else {
+                auto fb_hit = g_fallback_index.find(clean_key);
+                if (fb_hit != g_fallback_index.end()) {
+                    matched = fb_hit->second;
+                } else {
+                    const std::string canonical_key = compact_rich_text_lookup_key(
+                            canonicalize_rich_text_for_lookup(clean_key));
+                    if (!canonical_key.empty()) {
+                        auto can_hit = g_rich_text_canonical_index.find(canonical_key);
+                        if (can_hit != g_rich_text_canonical_index.end()) {
+                            matched = can_hit->second;
+                        }
+                    }
+                }
+            }
+        }
+        if (matched.empty()) return false;
+        if (!source_has_tags && matched.find('<') != std::string::npos) {
+            matched = canonicalize_rich_text_for_lookup(matched);
+        }
+        if (matched.empty()) return false;
+        *out_value = std::move(matched);
+        *out_leading = has_leading;
+        *out_trailing = has_trailing;
+        *out_key_size = clean_key.size();
+        return true;
+    };
+
+    std::string out;
+    bool has_leading = false;
+    bool has_trailing = false;
+    size_t key_size = 0;
+    if (!lookup_candidate(source, &out, &has_leading, &has_trailing, &key_size)) {
+        if (!source_has_tags) return false;
+        const std::string stripped_source = canonicalize_rich_text_for_lookup(source);
+        if (stripped_source.empty() || stripped_source == source ||
+            !lookup_candidate(
+                    stripped_source, &out, &has_leading, &has_trailing, &key_size)) {
+            return false;
+        }
+    }
+
+    auto starts_with_token = [](const std::string &s, const char *tok) {
+        const size_t len = strlen(tok);
+        return s.size() >= len && s.compare(0, len, tok) == 0;
+    };
+    auto ends_with_token = [](const std::string &s, const char *tok) {
+        const size_t len = strlen(tok);
+        return s.size() >= len && s.compare(s.size() - len, len, tok) == 0;
+    };
+
+    if (has_leading &&
+        !starts_with_token(out, "\xe2\x80\xa6") &&
+        !starts_with_token(out, "...")) {
+        out.insert(0, "\xe2\x80\xa6\xe2\x80\xa6");
+    }
+    if (has_trailing) {
+        // 若分句落在逗号/顿号处且原演出带有续接省略号，将尾逗号改作 …… 保持自然断句韵律；句末标点或原有省略号则保留原貌。
+        static const char *const kSoftTrailingCommas[] = {"\xef\xbc\x8c", "\xe3\x80\x81", ",", " "};
+        for (const char *comma : kSoftTrailingCommas) {
+            if (ends_with_token(out, comma)) {
+                out.resize(out.size() - strlen(comma));
+                out.append("\xe2\x80\xa6\xe2\x80\xa6");
+                break;
+            }
+        }
+    }
+    *translated = std::move(out);
+    static std::atomic<uint64_t> fragment_logs{0};
+    const uint64_t n = fragment_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 25) {
+        LT_LOGI("Split line fragment match n=%llu lead=%d trail=%d keyChars=%zu result=%s",
+                static_cast<unsigned long long>(n), has_leading ? 1 : 0, has_trailing ? 1 : 0,
+                key_size, translated->c_str());
+    }
+    return true;
+}
+
+bool restore_ellipsis_truncated_translation(const std::string &text,
+                                            std::string *restored,
+                                            bool allow_literal_ellipsis_prefix = false) {
+    size_t prefix_len = 0;
+    if (!trailing_ellipsis_prefix_length(text, &prefix_len) || prefix_len < 6) {
+        return false;
+    }
     bool found = false;
     std::string best_match;
     pthread_mutex_lock(&g_font_state_lock);
@@ -2315,6 +2859,20 @@ bool restore_ellipsis_truncated_translation(const std::string &text,
         if (entry.size() > prefix_len &&
             entry.find('\n') == std::string::npos &&
             entry.compare(0, prefix_len, text, 0, prefix_len) == 0) {
+            if (!allow_literal_ellipsis_prefix) {
+                // 若候选全文在截断点本身就是省略号（例如打字机推进到句中 "……" / "..."），
+                // 说明当前串是原句切片而不是被 UI 裁断后追加的省略号，禁止替换全文。
+                const bool literal_exact =
+                        entry.size() >= text.size() &&
+                        entry.compare(0, text.size(), text) == 0;
+                const bool starts_with_ellipsis_at_split =
+                        entry[prefix_len] == '.' ||
+                        (entry.size() - prefix_len >= 3 &&
+                         entry.compare(prefix_len, 3, "\xE2\x80\xA6") == 0);
+                if (literal_exact || starts_with_ellipsis_at_split) {
+                    continue;
+                }
+            }
             if (!found || entry.size() < best_match.size()) {
                 best_match = entry;
                 found = true;
@@ -2332,10 +2890,8 @@ bool is_registered_translation_text(const std::string &text) {
     pthread_mutex_unlock(&g_font_state_lock);
     if (!registered) {
         std::string restored;
-        if (restore_ellipsis_truncated_translation(text, &restored)) {
-            pthread_mutex_lock(&g_font_state_lock);
-            g_translated_managed_texts.insert(text);
-            pthread_mutex_unlock(&g_font_state_lock);
+        // 仅识别前置片段以保留中文主字体并避免二次翻译，不把中途片段写入全局译文集合。
+        if (restore_ellipsis_truncated_translation(text, &restored, true)) {
             registered = true;
         }
     }
@@ -2473,15 +3029,19 @@ void *translate_managed_string(
         if (protected_spans.empty()) {
             canonical_source = compact_rich_text_lookup_key(
                     canonicalize_rich_text_for_lookup(source));
-            if (!canonical_source.empty() && canonical_source != source) {
+            if (!canonical_source.empty()) {
+                // 即使演出已剥离全部 `<color=...>` 标签（此时 canonical_source == source），
+                // 也要允许命中富文本规范化索引；精确无标签词条已在上方先行返回，不会互相覆盖。
                 canonical_match =
                         g_rich_text_canonical_index.find(canonical_source);
                 canonical_index_match =
                         canonical_match != g_rich_text_canonical_index.end();
-                if (!canonical_index_match) {
+                if (!canonical_index_match && canonical_source != source) {
                     canonical_match = g_index.find(canonical_source);
                 }
-                canonical_fallback = g_fallback_index.find(canonical_source);
+                if (canonical_source != source) {
+                    canonical_fallback = g_fallback_index.find(canonical_source);
+                }
             }
         }
         if (line_height_normalized && match != g_index.end()) {
@@ -2492,20 +3052,30 @@ void *translate_managed_string(
             translated = apply_dante_line_height(fallback_match->second);
             probe_stage = "normalized-fallback-match";
             g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
-        } else if (canonical_index_match || canonical_match != g_index.end()) {
-            translated = canonical_match->second;
-            probe_stage = "rich-text-canonical-match";
-            uint64_t hits = g_rich_text_canonical_matches.fetch_add(
-                    1, std::memory_order_relaxed) + 1;
-            if (hits <= 40 || hits % 250 == 0) {
-                LT_LOGI("Rich-text canonical story match hits=%llu chars=%zu->%zu",
-                        static_cast<unsigned long long>(hits),
-                        source.size(), canonical_source.size());
+        } else if (canonical_index_match || canonical_match != g_index.end() ||
+                   canonical_fallback != g_fallback_index.end()) {
+            const bool from_fallback =
+                    !canonical_index_match && canonical_match == g_index.end();
+            translated = from_fallback ? canonical_fallback->second : canonical_match->second;
+            if (source.find('<') == std::string::npos &&
+                translated.find('<') != std::string::npos) {
+                // 运行时原文已移除外壳富文本标签（如靠材质渐变上色的台词），同步输出纯文本以免破坏颜色渐变或打字机。
+                std::string plain = canonicalize_rich_text_for_lookup(translated);
+                if (!plain.empty()) translated = std::move(plain);
             }
-        } else if (canonical_fallback != g_fallback_index.end()) {
-            translated = canonical_fallback->second;
-            probe_stage = "rich-text-canonical-fallback";
-            g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
+            if (from_fallback) {
+                probe_stage = "rich-text-canonical-fallback";
+                g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                probe_stage = "rich-text-canonical-match";
+                uint64_t hits = g_rich_text_canonical_matches.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                if (hits <= 40 || hits % 250 == 0) {
+                    LT_LOGI("Rich-text canonical story match hits=%llu chars=%zu->%zu",
+                            static_cast<unsigned long long>(hits),
+                            source.size(), canonical_source.size());
+                }
+            }
         } else if (protected_spans.empty() && translate_story_theater_compound_title(source, &translated)) {
             probe_stage = "story-theater-compound-match";
             g_exact_matches.fetch_add(1, std::memory_order_relaxed);
@@ -2515,6 +3085,9 @@ void *translate_managed_string(
         } else if (protected_spans.empty() && translate_multiline_exact(source, &translated)) {
             // The formatter joined several already-localized fields with newlines.
             probe_stage = "multiline-match";
+        } else if (protected_spans.empty() && translate_split_line_fragment(source, &translated)) {
+            probe_stage = "split-line-fragment-match";
+            g_fallback_matches.fetch_add(1, std::memory_order_relaxed);
         } else if (protected_spans.empty() &&
                    translate_rich_text_keyword_names(source, &translated)) {
             probe_stage = "rich-text-keyword-match";
@@ -3016,6 +3589,8 @@ acquisition1_fn g_acquisition1[kAcquisitionSlots] = {};
 acquisition2_fn g_acquisition2[kAcquisitionSlots] = {};
 std::string g_acquisition1_battle_hint_tables[kAcquisitionSlots];
 std::string g_acquisition2_battle_hint_tables[kAcquisitionSlots];
+bool g_acquisition1_is_lyrics[kAcquisitionSlots] = {};
+bool g_acquisition2_is_lyrics[kAcquisitionSlots] = {};
 
 const size_t kKeywordTextGetterSlots = 8;
 typedef void *(*keyword_text_getter_fn)(void *, void *);
@@ -3132,6 +3707,17 @@ void *invoke_acquisition0(size_t slot, void *instance, const void *method) {
     return result;
 }
 void *invoke_acquisition1(size_t slot, void *instance, void *arg0, const void *method) {
+    if (g_acquisition1_is_lyrics[slot]) {
+        void *formatted = g_acquisition1[slot](instance, arg0, method);
+        static std::atomic<uint64_t> raw_lyrics_calls{0};
+        uint64_t n = raw_lyrics_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 30) {
+            LT_LOGI("Probe TextData_Lyrics acq1 slot=%zu call=%llu val=%s",
+                    slot, static_cast<unsigned long long>(n),
+                    read_managed_string_value(formatted).c_str());
+        }
+        return formatted;
+    }
     FormatterTranslationScope scope;
     translate_object_graph(instance);
     void *formatted = g_acquisition1[slot](instance, arg0, method);
@@ -3146,6 +3732,17 @@ void *invoke_acquisition1(size_t slot, void *instance, void *arg0, const void *m
 }
 void *invoke_acquisition2(size_t slot, void *instance, void *arg0, void *arg1,
                           const void *method) {
+    if (g_acquisition2_is_lyrics[slot]) {
+        void *formatted = g_acquisition2[slot](instance, arg0, arg1, method);
+        static std::atomic<uint64_t> raw_lyrics_calls2{0};
+        uint64_t n = raw_lyrics_calls2.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 30) {
+            LT_LOGI("Probe TextData_Lyrics acq2 slot=%zu call=%llu val=%s",
+                    slot, static_cast<unsigned long long>(n),
+                    read_managed_string_value(formatted).c_str());
+        }
+        return formatted;
+    }
     FormatterTranslationScope scope;
     translate_object_graph(instance);
     void *formatted = g_acquisition2[slot](instance, arg0, arg1, method);
@@ -4260,13 +4857,1477 @@ void *read_named_object_field(void *instance, const char *const *names, size_t n
             if (field_name == nullptr) continue;
             for (size_t index = 0; index < name_count; ++index) {
                 if (strcmp(field_name, names[index]) != 0) continue;
+                if (g_field_get_type != nullptr && g_class_from_type != nullptr &&
+                    g_class_is_valuetype != nullptr) {
+                    const void *ftype = g_field_get_type(field);
+                    void *fklass = ftype == nullptr ? nullptr : g_class_from_type(ftype);
+                    if (fklass != nullptr && g_class_is_valuetype(fklass)) {
+                        return nullptr;
+                    }
+                }
+                uint8_t value_buf[256] = {};
+                g_field_get_value(instance, field, value_buf);
                 void *value = nullptr;
-                g_field_get_value(instance, field, &value);
+                memcpy(&value, value_buf, sizeof(value));
                 return value;
             }
         }
     }
     return nullptr;
+}
+
+// ============================================================================
+// Reflection & Special Material Helpers
+// ============================================================================
+std::string ascii_lower_copy(std::string value) {
+    for (char &ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+bool read_named_scalar_field(
+        void *instance, const char *name, void *out_buf, size_t buf_size,
+        std::string *out_type = nullptr) {
+    if (instance == nullptr || name == nullptr || out_buf == nullptr ||
+        g_object_get_class == nullptr || g_class_get_parent == nullptr ||
+        g_class_get_fields == nullptr || g_field_get_name == nullptr ||
+        g_field_get_value == nullptr) {
+        return false;
+    }
+    for (void *klass = g_object_get_class(instance); klass != nullptr;
+         klass = g_class_get_parent(klass)) {
+        void *iterator = nullptr;
+        const void *field = nullptr;
+        while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
+            const char *field_name = g_field_get_name(field);
+            if (field_name == nullptr || strcmp(field_name, name) != 0) continue;
+            if (g_field_get_flags != nullptr &&
+                (g_field_get_flags(field) & 0x0010) != 0) {
+                continue;
+            }
+            if (out_type != nullptr && g_field_get_type != nullptr &&
+                g_type_get_name != nullptr) {
+                char *tn = g_type_get_name(g_field_get_type(field));
+                if (tn != nullptr) {
+                    *out_type = tn;
+                    if (g_il2cpp_free != nullptr) g_il2cpp_free(tn);
+                }
+            }
+            uint8_t safe_buf[256] = {};
+            g_field_get_value(instance, field, safe_buf);
+            const size_t copy_len = std::min(buf_size, sizeof(safe_buf));
+            memset(out_buf, 0, buf_size);
+            memcpy(out_buf, safe_buf, copy_len);
+            return true;
+        }
+    }
+    return false;
+}
+
+void *read_material_shader(void *material) {
+    if (material == nullptr || g_material_get_shader_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return nullptr;
+    }
+    void *exception = nullptr;
+    void *shader = g_runtime_invoke(
+            g_material_get_shader_info, material, nullptr, &exception);
+    return exception == nullptr ? shader : nullptr;
+}
+
+bool read_material_has_property(void *material, const char *property) {
+    if (material == nullptr || property == nullptr ||
+        g_material_has_property_info == nullptr || g_runtime_invoke == nullptr ||
+        g_object_unbox == nullptr) {
+        return false;
+    }
+    void *prop_str = new_managed_string(property);
+    if (prop_str == nullptr) return false;
+    void *args[] = {prop_str};
+    void *exception = nullptr;
+    void *boxed = g_runtime_invoke(
+            g_material_has_property_info, material, args, &exception);
+    void *unboxed = (exception == nullptr && boxed != nullptr) ?
+            g_object_unbox(boxed) : nullptr;
+    if (unboxed == nullptr) return false;
+    uint8_t value = 0;
+    memcpy(&value, unboxed, sizeof(value));
+    return value != 0;
+}
+
+bool read_material_vector_property(
+        void *material, const char *property, float vec[4]) {
+    if (material == nullptr || property == nullptr || vec == nullptr ||
+        g_material_get_vector_info == nullptr || g_runtime_invoke == nullptr ||
+        g_object_unbox == nullptr) {
+        return false;
+    }
+    void *prop_str = new_managed_string(property);
+    if (prop_str == nullptr) return false;
+    void *args[] = {prop_str};
+    void *exception = nullptr;
+    void *boxed = g_runtime_invoke(
+            g_material_get_vector_info, material, args, &exception);
+    void *unboxed = (exception == nullptr && boxed != nullptr) ?
+            g_object_unbox(boxed) : nullptr;
+    if (unboxed == nullptr) return false;
+    memcpy(vec, unboxed, sizeof(float) * 4);
+    return true;
+}
+
+// ============================================================================
+// Battle Lyrics & Special Shader Material Calibration System
+// ============================================================================
+pthread_mutex_t g_special_material_lock = PTHREAD_MUTEX_INITIALIZER;
+thread_local bool g_in_battle_lyrics_init = false;
+thread_local bool g_in_internal_material_sync = false;
+
+struct InternalMaterialSyncGuard {
+    bool prev = false;
+    InternalMaterialSyncGuard() : prev(g_in_internal_material_sync) {
+        g_in_internal_material_sync = true;
+    }
+    ~InternalMaterialSyncGuard() {
+        g_in_internal_material_sync = prev;
+    }
+};
+
+struct SpecialMaterialCloneEntry {
+    void *source = nullptr;
+    uintptr_t source_weak = 0;
+    void *font = nullptr;
+    uintptr_t font_weak = 0;
+    void *clone = nullptr;
+    uintptr_t clone_weak = 0;
+    uintptr_t clone_pin = 0;
+    void *main_tex = nullptr;
+};
+
+struct LyricPresetSpec {
+    const char *zh_name;
+    const char *paths[3];
+};
+
+static const LyricPresetSpec kLyricStylePresetSpecs[4] = {
+        {
+                "ZH_Lyrics_RedDarkGlow",
+                {
+                        "JP/title)corporate logo(bold)/Corporate-Logo-Bold-ver2 SDF RedDarkGlow",
+                        "KR/p)SCDream(light)/SCDream5 RedDarkGlow",
+                        "EN/title)mikodacs/Mikodacs SDF RedDarkGlow"
+                }
+        },
+        {
+                "ZH_Lyrics_RedDarkGlow_CP6_1",
+                {
+                        "JP/title)corporate logo(bold)/Corporate-Logo-Bold-ver2 SDF RedDarkGlow_CP6_1",
+                        "KR/p)SCDream(light)/SCDream5 RedDarkGlow_CP6_1",
+                        "EN/title)mikodacs/Mikodacs SDF RedDarkGlow_CP6_1"
+                }
+        },
+        {
+                "ZH_Lyrics_RedDarkGlow_CP6_2",
+                {
+                        "JP/title)corporate logo(bold)/Corporate-Logo-Bold-ver2 SDF RedDarkGlow_CP6_2",
+                        "KR/p)SCDream(light)/SCDream5 RedDarkGlow_CP6_2",
+                        "EN/title)mikodacs/Mikodacs SDF RedDarkGlow_CP6_2"
+                }
+        },
+        {
+                "ZH_Lyrics_Araya_CP9",
+                {
+                        "JP/title)corporate logo(bold)/Corporate-Logo-Bold-ver2 SDF Araya_CP9",
+                        "KR/p)SCDream(light)/SCDream5 Araya_CP9",
+                        "EN/title)mikodacs/Mikodacs SDF Araya_CP9"
+                }
+        },
+};
+
+struct LyricPresetRuntimeEntry {
+    void *clone = nullptr;
+    uintptr_t clone_weak = 0;
+    uintptr_t clone_pin = 0;
+};
+
+std::unordered_map<void *, uintptr_t> g_battle_lyric_tmps;
+std::unordered_map<void *, SpecialMaterialCloneEntry> g_special_material_clones;
+std::unordered_set<void *> g_chinese_special_materials;
+LyricPresetRuntimeEntry g_lyric_preset_clones[4] = {};
+void *g_last_mat_ref_manager = nullptr;
+uintptr_t g_last_mat_ref_manager_weak = 0;
+void *g_lyrics_base_fallback_clone = nullptr;
+uintptr_t g_lyrics_base_fallback_weak = 0;
+uintptr_t g_lyrics_base_fallback_pin = 0;
+
+std::unordered_map<int32_t, std::string> g_shader_prop_id_names;
+std::unordered_set<int32_t> g_protected_atlas_prop_ids;
+std::atomic<bool> g_shader_prop_ids_initialized{false};
+
+bool method_is_static(const void *method_info) {
+    if (method_info == nullptr || g_method_get_flags == nullptr) return true;
+    constexpr uint32_t kMethodAttributeStatic = 0x0010;
+    return (g_method_get_flags(method_info, nullptr) & kMethodAttributeStatic) != 0;
+}
+
+void write_material_vector_property(
+        void *material, const char *property, const float vec[4]) {
+    if (material == nullptr || property == nullptr || vec == nullptr ||
+        g_material_set_vector_info == nullptr || g_runtime_invoke == nullptr) {
+        return;
+    }
+    void *property_name = new_managed_string(property);
+    if (property_name == nullptr) return;
+    InternalMaterialSyncGuard guard;
+    void *args[] = {property_name, const_cast<float *>(vec)};
+    void *exception = nullptr;
+    g_runtime_invoke(g_material_set_vector_info, material, args, &exception);
+}
+
+void write_material_float_by_id(void *material, int32_t prop_id, float value) {
+    if (material == nullptr || g_material_set_float_id_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return;
+    }
+    InternalMaterialSyncGuard guard;
+    void *args[] = {&prop_id, &value};
+    void *exception = nullptr;
+    g_runtime_invoke(g_material_set_float_id_info, material, args, &exception);
+}
+
+void write_material_color_by_id(
+        void *material, int32_t prop_id, const RuntimeColor &color) {
+    if (material == nullptr || g_material_set_color_id_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return;
+    }
+    InternalMaterialSyncGuard guard;
+    void *args[] = {&prop_id, const_cast<RuntimeColor *>(&color)};
+    void *exception = nullptr;
+    g_runtime_invoke(g_material_set_color_id_info, material, args, &exception);
+}
+
+void write_material_vector_by_id(
+        void *material, int32_t prop_id, const RuntimeVector4 &vec) {
+    if (material == nullptr || g_material_set_vector_id_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return;
+    }
+    InternalMaterialSyncGuard guard;
+    void *args[] = {&prop_id, const_cast<RuntimeVector4 *>(&vec)};
+    void *exception = nullptr;
+    g_runtime_invoke(g_material_set_vector_id_info, material, args, &exception);
+}
+
+bool resolve_shader_property_id(const char *name, int32_t *out_id) {
+    if (name == nullptr || out_id == nullptr || g_shader_property_to_id_info == nullptr ||
+        g_runtime_invoke == nullptr || g_object_unbox == nullptr) {
+        return false;
+    }
+    void *managed = new_managed_string(name);
+    if (managed == nullptr) return false;
+    void *args[] = {managed};
+    void *exc = nullptr;
+    void *boxed = g_runtime_invoke(
+            g_shader_property_to_id_info, nullptr, args, &exc);
+    void *unboxed = (exc == nullptr && boxed != nullptr) ?
+            g_object_unbox(boxed) : nullptr;
+    if (unboxed == nullptr) return false;
+    memcpy(out_id, unboxed, sizeof(*out_id));
+    return true;
+}
+
+void ensure_shader_property_ids_initialized() {
+    if (g_shader_prop_ids_initialized.load(std::memory_order_acquire)) return;
+    if (g_shader_property_to_id_info == nullptr) return;
+    static const char *const kKnownTrackedProps[] = {
+            "_FaceColor", "_OutlineColor", "_UnderlayColor", "_GlowColor", "_SpecColor",
+            "_FaceDilate", "_OutlineWidth", "_OutlineSoftness",
+            "_GlowOffset", "_GlowInner", "_GlowOuter", "_GlowPower",
+            "_UnderlayOffsetX", "_UnderlayOffsetY", "_UnderlayDilate", "_UnderlaySoftness",
+            "_DotTexels", "_DotCrisp", "_DotScale", "_DotPhase", "_Fade", "_Alpha"
+    };
+    static const char *const kProtectedAtlasProps[] = {
+            "_MainTex", "_MainTex_ST", "_MainTex_TexelSize",
+            "_TextureWidth", "_TextureHeight", "_GradientScale",
+            "_ScaleRatioA", "_ScaleRatioB", "_ScaleRatioC"
+    };
+    std::vector<std::pair<int32_t, std::string>> resolved_tracked;
+    std::vector<int32_t> resolved_protected;
+    for (const char *name : kKnownTrackedProps) {
+        int32_t id = 0;
+        if (resolve_shader_property_id(name, &id)) {
+            resolved_tracked.emplace_back(id, name);
+        }
+    }
+    for (const char *name : kProtectedAtlasProps) {
+        int32_t id = 0;
+        if (resolve_shader_property_id(name, &id)) {
+            resolved_protected.push_back(id);
+        }
+    }
+    pthread_mutex_lock(&g_special_material_lock);
+    if (!g_shader_prop_ids_initialized.load(std::memory_order_relaxed)) {
+        for (const auto &entry : resolved_tracked) {
+            g_shader_prop_id_names[entry.first] = entry.second;
+        }
+        for (int32_t id : resolved_protected) {
+            g_protected_atlas_prop_ids.insert(id);
+        }
+        g_shader_prop_ids_initialized.store(true, std::memory_order_release);
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+}
+
+bool is_protected_atlas_property(const std::string &prop) {
+    return prop == "_MainTex" || prop == "_MainTex_ST" ||
+           prop == "_MainTex_TexelSize" || prop == "_TextureWidth" ||
+           prop == "_TextureHeight" || prop == "_GradientScale" ||
+           prop == "_ScaleRatioA" || prop == "_ScaleRatioB" ||
+           prop == "_ScaleRatioC";
+}
+
+bool is_protected_atlas_property_id(int32_t prop_id) {
+    ensure_shader_property_ids_initialized();
+    pthread_mutex_lock(&g_special_material_lock);
+    const bool protected_id = g_protected_atlas_prop_ids.find(prop_id) !=
+            g_protected_atlas_prop_ids.end();
+    pthread_mutex_unlock(&g_special_material_lock);
+    return protected_id;
+}
+
+std::string lookup_shader_property_name(int32_t prop_id) {
+    ensure_shader_property_ids_initialized();
+    pthread_mutex_lock(&g_special_material_lock);
+    auto found = g_shader_prop_id_names.find(prop_id);
+    std::string name = found != g_shader_prop_id_names.end() ?
+            found->second : std::string();
+    pthread_mutex_unlock(&g_special_material_lock);
+    return name;
+}
+
+void register_battle_lyric_tmp(void *tmp) {
+    if (tmp == nullptr || !is_unity_object_alive(tmp)) return;
+    uintptr_t weak = create_weak_object_handle(tmp);
+    if (weak == 0) return;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto existing = g_battle_lyric_tmps.find(tmp);
+    if (existing != g_battle_lyric_tmps.end()) {
+        if (resolve_live_object(existing->second, tmp) == tmp) {
+            pthread_mutex_unlock(&g_special_material_lock);
+            release_object_handle(weak);
+            return;
+        }
+        release_object_handle(existing->second);
+        g_battle_lyric_tmps.erase(existing);
+    }
+    if (g_battle_lyric_tmps.size() >= 256) {
+        for (const auto &kv : g_battle_lyric_tmps) {
+            release_object_handle(kv.second);
+        }
+        g_battle_lyric_tmps.clear();
+    }
+    g_battle_lyric_tmps[tmp] = weak;
+    pthread_mutex_unlock(&g_special_material_lock);
+}
+
+bool is_battle_lyric_tmp(void *tmp) {
+    if (tmp == nullptr) return false;
+    uintptr_t weak = 0;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto found = g_battle_lyric_tmps.find(tmp);
+    if (found != g_battle_lyric_tmps.end()) {
+        weak = found->second;
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (weak == 0) return false;
+    if (resolve_live_object(weak, tmp) == tmp) {
+        return true;
+    }
+    pthread_mutex_lock(&g_special_material_lock);
+    auto erase_it = g_battle_lyric_tmps.find(tmp);
+    if (erase_it != g_battle_lyric_tmps.end() && erase_it->second == weak) {
+        release_object_handle(erase_it->second);
+        g_battle_lyric_tmps.erase(erase_it);
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    return false;
+}
+
+bool is_chinese_special_material(void *material) {
+    if (material == nullptr || !is_unity_object_alive(material)) return false;
+    pthread_mutex_lock(&g_special_material_lock);
+    const bool hit = g_chinese_special_materials.find(material) !=
+            g_chinese_special_materials.end();
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (hit) return true;
+
+    // 游戏 TextMeshProMaterialSetter.CloneFontMaterial 会基于我方 "[ZH]" 材质再
+    // 拷贝出后缀为 " (Instance)" 的可变动态材质；必须排除这些二次副本，避免将
+    // 游戏刚刚覆写成新配色的动态实例误当作我方静态克隆而忽略同步。
+    const std::string mat_name = read_unity_object_name(material);
+    static const char kZhSuffix[] = " [ZH]";
+    const size_t suffix_len = sizeof(kZhSuffix) - 1;
+    const bool ends_with_zh = mat_name.size() >= suffix_len &&
+            mat_name.compare(mat_name.size() - suffix_len, suffix_len, kZhSuffix) == 0;
+    if (ends_with_zh || mat_name.compare(0, 10, "ZH_Lyrics_") == 0) {
+        return true;
+    }
+    return false;
+}
+
+std::unordered_map<void *, uintptr_t> g_battle_effect_dialog_tmps;
+
+void register_battle_dialog_tmp(void *tmp) {
+    if (tmp == nullptr || !is_unity_object_alive(tmp)) return;
+    uintptr_t weak = create_weak_object_handle(tmp);
+    if (weak == 0) return;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto existing = g_battle_effect_dialog_tmps.find(tmp);
+    if (existing != g_battle_effect_dialog_tmps.end()) {
+        if (resolve_live_object(existing->second, tmp) == tmp) {
+            pthread_mutex_unlock(&g_special_material_lock);
+            release_object_handle(weak);
+            return;
+        }
+        release_object_handle(existing->second);
+        g_battle_effect_dialog_tmps.erase(existing);
+    }
+    if (g_battle_effect_dialog_tmps.size() >= 64) {
+        for (const auto &kv : g_battle_effect_dialog_tmps) {
+            release_object_handle(kv.second);
+        }
+        g_battle_effect_dialog_tmps.clear();
+    }
+    g_battle_effect_dialog_tmps[tmp] = weak;
+    pthread_mutex_unlock(&g_special_material_lock);
+}
+
+bool is_battle_dialog_tmp(void *tmp) {
+    if (tmp == nullptr) return false;
+    uintptr_t weak = 0;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto found = g_battle_effect_dialog_tmps.find(tmp);
+    if (found != g_battle_effect_dialog_tmps.end()) {
+        weak = found->second;
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (weak == 0) return false;
+    if (resolve_live_object(weak, tmp) == tmp) {
+        return true;
+    }
+    pthread_mutex_lock(&g_special_material_lock);
+    auto erase_it = g_battle_effect_dialog_tmps.find(tmp);
+    if (erase_it != g_battle_effect_dialog_tmps.end() && erase_it->second == weak) {
+        release_object_handle(erase_it->second);
+        g_battle_effect_dialog_tmps.erase(erase_it);
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    return false;
+}
+
+bool has_effective_glow_on_material(void *material) {
+    if (material == nullptr || !is_unity_object_alive(material)) return false;
+    bool glow_enabled = false;
+    if (!read_material_keyword_property(material, "GLOW_ON", &glow_enabled) ||
+        !glow_enabled) {
+        return false;
+    }
+    float glow_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (read_material_color_property(material, "_GlowColor", glow_color) &&
+        glow_color[3] <= 0.01f) {
+        return false;
+    }
+    return true;
+}
+
+bool is_special_effect_tmp_material(void *material) {
+    if (material == nullptr || !is_unity_object_alive(material)) return false;
+    void *shader = read_material_shader(material);
+    const std::string shader_name =
+            shader == nullptr ? std::string() : read_unity_object_name(shader);
+    if (shader_name.find("Distance Field Dot") != std::string::npos ||
+        read_material_has_property(material, "_DotTexels")) {
+        return true;
+    }
+    // 严格限定主对话使用的 TextMeshPro/Distance Field 着色器，避免误伤战斗面板的 Mobile 发光预设。
+    if (shader_name == "TextMeshPro/Distance Field" &&
+        has_effective_glow_on_material(material)) {
+        return true;
+    }
+    const std::string lower_name = ascii_lower_copy(read_unity_object_name(material));
+    if (lower_name.find("zh_lyrics_") != std::string::npos ||
+        lower_name.find("reddarkglow") != std::string::npos ||
+        lower_name.find("araya_cp9") != std::string::npos ||
+        lower_name.find("tmp_sdf_dot") != std::string::npos ||
+        lower_name.find("subtitledot") != std::string::npos ||
+        lower_name.find("lyrics") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+bool is_custom_colored_instance_material(void *material) {
+    if (material == nullptr || !is_unity_object_alive(material) ||
+        is_chinese_special_material(material)) {
+        return false;
+    }
+    const std::string mat_name = read_unity_object_name(material);
+    if (mat_name.find("(Instance)") == std::string::npos &&
+        mat_name.find("(Clone)") == std::string::npos) {
+        return false;
+    }
+    float face_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (!read_material_color_property(material, "_FaceColor", face_color)) {
+        return false;
+    }
+    if (face_color[3] <= 0.01f) return false;
+    const float max_rgb = std::max(
+            face_color[0], std::max(face_color[1], face_color[2]));
+    const float min_rgb = std::min(
+            face_color[0], std::min(face_color[1], face_color[2]));
+    const float chroma = max_rgb - min_rgb;
+    return max_rgb > 1.05f || chroma > 0.12f;
+}
+
+bool should_preserve_dynamic_dialog_material(
+        void *instance, void *material,
+        const TmpComponentState *state = nullptr) {
+    if (instance == nullptr || material == nullptr ||
+        !is_unity_object_alive(material) || is_battle_lyric_tmp(instance)) {
+        return false;
+    }
+    // 仅对经过 BattleEffectManager / TextMeshProMaterialSetter 登记过的动态对话框生效，绝不扩伤普通 UI。
+    if (!is_battle_dialog_tmp(instance)) return false;
+    const std::string component_name = read_unity_object_name(instance);
+    const std::string parent_name = read_unity_parent_name(instance);
+    const std::string winrate_text = state == nullptr ?
+            std::string() : state->battle_winrate_text;
+    if (is_battle_winrate_control(component_name, parent_name, winrate_text) ||
+        is_battle_skill_banner_control(component_name, parent_name) ||
+        is_mirror_dungeon_reward_control(component_name, parent_name) ||
+        is_top_battle_state_control(component_name, parent_name) ||
+        is_bottom_battle_status_control(component_name, parent_name)) {
+        return false;
+    }
+    return has_effective_glow_on_material(material) ||
+           is_custom_colored_instance_material(material);
+}
+
+bool is_instantiated_dot_presentation_material(void *material) {
+    if (material == nullptr || !is_unity_object_alive(material)) return false;
+    void *shader = read_material_shader(material);
+    const std::string shader_name =
+            shader == nullptr ? std::string() : read_unity_object_name(shader);
+    if (shader_name.find("Distance Field Dot") == std::string::npos &&
+        !read_material_has_property(material, "_DotTexels")) {
+        return false;
+    }
+    const std::string mat_name = read_unity_object_name(material);
+    return mat_name.find("(Clone)") != std::string::npos ||
+           mat_name.find("(Instance)") != std::string::npos;
+}
+
+void *resources_load_material(const std::string &path) {
+    if (path.empty() || g_resources_load_info == nullptr ||
+        g_material_type_object == nullptr || g_runtime_invoke == nullptr) {
+        return nullptr;
+    }
+    void *managed_path = new_managed_string(path);
+    if (managed_path == nullptr) return nullptr;
+    void *args[] = {managed_path, g_material_type_object};
+    void *exc = nullptr;
+    void *result = g_runtime_invoke(g_resources_load_info, nullptr, args, &exc);
+    if (exc != nullptr || result == nullptr || !is_unity_object_alive(result)) {
+        return nullptr;
+    }
+    return result;
+}
+
+void set_unity_object_name(void *obj, const std::string &name) {
+    if (obj == nullptr || name.empty() || g_object_set_name_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return;
+    }
+    void *managed = new_managed_string(name);
+    if (managed == nullptr) return;
+    void *args[] = {managed};
+    void *exc = nullptr;
+    g_runtime_invoke(g_object_set_name_info, obj, args, &exc);
+}
+
+void update_tmp_shader_ratios(void *material) {
+    if (material == nullptr || g_shader_utilities_update_ratios_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return;
+    }
+    InternalMaterialSyncGuard guard;
+    void *args[] = {material};
+    void *exc = nullptr;
+    void *target = method_is_static(g_shader_utilities_update_ratios_info) ?
+            nullptr : material;
+    g_runtime_invoke(g_shader_utilities_update_ratios_info, target, args, &exc);
+}
+
+void copy_special_material_visual_fields(void *target_mat, void *source_mat) {
+    if (target_mat == nullptr || source_mat == nullptr || target_mat == source_mat) {
+        return;
+    }
+    static const char *const kColorProps[] = {
+            "_FaceColor", "_OutlineColor", "_UnderlayColor", "_GlowColor", "_SpecColor"
+    };
+    static const char *const kFloatProps[] = {
+            "_FaceDilate", "_OutlineWidth", "_OutlineSoftness",
+            "_UnderlayOffsetX", "_UnderlayOffsetY", "_UnderlayDilate", "_UnderlaySoftness",
+            "_GlowOffset", "_GlowInner", "_GlowOuter", "_GlowPower"
+    };
+    InternalMaterialSyncGuard guard;
+    for (const char *prop : kColorProps) {
+        float color[4] = {};
+        if (read_material_color_property(source_mat, prop, color)) {
+            write_material_color_property(target_mat, prop, color);
+        }
+    }
+    for (const char *prop : kFloatProps) {
+        float value = 0.0f;
+        if (read_material_float_property(source_mat, prop, &value)) {
+            write_material_float_property(target_mat, prop, value);
+        }
+    }
+    bool keyword_on = false;
+    if (read_material_keyword_property(source_mat, "OUTLINE_ON", &keyword_on)) {
+        write_material_keyword_property(target_mat, "OUTLINE_ON", keyword_on);
+        write_material_keyword_property(target_mat, "OUTLINE_OFF", !keyword_on);
+    }
+    if (read_material_keyword_property(source_mat, "UNDERLAY_ON", &keyword_on)) {
+        write_material_keyword_property(target_mat, "UNDERLAY_ON", keyword_on);
+        write_material_keyword_property(target_mat, "UNDERLAY_OFF", !keyword_on);
+    }
+    if (read_material_keyword_property(source_mat, "GLOW_ON", &keyword_on)) {
+        write_material_keyword_property(target_mat, "GLOW_ON", keyword_on);
+    }
+}
+
+bool calibrate_chinese_material_atlas(
+        void *target_mat, void *source_mat, void *chinese_font,
+        bool scale_spread_params, void **out_atlas_tex = nullptr) {
+    if (target_mat == nullptr || chinese_font == nullptr ||
+        !is_unity_object_alive(target_mat) ||
+        !is_unity_object_alive(chinese_font)) {
+        return false;
+    }
+    void *cn_base_mat = invoke_object_getter(g_tmp_font_get_material_info, chinese_font);
+    if (cn_base_mat == nullptr || !is_unity_object_alive(cn_base_mat)) {
+        return false;
+    }
+    void *cn_atlas = read_material_texture_property(cn_base_mat, "_MainTex");
+    if (cn_atlas == nullptr || !is_unity_object_alive(cn_atlas)) {
+        return false;
+    }
+
+    float cn_w = 4096.0f, cn_h = 4096.0f, cn_gs = 10.0f;
+    read_material_float_property(cn_base_mat, "_TextureWidth", &cn_w);
+    read_material_float_property(cn_base_mat, "_TextureHeight", &cn_h);
+    read_material_float_property(cn_base_mat, "_GradientScale", &cn_gs);
+
+    float src_gs = cn_gs, src_ratio_a = 0.90f;
+    void *param_ref_mat = (source_mat != nullptr && is_unity_object_alive(source_mat)) ?
+            source_mat : target_mat;
+    const bool source_already_cn_atlas =
+            param_ref_mat != target_mat &&
+            read_material_texture_property(param_ref_mat, "_MainTex") == cn_atlas;
+    if (param_ref_mat != target_mat) {
+        // 先将源材质最新颜色、关键字与未缩放原始 SDF 参数覆写到克隆，再基于源参数做单次幂等缩放。
+        copy_special_material_visual_fields(target_mat, param_ref_mat);
+    }
+    read_material_float_property(param_ref_mat, "_GradientScale", &src_gs);
+    read_material_float_property(param_ref_mat, "_ScaleRatioA", &src_ratio_a);
+
+    float face_dilate = 0.0f, outline_width = 0.0f, outline_softness = 0.0f;
+    float underlay_x = 0.0f, underlay_y = 0.0f, underlay_dilate = 0.0f;
+    float glow_offset = 0.0f, glow_inner = 0.0f, glow_outer = 0.0f, glow_power = 0.0f;
+    const bool has_dilate = read_material_float_property(param_ref_mat, "_FaceDilate", &face_dilate);
+    const bool has_outline = read_material_float_property(param_ref_mat, "_OutlineWidth", &outline_width);
+    const bool has_softness = read_material_float_property(param_ref_mat, "_OutlineSoftness", &outline_softness);
+    const bool has_ux = read_material_float_property(param_ref_mat, "_UnderlayOffsetX", &underlay_x);
+    const bool has_uy = read_material_float_property(param_ref_mat, "_UnderlayOffsetY", &underlay_y);
+    const bool has_ud = read_material_float_property(param_ref_mat, "_UnderlayDilate", &underlay_dilate);
+    const bool has_glow_off = read_material_float_property(param_ref_mat, "_GlowOffset", &glow_offset);
+    const bool has_glow_in = read_material_float_property(param_ref_mat, "_GlowInner", &glow_inner);
+    const bool has_glow_out = read_material_float_property(param_ref_mat, "_GlowOuter", &glow_outer);
+    const bool has_glow_pow = read_material_float_property(param_ref_mat, "_GlowPower", &glow_power);
+    bool glow_enabled = false;
+    read_material_keyword_property(param_ref_mat, "GLOW_ON", &glow_enabled);
+
+    {
+        InternalMaterialSyncGuard guard;
+        write_material_texture_property(target_mat, "_MainTex", cn_atlas);
+        write_material_float_property(target_mat, "_TextureWidth", cn_w);
+        write_material_float_property(target_mat, "_TextureHeight", cn_h);
+        write_material_float_property(target_mat, "_GradientScale", cn_gs);
+    }
+    update_tmp_shader_ratios(target_mat);
+
+    if (scale_spread_params && !source_already_cn_atlas) {
+        float dst_ratio_a = 0.90f;
+        read_material_float_property(target_mat, "_ScaleRatioA", &dst_ratio_a);
+        float spread_ratio = 1.0f;
+        if (src_gs > 0.1f && src_ratio_a > 0.01f &&
+            cn_gs > 0.1f && dst_ratio_a > 0.01f) {
+            const float raw_ratio = (src_gs * src_ratio_a) / (cn_gs * dst_ratio_a);
+            spread_ratio = std::max(0.35f, std::min(1.0f, raw_ratio));
+        }
+        bool adjusted_shader_params = false;
+        if (std::fabs(spread_ratio - 1.0f) > 0.02f) {
+            InternalMaterialSyncGuard guard;
+            if (has_dilate) {
+                float new_dilate = face_dilate * spread_ratio;
+                // 汉字笔画密度远高于假名：正膨胀封顶避免堵死字腔，无描边辉光负缩细下限对齐原版字重占比。
+                if (glow_enabled) {
+                    if (new_dilate > 0.20f) new_dilate = 0.20f;
+                    if (outline_width <= 0.0001f && new_dilate < -0.05f) new_dilate = -0.05f;
+                }
+                write_material_float_property(target_mat, "_FaceDilate", new_dilate);
+                adjusted_shader_params = true;
+            }
+            if (has_outline && outline_width > 0.0001f) {
+                write_material_float_property(
+                        target_mat, "_OutlineWidth", outline_width * spread_ratio);
+                adjusted_shader_params = true;
+            }
+            if (has_softness && outline_softness > 0.0001f) {
+                // ChineseBold 仅 32px 采样却带 9px padding；原版大字号柔边参数直接沿用会让笔画明显发虚。
+                const float new_softness = std::min(outline_softness * spread_ratio * 0.22f, 0.035f);
+                write_material_float_property(target_mat, "_OutlineSoftness", new_softness);
+                adjusted_shader_params = true;
+            }
+            if (has_ux && std::fabs(underlay_x) > 0.0001f) {
+                write_material_float_property(
+                        target_mat, "_UnderlayOffsetX", underlay_x * spread_ratio);
+                adjusted_shader_params = true;
+            }
+            if (has_uy && std::fabs(underlay_y) > 0.0001f) {
+                write_material_float_property(
+                        target_mat, "_UnderlayOffsetY", underlay_y * spread_ratio);
+                adjusted_shader_params = true;
+            }
+            if (has_ud && std::fabs(underlay_dilate) > 0.0001f) {
+                write_material_float_property(
+                        target_mat, "_UnderlayDilate", underlay_dilate * spread_ratio);
+                adjusted_shader_params = true;
+            }
+        }
+        if (glow_enabled && (has_glow_out || has_glow_in || has_glow_pow)) {
+            // 收紧外发光半径并陡化衰减指数，避免 9/32 高 padding 占比导致汉字间光晕糊成一体。
+            const float glow_radius_scale = std::max(0.26f, std::min(0.40f, spread_ratio * 0.58f));
+            float new_glow_in = glow_inner;
+            {
+                InternalMaterialSyncGuard guard;
+                if (has_glow_off && std::fabs(glow_offset) > 0.0001f) {
+                    write_material_float_property(
+                            target_mat, "_GlowOffset", glow_offset * glow_radius_scale);
+                }
+                if (has_glow_in && glow_inner > 0.0001f) {
+                    new_glow_in = std::max(0.025f, std::min(glow_inner * glow_radius_scale, 0.14f));
+                    write_material_float_property(target_mat, "_GlowInner", new_glow_in);
+                }
+                if (has_glow_out && glow_outer > 0.0001f) {
+                    float new_glow_out = std::max(0.20f, std::min(glow_outer * glow_radius_scale, 0.34f));
+                    if (has_glow_in && new_glow_out < new_glow_in + 0.08f) {
+                        new_glow_out = std::min(0.38f, new_glow_in + 0.08f);
+                    }
+                    write_material_float_property(target_mat, "_GlowOuter", new_glow_out);
+                }
+                if (has_glow_pow && glow_power > 0.55f) {
+                    const float new_glow_pow = std::max(0.36f, std::min(0.42f, glow_power * 0.38f));
+                    write_material_float_property(target_mat, "_GlowPower", new_glow_pow);
+                }
+            }
+            adjusted_shader_params = true;
+        }
+        if (adjusted_shader_params) {
+            update_tmp_shader_ratios(target_mat);
+        }
+        if (glow_enabled) {
+            static std::atomic<uint64_t> glow_cal_logs{0};
+            const uint64_t n = glow_cal_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 12) {
+                float fd = 0.0f, soft = 0.0f, goff = 0.0f, gin = 0.0f, gout = 0.0f, gpow = 0.0f, rb = 0.0f;
+                read_material_float_property(target_mat, "_FaceDilate", &fd);
+                read_material_float_property(target_mat, "_OutlineSoftness", &soft);
+                read_material_float_property(target_mat, "_GlowOffset", &goff);
+                read_material_float_property(target_mat, "_GlowInner", &gin);
+                read_material_float_property(target_mat, "_GlowOuter", &gout);
+                read_material_float_property(target_mat, "_GlowPower", &gpow);
+                read_material_float_property(target_mat, "_ScaleRatioB", &rb);
+                LT_LOGI("Calibrated glow material n=%llu name=\"%s\" spread=%.3f fd=%.3f->%.3f soft=%.3f->%.3f glow=(%.3f,%.3f,%.3f,pow=%.3f)->(%.3f,%.3f,%.3f,pow=%.3f) ratioB=%.3f",
+                        static_cast<unsigned long long>(n),
+                        read_unity_object_name(target_mat).c_str(),
+                        spread_ratio, face_dilate, fd, outline_softness, soft,
+                        glow_offset, glow_inner, glow_outer, glow_power,
+                        goff, gin, gout, gpow, rb);
+            }
+        }
+    }
+    if (out_atlas_tex != nullptr) *out_atlas_tex = cn_atlas;
+    return true;
+}
+
+void *get_or_create_special_chinese_material(
+        void *source_material, void *chinese_font) {
+    if (source_material == nullptr || !is_unity_object_alive(source_material)) {
+        return nullptr;
+    }
+    if (chinese_font == nullptr) {
+        if (!ensure_tmp_font()) return nullptr;
+        chinese_font = g_tmp_font_asset;
+    }
+    if (chinese_font == nullptr || !is_unity_object_alive(chinese_font)) {
+        return nullptr;
+    }
+    void *cn_base_mat = invoke_object_getter(g_tmp_font_get_material_info, chinese_font);
+    void *current_atlas = cn_base_mat == nullptr ? nullptr :
+            read_material_texture_property(cn_base_mat, "_MainTex");
+
+    if (is_chinese_special_material(source_material)) {
+        if (current_atlas != nullptr &&
+            read_material_texture_property(source_material, "_MainTex") != current_atlas) {
+            calibrate_chinese_material_atlas(
+                    source_material, source_material, chinese_font, false);
+        }
+        return source_material;
+    }
+
+    if (is_instantiated_dot_presentation_material(source_material)) {
+        void *synced_atlas = nullptr;
+        calibrate_chinese_material_atlas(
+                source_material, source_material, chinese_font, true, &synced_atlas);
+        pthread_mutex_lock(&g_special_material_lock);
+        g_chinese_special_materials.insert(source_material);
+        pthread_mutex_unlock(&g_special_material_lock);
+        return source_material;
+    }
+
+    SpecialMaterialCloneEntry cached;
+    bool hit = false;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto it = g_special_material_clones.find(source_material);
+    if (it != g_special_material_clones.end()) {
+        cached = it->second;
+        hit = true;
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+
+    if (hit) {
+        void *live_source = resolve_live_object(cached.source_weak, cached.source);
+        void *live_clone = resolve_live_object(cached.clone_weak, cached.clone);
+        void *live_font = resolve_live_object(cached.font_weak, cached.font);
+        if (live_source == source_material && live_clone != nullptr &&
+            live_font == chinese_font) {
+            if (current_atlas != nullptr && cached.main_tex != current_atlas) {
+                InternalMaterialSyncGuard guard;
+                write_material_texture_property(live_clone, "_MainTex", current_atlas);
+                pthread_mutex_lock(&g_special_material_lock);
+                auto upd = g_special_material_clones.find(source_material);
+                if (upd != g_special_material_clones.end()) {
+                    upd->second.main_tex = current_atlas;
+                }
+                pthread_mutex_unlock(&g_special_material_lock);
+            }
+            return live_clone;
+        }
+    }
+
+    if (g_unity_object_instantiate_info == nullptr || g_runtime_invoke == nullptr) {
+        return nullptr;
+    }
+    ManagedObjectPin src_pin(source_material);
+    ManagedObjectPin font_pin(chinese_font);
+    if (!src_pin.alive() || !font_pin.alive()) return nullptr;
+
+    void *args[] = {source_material};
+    void *exc = nullptr;
+    void *clone = g_runtime_invoke(
+            g_unity_object_instantiate_info, nullptr, args, &exc);
+    if (exc != nullptr || clone == nullptr || !is_unity_object_alive(clone)) {
+        return nullptr;
+    }
+    ManagedObjectPin clone_guard(clone);
+    if (!clone_guard.alive()) return nullptr;
+
+    const std::string src_name = read_unity_object_name(source_material);
+    if (!src_name.empty()) {
+        set_unity_object_name(clone, src_name + " [ZH]");
+    }
+    void *synced_atlas = nullptr;
+    if (!calibrate_chinese_material_atlas(
+            clone, source_material, chinese_font, true, &synced_atlas)) {
+        return nullptr;
+    }
+
+    SpecialMaterialCloneEntry entry;
+    entry.source = source_material;
+    entry.source_weak = create_weak_object_handle(source_material);
+    entry.font = chinese_font;
+    entry.font_weak = create_weak_object_handle(chinese_font);
+    entry.clone = clone;
+    entry.clone_weak = create_weak_object_handle(clone);
+    entry.clone_pin = g_gchandle_new != nullptr ? g_gchandle_new(clone, false) : 0;
+    entry.main_tex = synced_atlas;
+
+    pthread_mutex_lock(&g_special_material_lock);
+    auto old = g_special_material_clones.find(source_material);
+    if (old != g_special_material_clones.end()) {
+        release_object_handle(old->second.source_weak);
+        release_object_handle(old->second.font_weak);
+        release_object_handle(old->second.clone_weak);
+        release_object_handle(old->second.clone_pin);
+    }
+    if (g_special_material_clones.size() >= 512) {
+        for (const auto &kv : g_special_material_clones) {
+            release_object_handle(kv.second.source_weak);
+            release_object_handle(kv.second.font_weak);
+            release_object_handle(kv.second.clone_weak);
+            release_object_handle(kv.second.clone_pin);
+        }
+        g_special_material_clones.clear();
+    }
+    g_special_material_clones[source_material] = entry;
+    g_chinese_special_materials.insert(clone);
+    pthread_mutex_unlock(&g_special_material_lock);
+
+    LT_LOGI("Created special Chinese material clone=%p source=%p(\"%s\") font=%p",
+            clone, source_material, src_name.c_str(), chinese_font);
+    return clone;
+}
+
+bool sync_special_chinese_material_from_source(
+        void *source_material, void *chinese_font) {
+    if (source_material == nullptr || !is_unity_object_alive(source_material)) {
+        return false;
+    }
+    SpecialMaterialCloneEntry cached;
+    bool hit = false;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto it = g_special_material_clones.find(source_material);
+    if (it != g_special_material_clones.end()) {
+        cached = it->second;
+        hit = true;
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (!hit) return false;
+
+    void *live_source = resolve_live_object(cached.source_weak, cached.source);
+    void *live_clone = resolve_live_object(cached.clone_weak, cached.clone);
+    void *live_font = resolve_live_object(cached.font_weak, cached.font);
+    if (live_source != source_material || live_clone == nullptr) {
+        return false;
+    }
+    void *target_font = (chinese_font != nullptr && is_unity_object_alive(chinese_font)) ?
+            chinese_font : live_font;
+    if (target_font == nullptr || !is_unity_object_alive(target_font)) {
+        if (!ensure_tmp_font()) return false;
+        target_font = g_tmp_font_asset;
+    }
+    if (target_font == nullptr || !is_unity_object_alive(target_font)) {
+        return false;
+    }
+    void *synced_atlas = nullptr;
+    if (!calibrate_chinese_material_atlas(
+            live_clone, source_material, target_font, true, &synced_atlas)) {
+        return false;
+    }
+    uintptr_t updated_font_weak = target_font != live_font ?
+            create_weak_object_handle(target_font) : 0;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto upd = g_special_material_clones.find(source_material);
+    if (upd != g_special_material_clones.end() && upd->second.clone == live_clone) {
+        upd->second.main_tex = synced_atlas;
+        if (target_font != live_font) {
+            release_object_handle(upd->second.font_weak);
+            upd->second.font = target_font;
+            upd->second.font_weak = updated_font_weak;
+            updated_font_weak = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (updated_font_weak != 0) release_object_handle(updated_font_weak);
+    return true;
+}
+
+std::vector<std::string> build_tmp_font_resource_prefixes() {
+    std::vector<std::string> prefixes;
+    if (g_tmp_get_default_font_asset_path_info != nullptr &&
+        g_runtime_invoke != nullptr) {
+        void *exc = nullptr;
+        void *path_obj = g_runtime_invoke(
+                g_tmp_get_default_font_asset_path_info, nullptr, nullptr, &exc);
+        if (exc == nullptr && path_obj != nullptr) {
+            std::string base = read_managed_string_value(path_obj);
+            if (!base.empty()) {
+                if (base.back() != '/') base.push_back('/');
+                prefixes.push_back(base);
+            }
+        }
+    }
+    auto add_unique = [&](const char *p) {
+        for (const std::string &existing : prefixes) {
+            if (existing == p) return;
+        }
+        prefixes.emplace_back(p);
+    };
+    add_unique("Font/");
+    add_unique("Fonts & Materials/");
+    add_unique("");
+    return prefixes;
+}
+
+void *find_lyrics_base_fallback_material(void *chinese_font) {
+    if (chinese_font == nullptr) return nullptr;
+    void *cached = nullptr;
+    uintptr_t cached_weak = 0;
+    pthread_mutex_lock(&g_special_material_lock);
+    cached = g_lyrics_base_fallback_clone;
+    cached_weak = g_lyrics_base_fallback_weak;
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (cached != nullptr && resolve_live_object(cached_weak, cached) == cached) {
+        return get_or_create_special_chinese_material(cached, chinese_font);
+    }
+
+    static const char *const kLyricsBasePaths[] = {
+            "JP/title)corporate logo(bold)/Corporate-Logo-Bold-ver2 SDF Lyrics",
+            "KR/p)SCDream(light)/SCDream5 Lyrics",
+            "EN/title)mikodacs/Mikodacs SDF Lyrics"
+    };
+    const std::vector<std::string> prefixes = build_tmp_font_resource_prefixes();
+    void *loaded = nullptr;
+    for (const char *rel : kLyricsBasePaths) {
+        for (const std::string &pref : prefixes) {
+            loaded = resources_load_material(pref + rel);
+            if (loaded != nullptr) break;
+        }
+        if (loaded != nullptr) break;
+    }
+    if (loaded == nullptr) return nullptr;
+    void *clone = get_or_create_special_chinese_material(loaded, chinese_font);
+    if (clone != nullptr) {
+        pthread_mutex_lock(&g_special_material_lock);
+        release_object_handle(g_lyrics_base_fallback_weak);
+        release_object_handle(g_lyrics_base_fallback_pin);
+        g_lyrics_base_fallback_clone = clone;
+        g_lyrics_base_fallback_weak = create_weak_object_handle(clone);
+        g_lyrics_base_fallback_pin = g_gchandle_new != nullptr ?
+                g_gchandle_new(clone, false) : 0;
+        pthread_mutex_unlock(&g_special_material_lock);
+    }
+    return clone;
+}
+
+bool compute_tmp_string_hashes(const char *name, std::vector<int32_t> *out_hashes) {
+    if (name == nullptr || out_hashes == nullptr || g_runtime_invoke == nullptr ||
+        g_object_unbox == nullptr) {
+        return false;
+    }
+    void *managed_name = new_managed_string(name);
+    if (managed_name == nullptr) return false;
+
+    const void *hash_fns[] = {
+            g_tmp_get_simple_hash_code_info,
+            g_tmp_get_hash_case_insensitive_info,
+            g_tmp_get_simple_hash_lower_info,
+    };
+    out_hashes->clear();
+    for (const void *fn : hash_fns) {
+        if (fn == nullptr) continue;
+        void *args[] = {managed_name};
+        void *exc = nullptr;
+        void *boxed = g_runtime_invoke(fn, nullptr, args, &exc);
+        void *unboxed = (exc == nullptr && boxed != nullptr) ?
+                g_object_unbox(boxed) : nullptr;
+        if (unboxed == nullptr) continue;
+        int32_t h = 0;
+        memcpy(&h, unboxed, sizeof(h));
+        if (std::find(out_hashes->begin(), out_hashes->end(), h) ==
+            out_hashes->end()) {
+            out_hashes->push_back(h);
+        }
+    }
+    return !out_hashes->empty();
+}
+
+int32_t register_material_in_ref_manager(
+        void *ref_mgr, const char *name, void *material) {
+    if (ref_mgr == nullptr || name == nullptr || material == nullptr ||
+        g_material_ref_mgr_add_font_mat_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return 0;
+    }
+    std::vector<int32_t> hashes;
+    if (!compute_tmp_string_hashes(name, &hashes)) return 0;
+
+    static const char *const kLookupFields[] = {"m_FontMaterialReferenceLookup"};
+    void *lookup_dict = read_named_object_field(ref_mgr, kLookupFields, 1);
+    const void *dict_set_item = nullptr;
+    if (lookup_dict != nullptr && g_object_get_class != nullptr &&
+        g_class_get_method != nullptr) {
+        dict_set_item = g_class_get_method(
+                g_object_get_class(lookup_dict), "set_Item", 2);
+    }
+
+    int32_t written = 0;
+    void *add_target = method_is_static(g_material_ref_mgr_add_font_mat_info) ?
+            nullptr : ref_mgr;
+    for (int32_t hash_code : hashes) {
+        bool ok = false;
+        if (lookup_dict != nullptr && dict_set_item != nullptr) {
+            void *set_args[] = {&hash_code, material};
+            void *set_exc = nullptr;
+            g_runtime_invoke(dict_set_item, lookup_dict, set_args, &set_exc);
+            if (set_exc == nullptr) ok = true;
+        }
+        if (add_target != nullptr ||
+            method_is_static(g_material_ref_mgr_add_font_mat_info)) {
+            void *add_args[] = {&hash_code, material};
+            void *add_exc = nullptr;
+            g_runtime_invoke(
+                    g_material_ref_mgr_add_font_mat_info, add_target,
+                    add_args, &add_exc);
+            if (add_exc == nullptr) ok = true;
+        }
+        if (ok) ++written;
+    }
+    return written;
+}
+
+bool ensure_lyrics_style_presets_registered() {
+    if (!ensure_tmp_font() || g_tmp_font_asset == nullptr ||
+        g_material_ref_mgr_get_instance_info == nullptr ||
+        g_material_ref_mgr_add_font_mat_info == nullptr ||
+        g_tmp_get_simple_hash_code_info == nullptr ||
+        g_unity_object_instantiate_info == nullptr ||
+        g_runtime_invoke == nullptr) {
+        return false;
+    }
+    void *exc_mgr = nullptr;
+    void *ref_mgr = g_runtime_invoke(
+            g_material_ref_mgr_get_instance_info, nullptr, nullptr, &exc_mgr);
+    if (exc_mgr != nullptr || ref_mgr == nullptr) return false;
+
+    bool all_ready = false;
+    pthread_mutex_lock(&g_special_material_lock);
+    if (g_last_mat_ref_manager == ref_mgr &&
+        (g_last_mat_ref_manager_weak == 0 ||
+         resolve_live_object(g_last_mat_ref_manager_weak, ref_mgr) == ref_mgr)) {
+        all_ready = true;
+        for (size_t i = 0; i < 4; ++i) {
+            if (g_lyric_preset_clones[i].clone == nullptr ||
+                resolve_live_object(
+                        g_lyric_preset_clones[i].clone_weak,
+                        g_lyric_preset_clones[i].clone) != g_lyric_preset_clones[i].clone) {
+                all_ready = false;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (all_ready) return true;
+
+    const std::vector<std::string> prefixes = build_tmp_font_resource_prefixes();
+    int32_t ready_clones = 0;
+    int32_t entries_written = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        const LyricPresetSpec &spec = kLyricStylePresetSpecs[i];
+        void *live_clone = nullptr;
+        pthread_mutex_lock(&g_special_material_lock);
+        if (g_lyric_preset_clones[i].clone != nullptr) {
+            live_clone = resolve_live_object(
+                    g_lyric_preset_clones[i].clone_weak,
+                    g_lyric_preset_clones[i].clone);
+        }
+        pthread_mutex_unlock(&g_special_material_lock);
+
+        if (live_clone != nullptr) {
+            calibrate_chinese_material_atlas(
+                    live_clone, live_clone, g_tmp_font_asset, false);
+        } else {
+            void *src_mat = nullptr;
+            for (const char *rel : spec.paths) {
+                for (const std::string &pref : prefixes) {
+                    src_mat = resources_load_material(pref + rel);
+                    if (src_mat != nullptr) break;
+                }
+                if (src_mat != nullptr) break;
+            }
+            if (src_mat == nullptr) {
+                LT_LOGW("Lyrics preset source not found key=%s", spec.zh_name);
+                continue;
+            }
+            ManagedObjectPin src_pin(src_mat);
+            void *args[] = {src_mat};
+            void *exc = nullptr;
+            live_clone = g_runtime_invoke(
+                    g_unity_object_instantiate_info, nullptr, args, &exc);
+            if (exc != nullptr || live_clone == nullptr ||
+                !is_unity_object_alive(live_clone)) {
+                continue;
+            }
+            ManagedObjectPin clone_pin(live_clone);
+            set_unity_object_name(live_clone, spec.zh_name);
+            if (!calibrate_chinese_material_atlas(
+                    live_clone, src_mat, g_tmp_font_asset, true)) {
+                continue;
+            }
+            uintptr_t weak = create_weak_object_handle(live_clone);
+            uintptr_t pin = g_gchandle_new != nullptr ?
+                    g_gchandle_new(live_clone, false) : 0;
+            pthread_mutex_lock(&g_special_material_lock);
+            release_object_handle(g_lyric_preset_clones[i].clone_weak);
+            release_object_handle(g_lyric_preset_clones[i].clone_pin);
+            g_lyric_preset_clones[i].clone = live_clone;
+            g_lyric_preset_clones[i].clone_weak = weak;
+            g_lyric_preset_clones[i].clone_pin = pin;
+            g_chinese_special_materials.insert(live_clone);
+            pthread_mutex_unlock(&g_special_material_lock);
+        }
+
+        ++ready_clones;
+        entries_written += register_material_in_ref_manager(
+                ref_mgr, spec.zh_name, live_clone);
+        for (const char *official_path : spec.paths) {
+            entries_written += register_material_in_ref_manager(
+                    ref_mgr, official_path, live_clone);
+        }
+    }
+
+    pthread_mutex_lock(&g_special_material_lock);
+    if (g_last_mat_ref_manager != ref_mgr) {
+        release_object_handle(g_last_mat_ref_manager_weak);
+        g_last_mat_ref_manager = ref_mgr;
+        g_last_mat_ref_manager_weak = create_weak_object_handle(ref_mgr);
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    LT_LOGI("Registered official+ZH lyric presets clones=%d/4 refMgr=%p entries=%d",
+            ready_clones, ref_mgr, entries_written);
+    return ready_clones > 0;
+}
+
+std::string strip_tmp_tags_for_glyph_preload(const std::string &text) {
+    std::string plain;
+    plain.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t lt = text.find('<', i);
+        if (lt == std::string::npos) {
+            plain.append(text, i, std::string::npos);
+            break;
+        }
+        plain.append(text, i, lt - i);
+        size_t gt = text.find('>', lt + 1);
+        if (gt == std::string::npos) {
+            plain.append(text, lt, std::string::npos);
+            break;
+        }
+        i = gt + 1;
+    }
+    return plain;
+}
+
+bool contains_non_ascii_utf8(const std::string &text) {
+    for (unsigned char ch : text) {
+        if ((ch & 0x80) != 0) return true;
+    }
+    return false;
+}
+
+std::unordered_set<char16_t> g_preloaded_lyric_codepoints;
+void *g_preloaded_lyric_font = nullptr;
+
+void preload_lyric_cjk_glyphs_cached(void *font, const std::string &plain_text) {
+    if (font == nullptr || plain_text.empty()) return;
+    std::u16string utf16;
+    if (!utf8_to_utf16(plain_text, &utf16)) return;
+    bool need_preload = false;
+    std::vector<char16_t> missing_chars;
+    pthread_mutex_lock(&g_special_material_lock);
+    if (g_preloaded_lyric_font != font) {
+        g_preloaded_lyric_codepoints.clear();
+        g_preloaded_lyric_font = font;
+    }
+    for (char16_t c : utf16) {
+        if ((c & 0xff80) == 0) continue;
+        if (g_preloaded_lyric_codepoints.find(c) == g_preloaded_lyric_codepoints.end()) {
+            need_preload = true;
+            missing_chars.push_back(c);
+        }
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (!need_preload) return;
+    preload_cjk_glyphs(font, plain_text);
+    pthread_mutex_lock(&g_special_material_lock);
+    if (g_preloaded_lyric_font == font) {
+        if (g_preloaded_lyric_codepoints.size() >= 8192) {
+            g_preloaded_lyric_codepoints.clear();
+        }
+        for (char16_t c : missing_chars) {
+            g_preloaded_lyric_codepoints.insert(c);
+        }
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+}
+
+void *find_special_clone_for_source(void *source_material) {
+    if (source_material == nullptr) return nullptr;
+    SpecialMaterialCloneEntry entry;
+    bool found = false;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto it = g_special_material_clones.find(source_material);
+    if (it != g_special_material_clones.end()) {
+        entry = it->second;
+        found = true;
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    if (!found) return nullptr;
+    void *live_clone = resolve_live_object(entry.clone_weak, entry.clone);
+    if (live_clone != nullptr) return live_clone;
+    pthread_mutex_lock(&g_special_material_lock);
+    auto erase_it = g_special_material_clones.find(source_material);
+    if (erase_it != g_special_material_clones.end() &&
+        erase_it->second.clone == entry.clone) {
+        release_object_handle(erase_it->second.source_weak);
+        release_object_handle(erase_it->second.font_weak);
+        release_object_handle(erase_it->second.clone_weak);
+        release_object_handle(erase_it->second.clone_pin);
+        g_special_material_clones.erase(erase_it);
+    }
+    pthread_mutex_unlock(&g_special_material_lock);
+    return nullptr;
+}
+
+std::string strip_outer_style_tag(
+        const std::string &text, std::string *out_open_tag,
+        std::string *out_close_tag) {
+    if (text.empty()) return text;
+    std::string trimmed = text;
+    std::string open_tag;
+    std::string close_tag;
+    if (trimmed.front() == '<') {
+        size_t gt = trimmed.find('>');
+        if (gt != std::string::npos) {
+            std::string inner_l = ascii_lower_copy(trimmed.substr(1, gt - 1));
+            if (inner_l.compare(0, 6, "style=") == 0) {
+                open_tag = trimmed.substr(0, gt + 1);
+                trimmed.erase(0, gt + 1);
+            }
+        }
+    }
+    if (!open_tag.empty()) {
+        const std::string lower_tail = ascii_lower_copy(trimmed);
+        if (lower_tail.size() >= 8 &&
+            lower_tail.compare(lower_tail.size() - 8, 8, "</style>") == 0) {
+            close_tag = trimmed.substr(trimmed.size() - 8);
+            trimmed.resize(trimmed.size() - 8);
+        } else if (lower_tail.size() >= 7 &&
+                   lower_tail.compare(lower_tail.size() - 7, 7, "</font>") == 0) {
+            close_tag = trimmed.substr(trimmed.size() - 7);
+            trimmed.resize(trimmed.size() - 7);
+        }
+    }
+    if (out_open_tag != nullptr) *out_open_tag = open_tag;
+    if (out_close_tag != nullptr) *out_close_tag = close_tag;
+    return trimmed;
+}
+
+void *translate_lyrics_managed_string(void *managed_text) {
+    if (managed_text == nullptr || g_string_length == nullptr ||
+        g_string_chars == nullptr || g_string_new_utf16 == nullptr) {
+        return managed_text;
+    }
+    const std::string orig_utf8 = read_managed_string_value(managed_text);
+    if (orig_utf8.empty()) return managed_text;
+
+    if (is_translated_managed_string(managed_text) &&
+        contains_non_ascii_utf8(orig_utf8) &&
+        !contains_japanese_kana(orig_utf8)) {
+        ensure_lyrics_style_presets_registered();
+        return managed_text;
+    }
+
+    void *translated_obj = translate_managed_string(managed_text);
+    std::string utf8_result = read_managed_string_value(translated_obj);
+
+    if (translated_obj == managed_text &&
+        !is_translated_managed_string(managed_text)) {
+        // Fallback 1: vocal=1 9xx duplicate line missing <style> prefix in pack
+        std::string open_tag, close_tag;
+        const std::string body = strip_outer_style_tag(
+                orig_utf8, &open_tag, &close_tag);
+        if (open_tag.empty()) {
+            static const char *const kStylePrefixes[] = {
+                    "<style=\"djp_CP6_2\">",
+                    "<style=\"djp_CP6_1\">",
+                    "<style=\"djp\">",
+                    "<style=\"DJP_CP9_1\">"
+            };
+            for (const char *pref : kStylePrefixes) {
+                for (int mode = 0; mode < 2; ++mode) {
+                    const std::string candidate = mode == 0 ?
+                            (std::string(pref) + orig_utf8) :
+                            (std::string(pref) + orig_utf8 + "</style>");
+                    const std::string *matched_tr = nullptr;
+                    auto h1 = g_index.find(candidate);
+                    if (h1 != g_index.end()) {
+                        matched_tr = &h1->second;
+                    } else {
+                        auto h2 = g_fallback_index.find(candidate);
+                        if (h2 != g_fallback_index.end()) {
+                            matched_tr = &h2->second;
+                        }
+                    }
+                    if (matched_tr != nullptr) {
+                        std::string stripped = strip_outer_style_tag(
+                                *matched_tr, nullptr, nullptr);
+                        if (!stripped.empty()) {
+                            utf8_result = stripped;
+                            break;
+                        }
+                    }
+                }
+                if (utf8_result != orig_utf8) break;
+            }
+        } else if (!body.empty() && body != orig_utf8) {
+            // Fallback 2: source wrapped in <style=...>, try translating inner body
+            void *body_managed = new_managed_string(body);
+            if (body_managed != nullptr) {
+                void *body_tr = translate_managed_string(body_managed);
+                if (body_tr != body_managed) {
+                    utf8_result = open_tag + read_managed_string_value(body_tr) +
+                            close_tag;
+                }
+            }
+        }
+    }
+
+    if (utf8_result.find("<style") != std::string::npos ||
+        utf8_result.find("<STYLE") != std::string::npos) {
+        ensure_lyrics_style_presets_registered();
+    }
+
+    if (utf8_result == orig_utf8 && translated_obj != managed_text) {
+        return translated_obj;
+    }
+    if (utf8_result == orig_utf8) {
+        return managed_text;
+    }
+
+    void *final_obj = new_managed_string(utf8_result);
+    if (final_obj == nullptr) return translated_obj;
+    remember_translation_owned_string(final_obj);
+    if (contains_non_ascii_utf8(utf8_result)) {
+        pthread_mutex_lock(&g_font_state_lock);
+        g_translated_managed_texts.insert(utf8_result);
+        pthread_mutex_unlock(&g_font_state_lock);
+    }
+    return final_obj;
 }
 
 void clear_tmp_font_fallback_table(void *asset) {
@@ -4550,11 +6611,93 @@ void apply_chinese_font_materials() {
     apply_chinese_font_materials_for(g_tmp_regular_font_asset);
 }
 
+void sync_material_owners_after_mutation(
+        void *material, bool full_resync_existing_clone);
+
+bool revalidate_tmp_special_effect_state(
+        void *instance, TmpComponentState *state) {
+    if (instance == nullptr || state == nullptr || !state->preserve_special_effect) {
+        return false;
+    }
+    if (is_battle_lyric_tmp(instance)) return true;
+    void *live_source_mat = resolve_live_object(
+            state->source_material_weak_handle, state->source_material);
+    if (live_source_mat == nullptr) {
+        live_source_mat = resolve_live_object(
+                state->shared_material_weak_handle, state->shared_material);
+    }
+    if (live_source_mat == nullptr || !is_unity_object_alive(live_source_mat) ||
+        is_chinese_special_material(live_source_mat)) {
+        return true;
+    }
+    if (is_special_effect_tmp_material(live_source_mat) ||
+        should_preserve_dynamic_dialog_material(instance, live_source_mat, state)) {
+        return true;
+    }
+    sync_special_chinese_material_from_source(live_source_mat, nullptr);
+    pthread_mutex_lock(&g_font_state_lock);
+    auto saved = g_original_tmp_states.find(instance);
+    if (saved != g_original_tmp_states.end()) {
+        saved->second.preserve_special_effect = false;
+    }
+    pthread_mutex_unlock(&g_font_state_lock);
+    state->preserve_special_effect = false;
+    LT_LOGI("Cleared stale TMP special/custom-color state instance=%p name=%s source=%p(\"%s\")",
+            instance, read_unity_object_name(instance).c_str(),
+            live_source_mat, read_unity_object_name(live_source_mat).c_str());
+    return false;
+}
+
+std::vector<void *> collect_source_material_owners(void *material) {
+    std::vector<void *> result;
+    if (material == nullptr) return result;
+    std::vector<uintptr_t> owners;
+    pthread_mutex_lock(&g_font_state_lock);
+    auto registered = g_source_material_owners.find(material);
+    if (registered != g_source_material_owners.end()) {
+        owners = registered->second;
+    }
+    pthread_mutex_unlock(&g_font_state_lock);
+    if (g_gchandle_get_target == nullptr) return result;
+    for (uintptr_t handle : owners) {
+        void *instance = g_gchandle_get_target(handle);
+        if (instance == nullptr || !is_unity_object_alive(instance)) continue;
+        if (std::find(result.begin(), result.end(), instance) == result.end()) {
+            result.push_back(instance);
+        }
+    }
+    return result;
+}
+
 void sync_translated_tmp_materials(void *instance, bool force = false) {
     (void)force;
+    if (instance == nullptr) return;
+    if (is_battle_lyric_tmp(instance)) {
+        ensure_translated_tmp_material(instance);
+        return;
+    }
     TmpComponentState state;
-    if (instance == nullptr || !find_tmp_component_state(instance, &state)) return;
+    if (!find_tmp_component_state(instance, &state)) return;
+    if (revalidate_tmp_special_effect_state(instance, &state)) {
+        ensure_translated_tmp_material(instance);
+        return;
+    }
     refresh_tmp_source_material_style(instance, &state);
+    void *live_source_mat = resolve_live_object(
+            state.source_material_weak_handle, state.source_material);
+    if (live_source_mat != nullptr &&
+        (is_special_effect_tmp_material(live_source_mat) ||
+         should_preserve_dynamic_dialog_material(
+                 instance, live_source_mat, &state))) {
+        pthread_mutex_lock(&g_font_state_lock);
+        auto saved = g_original_tmp_states.find(instance);
+        if (saved != g_original_tmp_states.end()) {
+            saved->second.preserve_special_effect = true;
+        }
+        pthread_mutex_unlock(&g_font_state_lock);
+        ensure_translated_tmp_material(instance);
+        return;
+    }
     const std::string component_name = read_unity_object_name(instance);
     const std::string parent_name = read_unity_parent_name(instance);
     const bool top_status =
@@ -4618,44 +6761,38 @@ void sync_translated_tmp_materials(void *instance, bool force = false) {
     }
 }
 
-void mirror_source_material_color(
+bool mirror_source_material_color(
         void *material, const std::string &property, const RuntimeColor &color) {
     if (material == nullptr ||
         (property != "_FaceColor" && property != "_OutlineColor" &&
-         property != "_UnderlayColor")) {
-        return;
+         property != "_UnderlayColor" && property != "_GlowColor")) {
+        return false;
     }
-    std::vector<uintptr_t> owners;
-    pthread_mutex_lock(&g_font_state_lock);
-    auto registered = g_source_material_owners.find(material);
-    if (registered != g_source_material_owners.end()) {
-        owners = registered->second;
-    }
-    pthread_mutex_unlock(&g_font_state_lock);
-    std::vector<void *> translated_instances;
-    for (uintptr_t handle : owners) {
-        void *instance = g_gchandle_get_target == nullptr ?
-                nullptr : g_gchandle_get_target(handle);
-        if (instance == nullptr) continue;
+    const std::vector<void *> owners = collect_source_material_owners(material);
+    if (owners.empty()) return false;
+    size_t winrate_count = 0;
+    for (void *instance : owners) {
         bool updated = false;
         pthread_mutex_lock(&g_font_state_lock);
         auto saved = g_original_tmp_states.find(instance);
         if (saved != g_original_tmp_states.end()) {
-            float *target = property == "_FaceColor" ?
-                    saved->second.source_material_style.face_color :
-                    (property == "_OutlineColor" ?
-                            saved->second.source_material_style.outline_color :
-                            saved->second.source_material_style.underlay_color);
-            target[0] = color.r;
-            target[1] = color.g;
-            target[2] = color.b;
-            target[3] = color.a;
-            if (property == "_FaceColor") {
-                saved->second.source_material_style.has_face_color = true;
-            } else if (property == "_OutlineColor") {
-                saved->second.source_material_style.has_outline_color = true;
-            } else {
-                saved->second.source_material_style.has_underlay_color = true;
+            if (property != "_GlowColor") {
+                float *target = property == "_FaceColor" ?
+                        saved->second.source_material_style.face_color :
+                        (property == "_OutlineColor" ?
+                                saved->second.source_material_style.outline_color :
+                                saved->second.source_material_style.underlay_color);
+                target[0] = color.r;
+                target[1] = color.g;
+                target[2] = color.b;
+                target[3] = color.a;
+                if (property == "_FaceColor") {
+                    saved->second.source_material_style.has_face_color = true;
+                } else if (property == "_OutlineColor") {
+                    saved->second.source_material_style.has_outline_color = true;
+                } else {
+                    saved->second.source_material_style.has_underlay_color = true;
+                }
             }
             updated = true;
         }
@@ -4664,27 +6801,25 @@ void mirror_source_material_color(
             const std::string component_name = read_unity_object_name(instance);
             const std::string parent_name = read_unity_parent_name(instance);
             if (is_battle_winrate_control(component_name, parent_name)) {
-                translated_instances.push_back(instance);
+                ++winrate_count;
             }
         }
     }
-    for (void *instance : translated_instances) {
-        sync_translated_tmp_materials(instance, true);
-    }
-    if (!translated_instances.empty()) {
+    sync_material_owners_after_mutation(material, false);
+    if (winrate_count > 0) {
         uint64_t mutations = g_battle_status_material_set_diagnostics.fetch_add(
                 1, std::memory_order_relaxed) + 1;
         if (mutations <= 240) {
             LT_LOGI("Battle status material color mutation material=%s property=%s"
                     " color=(%.3f,%.3f,%.3f,%.3f) owners=%zu",
                     read_unity_object_name(material).c_str(), property.c_str(),
-                    color.r, color.g, color.b, color.a,
-                    translated_instances.size());
+                    color.r, color.g, color.b, color.a, winrate_count);
         }
     }
+    return true;
 }
 
-void mirror_source_material_float(
+bool mirror_source_material_float(
         void *material, const std::string &property, float value) {
     if (material == nullptr ||
         (property != "_FaceDilate" && property != "_OutlineWidth" &&
@@ -4693,21 +6828,15 @@ void mirror_source_material_float(
          property != "_UnderlaySoftness" && property != "_GradientScale" &&
          property != "_ScaleRatioA" && property != "_ScaleRatioB" &&
          property != "_ScaleRatioC" && property != "_TextureWidth" &&
-         property != "_TextureHeight")) {
-        return;
+         property != "_TextureHeight" && property != "_GlowOffset" &&
+         property != "_GlowInner" && property != "_GlowOuter" &&
+         property != "_GlowPower")) {
+        return false;
     }
-    std::vector<uintptr_t> owners;
-    pthread_mutex_lock(&g_font_state_lock);
-    auto registered = g_source_material_owners.find(material);
-    if (registered != g_source_material_owners.end()) {
-        owners = registered->second;
-    }
-    pthread_mutex_unlock(&g_font_state_lock);
-    std::vector<void *> translated_instances;
-    for (uintptr_t handle : owners) {
-        void *instance = g_gchandle_get_target == nullptr ?
-                nullptr : g_gchandle_get_target(handle);
-        if (instance == nullptr) continue;
+    const std::vector<void *> owners = collect_source_material_owners(material);
+    if (owners.empty()) return false;
+    size_t winrate_count = 0;
+    for (void *instance : owners) {
         bool updated = false;
         pthread_mutex_lock(&g_font_state_lock);
         auto saved = g_original_tmp_states.find(instance);
@@ -4760,23 +6889,28 @@ void mirror_source_material_float(
             const std::string component_name = read_unity_object_name(instance);
             const std::string parent_name = read_unity_parent_name(instance);
             if (is_battle_winrate_control(component_name, parent_name)) {
-                translated_instances.push_back(instance);
+                ++winrate_count;
             }
         }
     }
-    for (void *instance : translated_instances) {
-        sync_translated_tmp_materials(instance, true);
-    }
-    if (!translated_instances.empty()) {
+    sync_material_owners_after_mutation(material, false);
+    if (winrate_count > 0) {
         uint64_t mutations = g_battle_status_material_set_diagnostics.fetch_add(
                 1, std::memory_order_relaxed) + 1;
         if (mutations <= 240) {
             LT_LOGI("Battle status material float mutation material=%s"
                     " property=%s value=%.4f owners=%zu",
                     read_unity_object_name(material).c_str(), property.c_str(),
-                    value, translated_instances.size());
+                    value, winrate_count);
         }
     }
+    return true;
+}
+
+void *read_tmp_font_material_field(void *instance) {
+    if (instance == nullptr || !is_unity_object_alive(instance)) return nullptr;
+    static const char *const kFontMatFields[] = {"m_fontMaterial"};
+    return read_named_object_field(instance, kFontMatFields, 1);
 }
 
 TmpComponentState capture_tmp_component_state(
@@ -4789,15 +6923,36 @@ TmpComponentState capture_tmp_component_state(
     candidate.shared_material = invoke_object_getter(g_tmp_get_shared_material_info, instance);
     candidate.shared_material_weak_handle =
             create_weak_object_handle(candidate.shared_material);
-    candidate.source_material = invoke_object_getter(g_tmp_get_font_material_info, instance);
-    if (candidate.source_material == nullptr) {
-        candidate.source_material = candidate.shared_material;
+    void *raw_font_mat = read_tmp_font_material_field(instance);
+    if (raw_font_mat == nullptr && candidate.shared_material == nullptr) {
+        raw_font_mat = invoke_object_getter(g_tmp_get_font_material_info, instance);
+    }
+    candidate.source_material = candidate.shared_material != nullptr ?
+            candidate.shared_material : raw_font_mat;
+    // 动态对话框（受 OutterGradiantEffectController / TextMeshProMaterialSetter 管理）
+    // 由 setter 写入 _fontMaterialInstance / sharedMaterial，m_fontMaterial 字段可能仍残
+    // 留上句旧实例，因此仅对非动态对话框允许特殊 m_fontMaterial 覆盖 sharedMaterial。
+    if (candidate.source_material != nullptr && raw_font_mat != nullptr &&
+        raw_font_mat != candidate.source_material &&
+        !is_battle_dialog_tmp(instance) &&
+        !is_special_effect_tmp_material(candidate.source_material) &&
+        is_special_effect_tmp_material(raw_font_mat)) {
+        candidate.source_material = raw_font_mat;
     }
     candidate.source_material_weak_handle =
             create_weak_object_handle(candidate.source_material);
+    candidate.preserve_special_effect =
+            is_special_effect_tmp_material(candidate.source_material) ||
+            should_preserve_dynamic_dialog_material(
+                    instance, candidate.source_material);
     candidate.source_material_style = read_material_visual_style(candidate.source_material);
     register_source_material_owner(
             candidate.source_material, candidate.instance_weak_handle);
+    if (candidate.shared_material != nullptr &&
+        candidate.shared_material != candidate.source_material) {
+        register_source_material_owner(
+                candidate.shared_material, candidate.instance_weak_handle);
+    }
     candidate.source_visible_codepoints = source_visible_codepoints;
     candidate.has_line_spacing = invoke_float_getter(
             g_tmp_get_line_spacing_info, instance, &candidate.line_spacing);
@@ -5169,9 +7324,68 @@ void store_translated_tmp_material(
     pthread_mutex_unlock(&g_font_state_lock);
 }
 
+void clear_translated_tmp_material_binding(void *instance, void *base_mat) {
+    if (instance == nullptr || !is_unity_object_alive(instance)) return;
+    bool had_translated = false;
+    pthread_mutex_lock(&g_font_state_lock);
+    auto saved = g_original_tmp_states.find(instance);
+    if (saved != g_original_tmp_states.end()) {
+        had_translated = saved->second.translated_material != nullptr ||
+                saved->second.translated_material_weak_handle != 0;
+        release_object_handle(saved->second.translated_material_weak_handle);
+        release_object_handle(saved->second.translated_material_font_weak_handle);
+        saved->second.translated_material = nullptr;
+        saved->second.translated_material_weak_handle = 0;
+        saved->second.translated_material_font = nullptr;
+        saved->second.translated_material_font_weak_handle = 0;
+    }
+    pthread_mutex_unlock(&g_font_state_lock);
+    if (base_mat == nullptr || !is_unity_object_alive(base_mat)) return;
+    void *cur_shared = invoke_object_getter(g_tmp_get_shared_material_info, instance);
+    void *cur_inst = read_tmp_font_material_field(instance);
+    if (had_translated || is_battle_dialog_tmp(instance) ||
+        is_chinese_special_material(cur_shared) ||
+        is_chinese_special_material(cur_inst)) {
+        if (g_original_tmp_set_shared_material != nullptr &&
+            g_tmp_set_shared_material_info != nullptr) {
+            g_original_tmp_set_shared_material(
+                    instance, base_mat, g_tmp_set_shared_material_info);
+        }
+        set_tmp_component_font_material(instance, base_mat);
+    }
+}
+
 void *ensure_translated_tmp_material(void *instance) {
+    if (instance == nullptr) return nullptr;
+    if (is_battle_lyric_tmp(instance)) {
+        if (!ensure_tmp_font() || g_tmp_font_asset == nullptr) return nullptr;
+        if (g_tmp_get_font != nullptr && g_tmp_set_font != nullptr &&
+            g_tmp_get_font(instance, g_tmp_get_font_info) != g_tmp_font_asset) {
+            g_tmp_set_font(instance, g_tmp_font_asset, g_tmp_set_font_info);
+        }
+        void *cur_shared = invoke_object_getter(g_tmp_get_shared_material_info, instance);
+        void *cur_inst = invoke_object_getter(g_tmp_get_font_material_info, instance);
+        void *cur_mat = cur_inst != nullptr ? cur_inst : cur_shared;
+        if (is_chinese_special_material(cur_mat)) {
+            return get_or_create_special_chinese_material(cur_mat, g_tmp_font_asset);
+        }
+        void *special = is_special_effect_tmp_material(cur_mat) ?
+                get_or_create_special_chinese_material(cur_mat, g_tmp_font_asset) :
+                find_lyrics_base_fallback_material(g_tmp_font_asset);
+        if (special != nullptr) {
+            if (g_original_tmp_set_shared_material != nullptr &&
+                g_tmp_set_shared_material_info != nullptr) {
+                g_original_tmp_set_shared_material(
+                        instance, special, g_tmp_set_shared_material_info);
+            }
+            set_tmp_component_font_material(instance, special);
+            return special;
+        }
+        return invoke_object_getter(g_tmp_font_get_material_info, g_tmp_font_asset);
+    }
+
     TmpComponentState state;
-    if (instance == nullptr || !find_tmp_component_state(instance, &state) ||
+    if (!find_tmp_component_state(instance, &state) ||
         g_tmp_get_font == nullptr) {
         return nullptr;
     }
@@ -5197,6 +7411,44 @@ void *ensure_translated_tmp_material(void *instance) {
             return nullptr;
         }
     }
+
+    void *live_source_mat = resolve_live_object(
+            state.source_material_weak_handle, state.source_material);
+    if (live_source_mat == nullptr) {
+        live_source_mat = resolve_live_object(
+                state.shared_material_weak_handle, state.shared_material);
+    }
+    revalidate_tmp_special_effect_state(instance, &state);
+    if (state.preserve_special_effect ||
+        is_special_effect_tmp_material(live_source_mat) ||
+        should_preserve_dynamic_dialog_material(
+                instance, live_source_mat, &state)) {
+        if (!state.preserve_special_effect) {
+            pthread_mutex_lock(&g_font_state_lock);
+            auto saved = g_original_tmp_states.find(instance);
+            if (saved != g_original_tmp_states.end()) {
+                saved->second.preserve_special_effect = true;
+            }
+            pthread_mutex_unlock(&g_font_state_lock);
+        }
+        if (is_battle_dialog_tmp(instance) &&
+            find_special_clone_for_source(live_source_mat) != nullptr) {
+            sync_special_chinese_material_from_source(live_source_mat, active_asset);
+        }
+        void *special_mat = get_or_create_special_chinese_material(
+                live_source_mat, active_asset);
+        if (special_mat != nullptr) {
+            store_translated_tmp_material(instance, special_mat, active_asset);
+            if (g_original_tmp_set_shared_material != nullptr &&
+                g_tmp_set_shared_material_info != nullptr) {
+                g_original_tmp_set_shared_material(
+                        instance, special_mat, g_tmp_set_shared_material_info);
+            }
+            set_tmp_component_font_material(instance, special_mat);
+            return special_mat;
+        }
+    }
+
     const bool mirror_reward = is_mirror_dungeon_reward_control(component_name, parent_name);
     const bool is_battle_control = top_status || bottom_status ||
             is_battle_skill_banner_control(component_name, parent_name) ||
@@ -5204,7 +7456,9 @@ void *ensure_translated_tmp_material(void *instance) {
             state.preserve_source_outline || state.use_regular_title_font ||
             preserve_source_color;
     if (mirror_reward || !is_battle_control) {
-        return invoke_object_getter(g_tmp_font_get_material_info, active_asset);
+        void *base_mat = invoke_object_getter(g_tmp_font_get_material_info, active_asset);
+        clear_translated_tmp_material_binding(instance, base_mat);
+        return base_mat;
     }
     const float face_dilate =
             active_asset == g_tmp_regular_font_asset
@@ -5313,9 +7567,179 @@ void *ensure_translated_tmp_material(void *instance) {
     return material;
 }
 
+void sync_material_owners_after_mutation(
+        void *material, bool full_resync_existing_clone) {
+    if (material == nullptr || !is_unity_object_alive(material) ||
+        is_chinese_special_material(material)) {
+        return;
+    }
+    const std::vector<void *> owners = collect_source_material_owners(material);
+    if (owners.empty()) return;
+
+    const bool special_now = is_special_effect_tmp_material(material);
+    const bool glow_now = has_effective_glow_on_material(material);
+    const bool custom_color_now = is_custom_colored_instance_material(material);
+    bool synced_existing_clone = false;
+
+    for (void *instance : owners) {
+        if (instance == nullptr || !is_unity_object_alive(instance)) continue;
+        if (is_battle_lyric_tmp(instance)) {
+            if (full_resync_existing_clone && !synced_existing_clone) {
+                synced_existing_clone = sync_special_chinese_material_from_source(
+                        material, g_tmp_font_asset);
+            }
+            ensure_translated_tmp_material(instance);
+            continue;
+        }
+        TmpComponentState state;
+        if (!find_tmp_component_state(instance, &state)) continue;
+
+        const std::string component_name = read_unity_object_name(instance);
+        const std::string parent_name = read_unity_parent_name(instance);
+        const bool winrate = is_battle_winrate_control(
+                component_name, parent_name, state.battle_winrate_text);
+        const bool dynamic_dialog_effect =
+                is_battle_dialog_tmp(instance) && !winrate &&
+                !is_battle_skill_banner_control(component_name, parent_name) &&
+                !is_mirror_dungeon_reward_control(component_name, parent_name) &&
+                !is_top_battle_state_control(component_name, parent_name) &&
+                !is_bottom_battle_status_control(component_name, parent_name) &&
+                (glow_now || custom_color_now);
+        void *live_source_mat = resolve_live_object(
+                state.source_material_weak_handle, state.source_material);
+        void *active_shared_mat = invoke_object_getter(
+                g_tmp_get_shared_material_info, instance);
+
+        if (special_now || dynamic_dialog_effect) {
+            void *active_clone = find_special_clone_for_source(material);
+            void *saved_translated = resolve_live_object(
+                    state.translated_material_weak_handle, state.translated_material);
+            if (full_resync_existing_clone && active_clone != nullptr &&
+                !synced_existing_clone) {
+                void *target_font = g_tmp_get_font == nullptr ? nullptr :
+                        g_tmp_get_font(instance, g_tmp_get_font_info);
+                synced_existing_clone = sync_special_chinese_material_from_source(
+                        material, target_font);
+            }
+            if (!state.preserve_special_effect || live_source_mat != material ||
+                saved_translated == nullptr ||
+                (active_clone != nullptr && saved_translated != active_clone)) {
+                uintptr_t new_source_weak = live_source_mat != material ?
+                        create_weak_object_handle(material) : 0;
+                pthread_mutex_lock(&g_font_state_lock);
+                auto saved = g_original_tmp_states.find(instance);
+                if (saved != g_original_tmp_states.end()) {
+                    saved->second.preserve_special_effect = true;
+                    if (new_source_weak != 0) {
+                        release_object_handle(saved->second.source_material_weak_handle);
+                        saved->second.source_material = material;
+                        saved->second.source_material_weak_handle = new_source_weak;
+                        new_source_weak = 0;
+                    }
+                }
+                pthread_mutex_unlock(&g_font_state_lock);
+                if (new_source_weak != 0) release_object_handle(new_source_weak);
+                ensure_translated_tmp_material(instance);
+                LT_LOGI("Promoted TMP special/dialog material instance=%p name=%s"
+                        " source=%p(\"%s\") special=%d dynamicDialog=%d",
+                        instance, component_name.c_str(), material,
+                        read_unity_object_name(material).c_str(),
+                        special_now ? 1 : 0, dynamic_dialog_effect ? 1 : 0);
+            } else if (full_resync_existing_clone && active_clone == nullptr) {
+                ensure_translated_tmp_material(instance);
+            }
+            continue;
+        }
+
+        if (state.preserve_special_effect &&
+            (live_source_mat == material || active_shared_mat == material ||
+             find_special_clone_for_source(material) != nullptr)) {
+            if (!synced_existing_clone) {
+                synced_existing_clone = sync_special_chinese_material_from_source(
+                        material, nullptr);
+            }
+            pthread_mutex_lock(&g_font_state_lock);
+            auto saved = g_original_tmp_states.find(instance);
+            if (saved != g_original_tmp_states.end()) {
+                saved->second.preserve_special_effect = false;
+            }
+            pthread_mutex_unlock(&g_font_state_lock);
+            sync_translated_tmp_materials(instance, true);
+            continue;
+        }
+
+        if (winrate) {
+            sync_translated_tmp_materials(instance, true);
+        }
+    }
+}
+
 void *translated_tmp_material(void *instance, void *requested_material) {
     if (!is_unity_object_alive(requested_material)) {
         requested_material = nullptr;
+    }
+    if (is_chinese_special_material(requested_material)) {
+        void *resynced = get_or_create_special_chinese_material(
+                requested_material, nullptr);
+        return resynced != nullptr ? resynced : requested_material;
+    }
+    if (is_battle_lyric_tmp(instance)) {
+        if (!ensure_tmp_font() || g_tmp_font_asset == nullptr) {
+            return requested_material;
+        }
+        if (requested_material != nullptr &&
+            is_special_effect_tmp_material(requested_material)) {
+            void *special = get_or_create_special_chinese_material(
+                    requested_material, g_tmp_font_asset);
+            if (special != nullptr) return special;
+        }
+        void *ensured = ensure_translated_tmp_material(instance);
+        return ensured != nullptr ? ensured : requested_material;
+    }
+    if (instance != nullptr && requested_material != nullptr &&
+        (is_special_effect_tmp_material(requested_material) ||
+         should_preserve_dynamic_dialog_material(instance, requested_material))) {
+        void *active_asset = g_tmp_get_font == nullptr ? nullptr :
+                g_tmp_get_font(instance, g_tmp_get_font_info);
+        TmpComponentState state;
+        const bool has_state = find_tmp_component_state(instance, &state);
+        const bool using_chinese_font =
+                active_asset != nullptr &&
+                (active_asset == g_tmp_font_asset ||
+                 active_asset == g_tmp_regular_font_asset);
+        if (has_state) {
+            uintptr_t requested_weak = create_weak_object_handle(requested_material);
+            uintptr_t owner_handle = state.instance_weak_handle;
+            pthread_mutex_lock(&g_font_state_lock);
+            auto saved = g_original_tmp_states.find(instance);
+            if (saved != g_original_tmp_states.end()) {
+                saved->second.preserve_special_effect = true;
+                owner_handle = saved->second.instance_weak_handle;
+                if (requested_weak != 0) {
+                    release_object_handle(saved->second.source_material_weak_handle);
+                    saved->second.source_material = requested_material;
+                    saved->second.source_material_weak_handle = requested_weak;
+                    requested_weak = 0;
+                }
+            }
+            pthread_mutex_unlock(&g_font_state_lock);
+            if (requested_weak != 0) release_object_handle(requested_weak);
+            if (owner_handle != 0) {
+                register_source_material_owner(requested_material, owner_handle);
+            }
+        }
+        if (using_chinese_font || has_state) {
+            void *target_font = using_chinese_font ? active_asset : g_tmp_font_asset;
+            void *special = get_or_create_special_chinese_material(
+                    requested_material, target_font);
+            if (special != nullptr) {
+                if (has_state) {
+                    store_translated_tmp_material(instance, special, target_font);
+                }
+                return special;
+            }
+        }
+        return requested_material;
     }
     // 游戏会在页签选择、胜率状态切换和角色刷新时重新写入原日文字体预设材质。
     // 若传入的是新的日文源材质预设，先同步其颜色与描边参数，再绑定中文克隆材质。
@@ -5391,6 +7815,7 @@ void *translated_tmp_material(void *instance, void *requested_material) {
                 pthread_mutex_lock(&g_font_state_lock);
                 auto saved = g_original_tmp_states.find(instance);
                 if (saved != g_original_tmp_states.end()) {
+                    saved->second.preserve_special_effect = false;
                     saved->second.source_material_style = updated_style;
                     uintptr_t requested_weak =
                             create_weak_object_handle(requested_material);
@@ -5416,13 +7841,119 @@ void *translated_tmp_material(void *instance, void *requested_material) {
 }
 
 void replacement_tmp_set_shared_material(void *instance, void *material, const void *method) {
+    if (is_battle_lyric_tmp(instance) && g_in_battle_lyrics_init) {
+        g_original_tmp_set_shared_material(instance, material, method);
+        return;
+    }
     g_original_tmp_set_shared_material(
             instance, translated_tmp_material(instance, material), method);
 }
 
 void replacement_tmp_set_material(void *instance, void *material, const void *method) {
+    if (is_battle_lyric_tmp(instance) && g_in_battle_lyrics_init) {
+        g_original_tmp_set_material(instance, material, method);
+        return;
+    }
     g_original_tmp_set_material(
             instance, translated_tmp_material(instance, material), method);
+}
+
+void handle_material_color_mutation(
+        void *material, const std::string &named_property, int32_t property_id,
+        RuntimeColor color) {
+    if (g_in_internal_material_sync || material == nullptr) return;
+    const std::string effective_prop = !named_property.empty() ?
+            named_property : lookup_shader_property_name(property_id);
+    const bool protected_prop =
+            (!effective_prop.empty() && is_protected_atlas_property(effective_prop)) ||
+            (effective_prop.empty() && property_id != 0 &&
+             is_protected_atlas_property_id(property_id));
+    if (protected_prop) return;
+
+    void *clone = find_special_clone_for_source(material);
+    if (clone != nullptr && clone != material) {
+        if (!effective_prop.empty()) {
+            InternalMaterialSyncGuard guard;
+            float c[4] = {color.r, color.g, color.b, color.a};
+            write_material_color_property(clone, effective_prop.c_str(), c);
+        } else if (property_id != 0) {
+            write_material_color_by_id(clone, property_id, color);
+        }
+    }
+    if (has_source_material_owners(material)) {
+        const bool handled = !effective_prop.empty() &&
+                mirror_source_material_color(material, effective_prop, color);
+        if (!handled) {
+            sync_material_owners_after_mutation(material, false);
+        }
+    }
+}
+
+void handle_material_float_mutation(
+        void *material, const std::string &named_property, int32_t property_id,
+        float value) {
+    if (g_in_internal_material_sync || material == nullptr) return;
+    const std::string effective_prop = !named_property.empty() ?
+            named_property : lookup_shader_property_name(property_id);
+    const bool protected_prop =
+            (!effective_prop.empty() && is_protected_atlas_property(effective_prop)) ||
+            (effective_prop.empty() && property_id != 0 &&
+             is_protected_atlas_property_id(property_id));
+    if (protected_prop) return;
+
+    void *clone = find_special_clone_for_source(material);
+    if (clone != nullptr && clone != material) {
+        if (!effective_prop.empty()) {
+            InternalMaterialSyncGuard guard;
+            write_material_float_property(clone, effective_prop.c_str(), value);
+        } else if (property_id != 0) {
+            write_material_float_by_id(clone, property_id, value);
+        }
+    }
+    if (has_source_material_owners(material)) {
+        const bool handled = !effective_prop.empty() &&
+                mirror_source_material_float(material, effective_prop, value);
+        if (!handled) {
+            sync_material_owners_after_mutation(material, false);
+        }
+    }
+}
+
+void handle_material_vector_mutation(
+        void *material, const std::string &named_property, int32_t property_id,
+        RuntimeVector4 value) {
+    if (g_in_internal_material_sync || material == nullptr) return;
+    const std::string effective_prop = !named_property.empty() ?
+            named_property : lookup_shader_property_name(property_id);
+    const bool protected_prop =
+            (!effective_prop.empty() && is_protected_atlas_property(effective_prop)) ||
+            (effective_prop.empty() && property_id != 0 &&
+             is_protected_atlas_property_id(property_id));
+    if (protected_prop) return;
+
+    void *clone = find_special_clone_for_source(material);
+    if (clone != nullptr && clone != material) {
+        if (!effective_prop.empty()) {
+            float v[4] = {value.x, value.y, value.z, value.w};
+            write_material_vector_property(clone, effective_prop.c_str(), v);
+        } else if (property_id != 0) {
+            write_material_vector_by_id(clone, property_id, value);
+        }
+    }
+}
+
+void handle_material_keyword_mutation(void *material, void *keyword_name) {
+    if (g_in_internal_material_sync || material == nullptr) return;
+    const std::string keyword = read_managed_string_value(keyword_name);
+    if (keyword != "GLOW_ON" && keyword != "OUTLINE_ON" &&
+        keyword != "OUTLINE_OFF" && keyword != "UNDERLAY_ON" &&
+        keyword != "UNDERLAY_OFF") {
+        return;
+    }
+    if (has_source_material_owners(material) ||
+        find_special_clone_for_source(material) != nullptr) {
+        sync_material_owners_after_mutation(material, true);
+    }
 }
 
 void replacement_material_set_color(
@@ -5431,10 +7962,8 @@ void replacement_material_set_color(
     if (g_original_material_set_color != nullptr) {
         g_original_material_set_color(material, property_name, color, method);
     }
-    if (has_source_material_owners(material)) {
-        const std::string property = read_managed_string_value(property_name);
-        mirror_source_material_color(material, property, color);
-    }
+    handle_material_color_mutation(
+            material, read_managed_string_value(property_name), 0, color);
 }
 
 void replacement_material_set_float(
@@ -5442,16 +7971,329 @@ void replacement_material_set_float(
     if (g_original_material_set_float != nullptr) {
         g_original_material_set_float(material, property_name, value, method);
     }
-    if (has_source_material_owners(material)) {
-        const std::string property = read_managed_string_value(property_name);
-        mirror_source_material_float(material, property, value);
+    handle_material_float_mutation(
+            material, read_managed_string_value(property_name), 0, value);
+}
+
+void replacement_material_set_vector(
+        void *material, void *property_name, RuntimeVector4 value,
+        const void *method) {
+    if (g_original_material_set_vector != nullptr) {
+        g_original_material_set_vector(material, property_name, value, method);
     }
+    handle_material_vector_mutation(
+            material, read_managed_string_value(property_name), 0, value);
+}
+
+void replacement_material_set_float_id(
+        void *material, int32_t property_id, float value, const void *method) {
+    if (g_original_material_set_float_id != nullptr) {
+        g_original_material_set_float_id(material, property_id, value, method);
+    }
+    handle_material_float_mutation(material, std::string(), property_id, value);
+}
+
+void replacement_material_set_color_id(
+        void *material, int32_t property_id, RuntimeColor color,
+        const void *method) {
+    if (g_original_material_set_color_id != nullptr) {
+        g_original_material_set_color_id(material, property_id, color, method);
+    }
+    handle_material_color_mutation(material, std::string(), property_id, color);
+}
+
+void replacement_material_set_vector_id(
+        void *material, int32_t property_id, RuntimeVector4 value,
+        const void *method) {
+    if (g_original_material_set_vector_id != nullptr) {
+        g_original_material_set_vector_id(material, property_id, value, method);
+    }
+    handle_material_vector_mutation(material, std::string(), property_id, value);
+}
+
+void replacement_material_enable_keyword(
+        void *material, void *keyword_name, const void *method) {
+    if (g_original_material_enable_keyword != nullptr) {
+        g_original_material_enable_keyword(material, keyword_name, method);
+    }
+    handle_material_keyword_mutation(material, keyword_name);
+}
+
+void replacement_material_disable_keyword(
+        void *material, void *keyword_name, const void *method) {
+    if (g_original_material_disable_keyword != nullptr) {
+        g_original_material_disable_keyword(material, keyword_name, method);
+    }
+    handle_material_keyword_mutation(material, keyword_name);
+}
+
+bool is_tmp_text_instance(void *obj) {
+    if (obj == nullptr || g_object_get_class == nullptr ||
+        g_tmp_text_class == nullptr) {
+        return false;
+    }
+    void *klass = g_object_get_class(obj);
+    for (int32_t depth = 0; klass != nullptr && depth < 16; ++depth) {
+        if (klass == g_tmp_text_class) return true;
+        if (g_class_get_parent == nullptr) break;
+        klass = g_class_get_parent(klass);
+    }
+    return false;
+}
+
+std::vector<void *> find_associated_tmps_for_setter(
+        void *setter, void *inst_mat, void *orig_mat) {
+    std::vector<void *> result;
+    auto add_unique = [&](void *candidate) {
+        if (candidate == nullptr || !is_unity_object_alive(candidate)) return;
+        if (std::find(result.begin(), result.end(), candidate) == result.end()) {
+            result.push_back(candidate);
+        }
+    };
+    static const char *const kRefFields[] = {"_fontMaterialReference"};
+    void *ref_obj = read_named_object_field(setter, kRefFields, 1);
+    if (is_tmp_text_instance(ref_obj)) {
+        add_unique(ref_obj);
+    }
+    if (result.empty() && g_component_get_component_type_info != nullptr &&
+        g_tmp_text_type_object != nullptr && g_runtime_invoke != nullptr) {
+        void *args[] = {g_tmp_text_type_object};
+        void *exc = nullptr;
+        void *comp = g_runtime_invoke(
+                g_component_get_component_type_info, setter, args, &exc);
+        if (exc == nullptr && is_tmp_text_instance(comp)) {
+            add_unique(comp);
+        }
+    }
+    for (void *owner : collect_source_material_owners(inst_mat)) {
+        add_unique(owner);
+    }
+    if (orig_mat != nullptr && orig_mat != inst_mat) {
+        for (void *owner : collect_source_material_owners(orig_mat)) {
+            add_unique(owner);
+        }
+    }
+    return result;
+}
+
+void on_text_mat_setter_mutated_internal(
+        void *setter, void *explicit_tmp, bool accent_cleared) {
+    if (g_in_internal_material_sync) return;
+    std::vector<void *> tmps;
+    auto add_tmp = [&](void *candidate) {
+        if (!is_tmp_text_instance(candidate) || !is_unity_object_alive(candidate)) return;
+        register_battle_dialog_tmp(candidate);
+        if (std::find(tmps.begin(), tmps.end(), candidate) == tmps.end()) {
+            tmps.push_back(candidate);
+        }
+    };
+    add_tmp(explicit_tmp);
+
+    void *inst_mat = nullptr;
+    void *orig_mat = nullptr;
+    void *effective_mat = nullptr;
+    if (setter != nullptr && is_unity_object_alive(setter)) {
+        static const char *const kInstMatFields[] = {"_fontMaterialInstance"};
+        static const char *const kOrigMatFields[] = {"originMat"};
+        inst_mat = read_named_object_field(setter, kInstMatFields, 1);
+        orig_mat = read_named_object_field(setter, kOrigMatFields, 1);
+        effective_mat = (inst_mat != nullptr && is_unity_object_alive(inst_mat)) ?
+                inst_mat : orig_mat;
+        for (void *found_tmp : find_associated_tmps_for_setter(
+                setter, effective_mat, orig_mat)) {
+            add_tmp(found_tmp);
+        }
+    }
+    void *cn_bold_base = g_tmp_font_asset == nullptr ? nullptr :
+            invoke_object_getter(g_tmp_font_get_material_info, g_tmp_font_asset);
+    void *cn_regular_base = g_tmp_regular_font_asset == nullptr ? nullptr :
+            invoke_object_getter(g_tmp_font_get_material_info, g_tmp_regular_font_asset);
+    const bool valid_source_mat =
+            effective_mat != nullptr && is_unity_object_alive(effective_mat) &&
+            !is_chinese_special_material(effective_mat) &&
+            effective_mat != cn_bold_base && effective_mat != cn_regular_base;
+
+    if (!valid_source_mat) {
+        if (accent_cleared) {
+            for (void *tmp : tmps) {
+                TmpComponentState state;
+                if (!find_tmp_component_state(tmp, &state) ||
+                    !state.preserve_special_effect) {
+                    continue;
+                }
+                pthread_mutex_lock(&g_font_state_lock);
+                auto saved = g_original_tmp_states.find(tmp);
+                if (saved != g_original_tmp_states.end()) {
+                    saved->second.preserve_special_effect = false;
+                }
+                pthread_mutex_unlock(&g_font_state_lock);
+                sync_translated_tmp_materials(tmp, true);
+            }
+        }
+        return;
+    }
+
+    const MaterialVisualStyle mat_style = read_material_visual_style(effective_mat);
+    bool registered_any_owner = false;
+    for (void *tmp : tmps) {
+        if (is_battle_lyric_tmp(tmp)) {
+            registered_any_owner = true;
+            continue;
+        }
+        TmpComponentState state;
+        if (!find_tmp_component_state(tmp, &state)) continue;
+        uintptr_t owner_handle = state.instance_weak_handle;
+        uintptr_t new_src_weak = state.source_material != effective_mat ?
+                create_weak_object_handle(effective_mat) : 0;
+        uintptr_t new_shared_weak = state.shared_material != effective_mat ?
+                create_weak_object_handle(effective_mat) : 0;
+        pthread_mutex_lock(&g_font_state_lock);
+        auto saved = g_original_tmp_states.find(tmp);
+        if (saved != g_original_tmp_states.end()) {
+            saved->second.source_material_style = mat_style;
+            owner_handle = saved->second.instance_weak_handle;
+            if (new_src_weak != 0) {
+                release_object_handle(saved->second.source_material_weak_handle);
+                saved->second.source_material = effective_mat;
+                saved->second.source_material_weak_handle = new_src_weak;
+                new_src_weak = 0;
+            }
+            if (new_shared_weak != 0) {
+                release_object_handle(saved->second.shared_material_weak_handle);
+                saved->second.shared_material = effective_mat;
+                saved->second.shared_material_weak_handle = new_shared_weak;
+                new_shared_weak = 0;
+            }
+            if (accent_cleared) {
+                saved->second.preserve_special_effect = false;
+            }
+        }
+        pthread_mutex_unlock(&g_font_state_lock);
+        if (new_src_weak != 0) release_object_handle(new_src_weak);
+        if (new_shared_weak != 0) release_object_handle(new_shared_weak);
+        if (owner_handle != 0) {
+            register_source_material_owner(effective_mat, owner_handle);
+            registered_any_owner = true;
+        }
+        if (accent_cleared) {
+            sync_translated_tmp_materials(tmp, true);
+        }
+    }
+    if (accent_cleared) {
+        sync_special_chinese_material_from_source(effective_mat, nullptr);
+    }
+    if (registered_any_owner ||
+        find_special_clone_for_source(effective_mat) != nullptr) {
+        sync_material_owners_after_mutation(effective_mat, true);
+    }
+}
+
+void on_text_mat_setter_mutated(void *setter) {
+    on_text_mat_setter_mutated_internal(setter, nullptr, false);
+}
+
+void sync_battle_effect_manager_dialogs(void *mgr, bool accent_cleared) {
+    if (g_in_internal_material_sync || mgr == nullptr ||
+        !is_unity_object_alive(mgr)) {
+        return;
+    }
+    static const struct {
+        const char *text_field;
+        const char *setter_field;
+    } kDialogSlots[] = {
+            {"_dialogText", "_dialogTextMatSetter"},
+            {"_dialogText_Mid", "_dialogTextMatSetter_Mid"},
+            {"_dialogText_Upper", "_dialogTextMatSetter_Upper"},
+    };
+    for (const auto &slot : kDialogSlots) {
+        const char *tf[] = {slot.text_field};
+        const char *sf[] = {slot.setter_field};
+        void *dialog_tmp = read_named_object_field(mgr, tf, 1);
+        void *dialog_setter = read_named_object_field(mgr, sf, 1);
+        if (dialog_tmp != nullptr || dialog_setter != nullptr) {
+            on_text_mat_setter_mutated_internal(
+                    dialog_setter, dialog_tmp, accent_cleared);
+        }
+    }
+}
+
+void replacement_battle_effect_clear_accent(void *mgr, const void *method) {
+    if (g_original_battle_effect_clear_accent != nullptr) {
+        g_original_battle_effect_clear_accent(mgr, method);
+    }
+    sync_battle_effect_manager_dialogs(mgr, true);
+}
+
+void replacement_battle_effect_set_dialog(
+        void *mgr, void *txt, float wait_time, bool is_skill_dialog,
+        const void *method) {
+    if (g_original_battle_effect_set_dialog != nullptr) {
+        g_original_battle_effect_set_dialog(
+                mgr, txt, wait_time, is_skill_dialog, method);
+    }
+    sync_battle_effect_manager_dialogs(mgr, false);
+}
+
+void replacement_battle_effect_set_dialog_mid(
+        void *mgr, void *txt, float wait_time, const void *method) {
+    if (g_original_battle_effect_set_dialog_mid != nullptr) {
+        g_original_battle_effect_set_dialog_mid(
+                mgr, txt, wait_time, method);
+    }
+    sync_battle_effect_manager_dialogs(mgr, false);
+}
+
+void replacement_battle_effect_set_dialog_upper(
+        void *mgr, void *txt, float wait_time, float arg2, const void *method) {
+    if (g_original_battle_effect_set_dialog_upper != nullptr) {
+        g_original_battle_effect_set_dialog_upper(
+                mgr, txt, wait_time, arg2, method);
+    }
+    sync_battle_effect_manager_dialogs(mgr, false);
+}
+
+void replacement_mat_setter_write_props(void *setter, const void *method) {
+    if (g_original_mat_setter_write_props != nullptr) {
+        g_original_mat_setter_write_props(setter, method);
+    }
+    on_text_mat_setter_mutated(setter);
+}
+
+void replacement_mat_setter_write(void *setter, const void *method) {
+    if (g_original_mat_setter_write != nullptr) {
+        g_original_mat_setter_write(setter, method);
+    }
+    on_text_mat_setter_mutated(setter);
+}
+
+void replacement_mat_setter_reset(void *setter, const void *method) {
+    if (g_original_mat_setter_reset != nullptr) {
+        g_original_mat_setter_reset(setter, method);
+    }
+    on_text_mat_setter_mutated(setter);
+}
+
+void replacement_mat_setter_reset_material(void *setter, const void *method) {
+    if (g_original_mat_setter_reset_material != nullptr) {
+        g_original_mat_setter_reset_material(setter, method);
+    }
+    on_text_mat_setter_mutated(setter);
+}
+
+void replacement_mat_setter_clone(void *setter, const void *method) {
+    if (g_original_mat_setter_clone != nullptr) {
+        g_original_mat_setter_clone(setter, method);
+    }
+    on_text_mat_setter_mutated(setter);
 }
 
 void replacement_tmp_set_text_color(
         void *instance, RuntimeColor color, const void *method) {
     if (g_original_tmp_set_color != nullptr) {
         g_original_tmp_set_color(instance, color, method);
+    }
+    if (is_battle_lyric_tmp(instance)) {
+        return;
     }
     bool updated = false;
     pthread_mutex_lock(&g_font_state_lock);
@@ -5484,6 +8326,16 @@ void replacement_tmp_set_text_color(
 
 void replacement_tmp_set_font(void *instance, void *font, const void *method) {
     if (g_tmp_set_font == nullptr) return;
+    if (is_battle_lyric_tmp(instance)) {
+        if (g_in_battle_lyrics_init) {
+            g_tmp_set_font(instance, font, method);
+            return;
+        }
+        void *target_font = (ensure_tmp_font() && g_tmp_font_asset != nullptr) ?
+                g_tmp_font_asset : font;
+        g_tmp_set_font(instance, target_font, method);
+        return;
+    }
     if (instance == nullptr || font == nullptr ||
         font == g_tmp_font_asset || font == g_tmp_regular_font_asset) {
         g_tmp_set_font(instance, font, method);
@@ -5557,21 +8409,59 @@ void restore_tmp_component_state(void *instance) {
             g_tmp_set_font(instance, original_font, g_tmp_set_font_info);
         }
     }
-    void *original_material = resolve_live_object(
+    void *saved_shared = resolve_live_object(
             state.shared_material_weak_handle, state.shared_material);
-    if (original_material != nullptr) {
-        ManagedObjectPin material_pin(original_material);
-        if (material_pin.alive()) {
-            invoke_object_setter(
-                    g_tmp_set_shared_material_info, instance, original_material);
-        }
-    }
-    void *source_material = resolve_live_object(
+    void *saved_source = resolve_live_object(
             state.source_material_weak_handle, state.source_material);
-    if (source_material != nullptr) {
-        ManagedObjectPin source_material_pin(source_material);
-        if (source_material_pin.alive()) {
-            set_tmp_component_font_material(instance, source_material);
+    void *saved_translated = resolve_live_object(
+            state.translated_material_weak_handle, state.translated_material);
+    void *current_shared = invoke_object_getter(g_tmp_get_shared_material_info, instance);
+    void *cn_bold_base = g_tmp_font_asset == nullptr ? nullptr :
+            invoke_object_getter(g_tmp_font_get_material_info, g_tmp_font_asset);
+    void *cn_regular_base = g_tmp_regular_font_asset == nullptr ? nullptr :
+            invoke_object_getter(g_tmp_font_get_material_info, g_tmp_regular_font_asset);
+    const bool has_newer_dynamic_material =
+            current_shared != nullptr &&
+            is_unity_object_alive(current_shared) &&
+            current_shared != saved_translated &&
+            current_shared != saved_shared &&
+            current_shared != saved_source &&
+            current_shared != cn_bold_base &&
+            current_shared != cn_regular_base;
+    void *authoritative_dynamic_mat = has_newer_dynamic_material
+            ? current_shared
+            : ((is_battle_dialog_tmp(instance) && saved_source != nullptr &&
+                is_unity_object_alive(saved_source)) ? saved_source : nullptr);
+    if (authoritative_dynamic_mat != nullptr) {
+        // 保留两句 SetText 之间刚刚更新过配色的动态实例或 setter 权威源，并对齐
+        // sharedMaterial 与 fontMaterial，避免用上一句缓存的旧材质覆写新状态。
+        ManagedObjectPin dyn_pin(authoritative_dynamic_mat);
+        if (dyn_pin.alive()) {
+            if (g_original_tmp_set_shared_material != nullptr &&
+                g_tmp_set_shared_material_info != nullptr) {
+                g_original_tmp_set_shared_material(
+                        instance, authoritative_dynamic_mat,
+                        g_tmp_set_shared_material_info);
+            } else {
+                invoke_object_setter(
+                        g_tmp_set_shared_material_info, instance,
+                        authoritative_dynamic_mat);
+            }
+            set_tmp_component_font_material(instance, authoritative_dynamic_mat);
+        }
+    } else {
+        if (saved_shared != nullptr) {
+            ManagedObjectPin material_pin(saved_shared);
+            if (material_pin.alive()) {
+                invoke_object_setter(
+                        g_tmp_set_shared_material_info, instance, saved_shared);
+            }
+        }
+        if (saved_source != nullptr) {
+            ManagedObjectPin source_material_pin(saved_source);
+            if (source_material_pin.alive()) {
+                set_tmp_component_font_material(instance, saved_source);
+            }
         }
     }
     if (state.has_line_spacing) {
@@ -5720,6 +8610,9 @@ size_t count_visible_codepoints(const std::string &text) {
 
 bool apply_translated_tmp_style(void *instance, void *managed_text,
                                 const TmpComponentState &state) {
+    if (is_battle_lyric_tmp(instance) || state.preserve_special_effect) {
+        return false;
+    }
     if (managed_text == nullptr || g_string_length == nullptr ||
         g_string_chars == nullptr) {
         return false;
@@ -5909,6 +8802,23 @@ bool is_ascii_question_placeholder(const std::string &text) {
 }
 
 void *prepare_tmp_text(void *instance, void *managed_text) {
+    if (is_battle_lyric_tmp(instance)) {
+        if (ensure_tmp_font() && g_tmp_font_asset != nullptr) {
+            if (g_tmp_get_font != nullptr && g_tmp_set_font != nullptr &&
+                g_tmp_get_font(instance, g_tmp_get_font_info) != g_tmp_font_asset) {
+                g_tmp_set_font(instance, g_tmp_font_asset, g_tmp_set_font_info);
+            }
+            if (managed_text != nullptr) {
+                const std::string txt = read_managed_string_value(managed_text);
+                if (contains_non_ascii_utf8(txt)) {
+                    preload_lyric_cjk_glyphs_cached(
+                            g_tmp_font_asset,
+                            strip_tmp_tags_for_glyph_preload(txt));
+                }
+            }
+        }
+        return managed_text;
+    }
     void *replacement = managed_text;
     if (instance != nullptr && managed_text != nullptr && g_string_length != nullptr &&
         g_string_chars != nullptr && g_string_new_utf16 != nullptr) {
@@ -5917,11 +8827,23 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
         std::string source;
         if (length >= 0 && length <= 1024 * 1024 &&
             utf16_to_utf8(g_string_chars(managed_text), length, &source)) {
+            TmpComponentState pre_state;
+            const bool has_pre_state = find_tmp_component_state(instance, &pre_state);
+            const bool has_japanese_kana = contains_japanese_kana(source);
+            const bool non_ascii_source = contains_non_ascii_utf8(source);
+            const bool special_cjk_continuation =
+                    has_pre_state && pre_state.preserve_special_effect &&
+                    non_ascii_source && !has_japanese_kana;
+            const bool typewriter_source_continuation =
+                    has_pre_state && non_ascii_source && !has_japanese_kana &&
+                    is_tmp_typewriter_continuation(instance, source);
             // A recycled list row can receive a new price or label while still
             // carrying the Chinese font style from its previous item. Restore the
             // pristine component before taking a new snapshot; otherwise the old
             // row's title size/material leaks into the new numeric value.
-            if (!is_registered_translation_text(source) &&
+            if (!special_cjk_continuation &&
+                !typewriter_source_continuation &&
+                !is_registered_translation_text(source) &&
                 g_tmp_get_font != nullptr && g_tmp_get_font_info != nullptr) {
                 void *font_before_translation =
                         g_tmp_get_font(instance, g_tmp_get_font_info);
@@ -5962,7 +8884,9 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                 }
             }
 
-            replacement = translate_managed_string(managed_text);
+            replacement = typewriter_source_continuation
+                    ? managed_text
+                    : translate_managed_string(managed_text);
             // Shop costs use ASCII question marks as a deliberate game-font
             // placeholder. Replacing them with full-width Chinese question marks
             // changes their advance widths and leaves visible gaps around the cost.
@@ -6025,16 +8949,6 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
             if (display_length >= 0 && display_length <= 1024 * 1024) {
                 utf16_to_utf8(g_string_chars(replacement), display_length, &display_text);
             }
-            std::string restored_full_text;
-            if (!display_text.empty() &&
-                restore_ellipsis_truncated_translation(display_text, &restored_full_text)) {
-                void *unabbreviated = new_managed_string(restored_full_text);
-                if (unabbreviated != nullptr &&
-                    remember_translation_owned_string(unabbreviated)) {
-                    replacement = unabbreviated;
-                    display_text = restored_full_text;
-                }
-            }
             void *current_font = g_tmp_get_font == nullptr ? nullptr :
                     g_tmp_get_font(instance, g_tmp_get_font_info);
             bool already_chinese = current_font == g_tmp_font_asset ||
@@ -6048,6 +8962,55 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     is_mirror_dungeon_reward_control(component_name, parent_name, source);
             const bool battle_skill_banner =
                     is_battle_skill_banner_control(component_name, parent_name);
+            std::string current_font_name = current_font == nullptr ? std::string() :
+                    read_unity_object_name(current_font);
+            const bool general_ui_cjk = is_general_ui_cjk_font(current_font_name);
+            void *current_shared_getter =
+                    invoke_object_getter(g_tmp_get_shared_material_info, instance);
+            void *current_inst_mat = read_tmp_font_material_field(instance);
+            void *current_shared_mat = current_shared_getter != nullptr ?
+                    current_shared_getter : current_inst_mat;
+            const bool is_special_mat_control =
+                    special_cjk_continuation ||
+                    is_special_effect_tmp_material(current_shared_mat);
+            const bool typewriter_progression =
+                    update_tmp_typewriter_progression(instance, display_text);
+            const bool is_ending_or_special_story =
+                    component_name.find("EndingText") != std::string::npos ||
+                    parent_name.find("LastVoiceAmbience") != std::string::npos;
+            const bool allow_ellipsis_restoration =
+                    !display_text.empty() &&
+                    !special_cjk_continuation &&
+                    !(has_pre_state && pre_state.preserve_special_effect) &&
+                    !is_special_mat_control &&
+                    !battle_skill_banner &&
+                    !is_ending_or_special_story &&
+                    !(typewriter_progression && !egogift_name && !mirror_reward_ui);
+            if (!allow_ellipsis_restoration &&
+                trailing_ellipsis_prefix_length(display_text, nullptr) &&
+                (typewriter_progression || is_ending_or_special_story || is_special_mat_control)) {
+                uint64_t skips = g_typewriter_ellipsis_skips.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                if (skips <= 20 || skips % 200 == 0) {
+                    LT_LOGI("Skipped ellipsis restoration count=%llu instance=%p name=%s"
+                            " typewriter=%d special=%d chars=%zu",
+                            static_cast<unsigned long long>(skips), instance,
+                            component_name.c_str(), typewriter_progression ? 1 : 0,
+                            (is_ending_or_special_story || is_special_mat_control) ? 1 : 0,
+                            count_visible_codepoints(display_text));
+                }
+            }
+            std::string restored_full_text;
+            if (allow_ellipsis_restoration &&
+                restore_ellipsis_truncated_translation(
+                        display_text, &restored_full_text, false)) {
+                void *unabbreviated = new_managed_string(restored_full_text);
+                if (unabbreviated != nullptr &&
+                    remember_translation_owned_string(unabbreviated)) {
+                    replacement = unabbreviated;
+                    display_text = restored_full_text;
+                }
+            }
             if (battle_skill_banner) {
                 if (trailing_ellipsis_prefix_length(display_text, nullptr)) {
                     std::string cached_full_text;
@@ -6073,12 +9036,13 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     battle_skill_banner || loading_hint_title;
             const bool strip_synthetic_bold =
                     regular_styled_control || battle_winrate_label;
-            std::string current_font_name = current_font == nullptr ? std::string() :
-                    read_unity_object_name(current_font);
-            const bool general_ui_cjk = is_general_ui_cjk_font(current_font_name);
+            if (!translated &&
+                (special_cjk_continuation || typewriter_source_continuation)) {
+                translated = true;
+            }
             const bool may_be_composed_cjk_ui =
                     egogift_name || mirror_reward_ui || battle_skill_banner ||
-                    battle_winrate_label || general_ui_cjk;
+                    battle_winrate_label || general_ui_cjk || is_special_mat_control;
             bool promoted_egogift = false;
             if (!translated && !already_chinese && current_font != nullptr &&
                 may_be_composed_cjk_ui) {
@@ -6145,6 +9109,8 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                         saved_state->second.use_regular_title_font = regular_styled_control;
                         saved_state->second.use_battle_winrate_bold = battle_winrate_label;
                         saved_state->second.preserve_source_outline = battle_winrate_label;
+                        saved_state->second.preserve_special_effect =
+                                source_state.preserve_special_effect;
                         saved_state->second.known_text_kind =
                                 tracked_kind == nullptr ? std::string() : std::string(tracked_kind);
                         saved_state->second.battle_winrate_text =
@@ -6163,8 +9129,10 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                                 current_font,
                                 g_tmp_font_asset != nullptr ? g_tmp_font_asset : chinese_font);
                     }
-                    if (ui_or_banner) {
-                        preload_cjk_glyphs(chinese_font, display_text);
+                    if (ui_or_banner || source_state.preserve_special_effect) {
+                        preload_cjk_glyphs(
+                                chinese_font,
+                                strip_tmp_tags_for_glyph_preload(display_text));
                     }
                     if (strip_synthetic_bold && source_state.has_font_style &&
                         (source_state.font_style & 1) != 0) {
@@ -6175,7 +9143,8 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     // Rebuild UI/popup/shop and battle skill banner controls with
                     // ignoreActiveState=true so every character is resolved from
                     // the target Chinese font before the panel becomes visible.
-                    if (ui_or_banner || promoted_egogift) {
+                    if (ui_or_banner || promoted_egogift ||
+                        source_state.preserve_special_effect) {
                         request_tmp_rebuild(instance);
                     }
                     // Every component receives its own Chinese material clone. The
@@ -6231,6 +9200,7 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     pthread_mutex_unlock(&g_font_state_lock);
                     TmpComponentState existing_state;
                     if (find_tmp_component_state(instance, &existing_state)) {
+                        revalidate_tmp_special_effect_state(instance, &existing_state);
                         if (battle_winrate_label) {
                             log_battle_status_style_snapshot(
                                     instance, existing_state, source, display_text,
@@ -6272,10 +9242,46 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                                     component_name.c_str(), parent_name.c_str());
                         }
                     }
+                    if (existing_state.preserve_special_effect) {
+                        preload_lyric_cjk_glyphs_cached(
+                                current_font,
+                                strip_tmp_tags_for_glyph_preload(display_text));
+                    }
                     ensure_translated_tmp_material(instance);
                 }
             } else if (!translated) {
                 restore_tmp_component_state(instance);
+                if (is_battle_dialog_tmp(instance) && g_tmp_get_font != nullptr) {
+                    void *post_font = g_tmp_get_font(instance, g_tmp_get_font_info);
+                    if (post_font != nullptr &&
+                        post_font != g_tmp_font_asset &&
+                        post_font != g_tmp_regular_font_asset) {
+                        void *post_mat = invoke_object_getter(
+                                g_tmp_get_shared_material_info, instance);
+                        void *post_tex = read_material_texture_property(post_mat, "_MainTex");
+                        auto matches_cn_atlas = [&](void *cn_font) {
+                            if (cn_font == nullptr) return false;
+                            void *base = invoke_object_getter(g_tmp_font_get_material_info, cn_font);
+                            return base != nullptr &&
+                                   read_material_texture_property(base, "_MainTex") == post_tex;
+                        };
+                        if (post_tex != nullptr &&
+                            (matches_cn_atlas(g_tmp_font_asset) ||
+                             matches_cn_atlas(g_tmp_regular_font_asset))) {
+                            void *orig_base = invoke_object_getter(
+                                    g_tmp_font_get_material_info, post_font);
+                            if (orig_base != nullptr && is_unity_object_alive(orig_base)) {
+                                if (g_original_tmp_set_shared_material != nullptr &&
+                                    g_tmp_set_shared_material_info != nullptr) {
+                                    g_original_tmp_set_shared_material(
+                                            instance, orig_base,
+                                            g_tmp_set_shared_material_info);
+                                }
+                                set_tmp_component_font_material(instance, orig_base);
+                            }
+                        }
+                    }
+                }
             }
             if (replacement != managed_text) {
                 uint64_t hits = __atomic_add_fetch(&g_translation_hits, 1, __ATOMIC_RELAXED);
@@ -6366,12 +9372,18 @@ void finalize_tmp_text(void *instance, void *managed_text) {
     if (instance == nullptr || managed_text == nullptr) {
         return;
     }
+    if (is_battle_lyric_tmp(instance)) {
+        return;
+    }
     const bool promoted_rebuild = has_pending_tmp_rebuild(instance);
     if (!is_translated_managed_string(managed_text) && !promoted_rebuild) {
         return;
     }
     TmpComponentState state;
     bool found_state = find_tmp_component_state(instance, &state);
+    if (found_state && state.preserve_special_effect) {
+        return;
+    }
     if (found_state) {
         // 原始 setter 完成后只处理明确需要的标题例外；其余字号、换行、溢出和
         // 行距全部沿用游戏为该控件配置的原始值。
@@ -6933,6 +9945,162 @@ void replacement_text_mesh_set_text(
     }
 }
 
+void *replacement_bgm_lyrics_get_data(
+        void *instance, void *key, int32_t vocal_id, int32_t *out_index,
+        const void *method) {
+    void *result = g_original_bgm_lyrics_get_data == nullptr ? nullptr :
+            g_original_bgm_lyrics_get_data(
+                    instance, key, vocal_id, out_index, method);
+    if (result == nullptr) return nullptr;
+    return translate_lyrics_managed_string(result);
+}
+
+void replacement_battle_lyrics_init(
+        void *instance, void *managed_text, float duration, int32_t ground,
+        bool upper, int32_t vocal_id, const void *method) {
+    static const char *const kTmpFields[] = {"tmp"};
+    static const char *const kCurFontInfoFields[] = {"_curFontInfo"};
+    (void)kCurFontInfoFields;
+
+    void *tmp_before = read_named_object_field(instance, kTmpFields, 1);
+    if (tmp_before != nullptr) {
+        register_battle_lyric_tmp(tmp_before);
+    }
+
+    ensure_tmp_font();
+    ensure_lyrics_style_presets_registered();
+    void *localized_text = translate_lyrics_managed_string(managed_text);
+    if (g_tmp_font_asset != nullptr && localized_text != nullptr) {
+        const std::string plain = strip_tmp_tags_for_glyph_preload(
+                read_managed_string_value(localized_text));
+        if (contains_non_ascii_utf8(plain)) {
+            preload_lyric_cjk_glyphs_cached(g_tmp_font_asset, plain);
+        }
+    }
+
+    struct BattleLyricsInitGuard {
+        bool prev = false;
+        BattleLyricsInitGuard() : prev(g_in_battle_lyrics_init) {
+            g_in_battle_lyrics_init = true;
+        }
+        ~BattleLyricsInitGuard() {
+            g_in_battle_lyrics_init = prev;
+        }
+    } init_guard;
+
+    if (g_original_battle_lyrics_init != nullptr) {
+        g_original_battle_lyrics_init(
+                instance, localized_text, duration, ground, upper, vocal_id, method);
+    }
+
+    void *tmp_after = read_named_object_field(instance, kTmpFields, 1);
+    if (tmp_after == nullptr || !is_unity_object_alive(tmp_after)) return;
+    register_battle_lyric_tmp(tmp_after);
+    if (!ensure_tmp_font() || g_tmp_font_asset == nullptr) return;
+
+    struct {
+        int32_t lang;
+        void *fontAsset;
+        void *fontMaterial;
+    } cur_fi = {-1, nullptr, nullptr};
+    void *src_mat = nullptr;
+    if (read_named_scalar_field(instance, "_curFontInfo", &cur_fi, sizeof(cur_fi)) &&
+        reinterpret_cast<uintptr_t>(cur_fi.fontMaterial) > 0x10000 &&
+        is_unity_object_alive(cur_fi.fontMaterial)) {
+        src_mat = cur_fi.fontMaterial;
+    }
+    if (src_mat == nullptr) {
+        src_mat = invoke_object_getter(g_tmp_get_shared_material_info, tmp_after);
+    }
+    if (!is_special_effect_tmp_material(src_mat)) {
+        void *fallback_lyrics = find_lyrics_base_fallback_material(g_tmp_font_asset);
+        if (fallback_lyrics != nullptr) src_mat = fallback_lyrics;
+    }
+    void *zh_base_mat = src_mat != nullptr ?
+            get_or_create_special_chinese_material(src_mat, g_tmp_font_asset) :
+            nullptr;
+    if (zh_base_mat == nullptr) {
+        zh_base_mat = find_lyrics_base_fallback_material(g_tmp_font_asset);
+    }
+
+    if (g_tmp_set_font != nullptr) {
+        g_tmp_set_font(tmp_after, g_tmp_font_asset, g_tmp_set_font_info);
+    }
+    if (zh_base_mat != nullptr) {
+        if (g_original_tmp_set_shared_material != nullptr &&
+            g_tmp_set_shared_material_info != nullptr) {
+            g_original_tmp_set_shared_material(
+                    tmp_after, zh_base_mat, g_tmp_set_shared_material_info);
+        }
+        set_tmp_component_font_material(tmp_after, zh_base_mat);
+    }
+
+    static std::atomic<uint64_t> lyric_init_logs{0};
+    uint64_t n = lyric_init_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 12 || (n % 50 == 0)) {
+        LT_LOGI("BattleLyrics Init n=%llu ctrl=%p tmp=%p srcMat=\"%s\" zhMat=%p(\"%s\") dur=%.2f vocal=%d",
+                static_cast<unsigned long long>(n), instance, tmp_after,
+                src_mat != nullptr && is_unity_object_alive(src_mat) ?
+                        read_unity_object_name(src_mat).c_str() : "-",
+                zh_base_mat,
+                zh_base_mat != nullptr && is_unity_object_alive(zh_base_mat) ?
+                        read_unity_object_name(zh_base_mat).c_str() : "-",
+                duration, vocal_id);
+    }
+}
+
+void replacement_battle_lyrics_create_presentation_material(
+        void *instance, const void *method) {
+    if (g_original_battle_lyrics_create_pres != nullptr) {
+        g_original_battle_lyrics_create_pres(instance, method);
+    }
+    if (!ensure_tmp_font() || g_tmp_font_asset == nullptr) return;
+    static const char *const kPresMatFields[] = {"_presentationMaterial"};
+    static const char *const kTmpFields[] = {"tmp"};
+    void *pres = read_named_object_field(instance, kPresMatFields, 1);
+    void *tmp = read_named_object_field(instance, kTmpFields, 1);
+    if (pres != nullptr && is_special_effect_tmp_material(pres)) {
+        void *calibrated = get_or_create_special_chinese_material(pres, g_tmp_font_asset);
+        if (calibrated != nullptr && calibrated != pres && tmp != nullptr) {
+            if (g_original_tmp_set_shared_material != nullptr &&
+                g_tmp_set_shared_material_info != nullptr) {
+                g_original_tmp_set_shared_material(
+                        tmp, calibrated, g_tmp_set_shared_material_info);
+            }
+            set_tmp_component_font_material(tmp, calibrated);
+        }
+    }
+}
+
+void replacement_battle_lyrics_set_presentation_dot(
+        void *instance, float dot, const void *method) {
+    if (g_original_battle_lyrics_set_dot != nullptr) {
+        g_original_battle_lyrics_set_dot(instance, dot, method);
+    }
+    static const char *const kPresMatFields[] = {"_presentationMaterial"};
+    void *pres = read_named_object_field(instance, kPresMatFields, 1);
+    if (pres != nullptr) {
+        void *clone = find_special_clone_for_source(pres);
+        if (clone != nullptr && is_unity_object_alive(clone)) {
+            InternalMaterialSyncGuard guard;
+            write_material_float_property(clone, "_DotTexels", dot);
+        }
+    }
+}
+
+void replacement_battle_lyrics_reset_presentation_color(
+        void *instance, const void *method) {
+    if (g_original_battle_lyrics_reset_color != nullptr) {
+        g_original_battle_lyrics_reset_color(instance, method);
+    }
+    static const char *const kTmpFields[] = {"tmp"};
+    void *tmp = read_named_object_field(instance, kTmpFields, 1);
+    if (tmp != nullptr && is_unity_object_alive(tmp)) {
+        register_battle_lyric_tmp(tmp);
+        ensure_translated_tmp_material(tmp);
+    }
+}
+
 void replacement_tmp_set_text_string(void *instance, void *managed_text, bool sync_input,
                                      const void *method) {
     g_suppress_tmp_text_submission = false;
@@ -7027,6 +10195,87 @@ void rebuild_package_line_break_index(
             }
         }
     }
+}
+
+void rebuild_line_fragment_index(
+        const std::unordered_map<std::string, std::string> &primary,
+        const std::unordered_map<std::string, std::string> &fallback) {
+    g_line_fragment_index.clear();
+    std::unordered_set<std::string> ambiguous;
+    std::unordered_set<std::string> primary_locked;
+
+    auto register_fragment = [&](const std::string &raw_jp,
+                                 const std::string &zh_part,
+                                 bool is_primary) {
+        if (raw_jp.empty() || zh_part.empty()) return;
+        auto put_key = [&](const std::string &key) {
+            if (key.empty() || count_utf8_codepoints(key) < 4 ||
+                key == zh_part || ambiguous.find(key) != ambiguous.end()) {
+                return;
+            }
+            if (!is_primary && primary_locked.find(key) != primary_locked.end()) {
+                return;
+            }
+            auto existing = g_line_fragment_index.find(key);
+            if (existing == g_line_fragment_index.end()) {
+                g_line_fragment_index.emplace(key, zh_part);
+                if (is_primary) primary_locked.insert(key);
+            } else if (existing->second != zh_part) {
+                g_line_fragment_index.erase(existing);
+                primary_locked.erase(key);
+                ambiguous.insert(key);
+            }
+        };
+        put_key(raw_jp);
+        std::string stripped;
+        bool lead_e = false;
+        bool trail_e = false;
+        strip_fragment_ellipsis_and_space(raw_jp, &stripped, &lead_e, &trail_e);
+        if ((lead_e || trail_e) && stripped != raw_jp) {
+            put_key(stripped);
+        }
+    };
+
+    auto ingest_map = [&](const std::unordered_map<std::string, std::string> &src_map,
+                          bool is_primary) {
+        std::vector<std::string> jp_lines;
+        std::vector<std::string> zh_parts;
+        for (const auto &entry : src_map) {
+            if (entry.first.find('\n') == std::string::npos || entry.second.empty()) {
+                continue;
+            }
+            // 先剥离整段外层 `<color=...>` 等显示标签，防止第 0 行或末行残留半截标签导致纯文本片段失配与字数比例失真。
+            const std::string clean_jp = canonicalize_rich_text_for_lookup(entry.first);
+            const std::string clean_zh = canonicalize_rich_text_for_lookup(entry.second);
+            if (clean_jp.find('\n') == std::string::npos || clean_zh.empty()) {
+                continue;
+            }
+            if (split_translation_into_line_segments(
+                        clean_jp, clean_zh, &jp_lines, &zh_parts)) {
+                const size_t n = jp_lines.size();
+                for (size_t i = 0; i < n; ++i) {
+                    register_fragment(jp_lines[i], zh_parts[i], is_primary);
+                }
+                // 部分演出会从 3 行及以上台词中截取连续子行块合并展示（如第 2~3 行）。
+                if (n >= 3 && n <= 8) {
+                    for (size_t i = 0; i < n; ++i) {
+                        std::string sub_jp = jp_lines[i];
+                        std::string sub_zh = zh_parts[i];
+                        for (size_t j = i + 1; j < n; ++j) {
+                            if (i == 0 && j + 1 == n) continue;
+                            sub_jp.push_back('\n');
+                            sub_jp.append(jp_lines[j]);
+                            sub_zh.push_back('\n');
+                            sub_zh.append(zh_parts[j]);
+                            register_fragment(sub_jp, sub_zh, is_primary);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    ingest_map(primary, true);
+    ingest_map(fallback, false);
 }
 
 bool load_index_file(const char *path) {
@@ -7158,26 +10407,29 @@ bool load_index_file(const char *path) {
         return false;
     }
     g_index.swap(loaded);
-    rebuild_rich_text_canonical_index();
     g_terms.swap(loaded_terms);
     g_fallback_index.swap(loaded_fallback);
     g_context_index.swap(loaded_context);
     g_battle_hint_index.swap(loaded_battle_hint);
     g_keyword_alias_index.swap(loaded_keyword_aliases);
     g_keyword_name_index.swap(loaded_keyword_names);
+    // 需在主表与回退表全部就位后再构建规范化及碎片派生索引。
+    rebuild_rich_text_canonical_index();
     rebuild_package_line_break_index(g_index);
     rebuild_package_line_break_index(g_fallback_index);
+    rebuild_line_fragment_index(g_index, g_fallback_index);
     rebuild_term_trie();
     rebuild_keyword_name_trie();
     LT_LOGI("Loaded Japanese full-text translation index entries=%zu terms=%zu fallback=%zu "
             "context=%zu battleHints=%zu keywordAliases=%zu keywordNames=%zu"
-            " richTextCanonical=%zu lineBreaks=%zu path=%s",
+            " richTextCanonical=%zu lineBreaks=%zu lineFragments=%zu path=%s",
             g_index.size(), g_terms.size(), g_fallback_index.size(),
             g_context_index.size(), g_battle_hint_index.size(),
             g_keyword_alias_index.size(),
             g_keyword_name_index.size(),
             g_rich_text_canonical_index.size(),
-            g_package_line_breaks.size(), path);
+            g_package_line_breaks.size(),
+            g_line_fragment_index.size(), path);
     return true;
 }
 
@@ -7393,6 +10645,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             resolver.resolve<method_get_param_fn>("il2cpp_method_get_param");
     method_get_return_type_fn method_get_return_type =
             resolver.resolve<method_get_return_type_fn>("il2cpp_method_get_return_type");
+    method_get_flags_fn method_get_flags =
+            resolver.resolve<method_get_flags_fn>("il2cpp_method_get_flags");
     type_get_name_fn type_get_name = resolver.resolve<type_get_name_fn>("il2cpp_type_get_name");
     il2cpp_free_fn il2cpp_free = resolver.resolve<il2cpp_free_fn>("il2cpp_free");
     string_length_fn string_length = resolver.resolve<string_length_fn>("il2cpp_string_length");
@@ -7424,6 +10678,20 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             resolver.resolve<field_get_value_fn>("il2cpp_field_get_value");
     field_set_value_fn field_set_value =
             resolver.resolve<field_set_value_fn>("il2cpp_field_set_value");
+    field_static_get_value_fn field_static_get_value =
+            resolver.resolve<field_static_get_value_fn>("il2cpp_field_static_get_value");
+    field_get_flags_fn field_get_flags =
+            resolver.resolve<field_get_flags_fn>("il2cpp_field_get_flags");
+    class_get_type_fn class_get_type =
+            resolver.resolve<class_get_type_fn>("il2cpp_class_get_type");
+    type_get_object_fn type_get_object =
+            resolver.resolve<type_get_object_fn>("il2cpp_type_get_object");
+    class_from_type_fn class_from_type =
+            resolver.resolve<class_from_type_fn>("il2cpp_class_from_type");
+    class_is_valuetype_fn class_is_valuetype =
+            resolver.resolve<class_is_valuetype_fn>("il2cpp_class_is_valuetype");
+    class_is_enum_fn class_is_enum =
+            resolver.resolve<class_is_enum_fn>("il2cpp_class_is_enum");
     if (domain_get == nullptr || domain_get_assemblies == nullptr || assembly_get_image == nullptr ||
         class_from_name == nullptr || class_get_method_from_name == nullptr) {
         LT_LOGW("IL2CPP exports missing domain=%p assemblies=%p image=%p class=%p method=%p",
@@ -7464,7 +10732,16 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
     void *transform_class = nullptr;
     void *rect_transform_class = nullptr;
     void *material_class = nullptr;
+    void *shader_class = nullptr;
+    void *resources_class = nullptr;
     void *tmp_settings_class = nullptr;
+    void *material_ref_mgr_class = nullptr;
+    void *tmp_text_utilities_class = nullptr;
+    void *shader_utilities_class = nullptr;
+    void *battle_lyrics_class = nullptr;
+    void *bgm_lyrics_list_class = nullptr;
+    void *text_mat_setter_class = nullptr;
+    void *battle_effect_mgr_class = nullptr;
     const void *get_language_method = nullptr;
     const void *get_global_language_method = nullptr;
     struct AcquisitionTarget {
@@ -7485,6 +10762,22 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                 if (name != nullptr && strncmp(name, "TextData_", 9) == 0 &&
                     acquisition_classes.insert(klass).second) {
                     acquisition_targets.push_back({name, klass});
+                }
+                if (name != nullptr && strcmp(name, "BattleLyricsContoller") == 0) {
+                    battle_lyrics_class = klass;
+                } else if (name != nullptr && strcmp(name, "BgmLyricsJsonDataList") == 0) {
+                    bgm_lyrics_list_class = klass;
+                } else if (name != nullptr && strcmp(name, "TextMeshProMaterialSetter") == 0) {
+                    text_mat_setter_class = klass;
+                } else if (name != nullptr &&
+                           (strcmp(name, "OutterGradiantEffectController") == 0 ||
+                            strcmp(name, "BattleEffectManager") == 0)) {
+                    if (battle_effect_mgr_class == nullptr ||
+                        (class_get_method_from_name != nullptr &&
+                         class_get_method_from_name(
+                                 klass, "ClearDialogMaterialAccent", 0) != nullptr)) {
+                        battle_effect_mgr_class = klass;
+                    }
                 }
             }
         }
@@ -7546,8 +10839,26 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         if (material_class == nullptr) {
             material_class = class_from_name(image, "UnityEngine", "Material");
         }
+        if (shader_class == nullptr) {
+            shader_class = class_from_name(image, "UnityEngine", "Shader");
+        }
+        if (resources_class == nullptr) {
+            resources_class = class_from_name(image, "UnityEngine", "Resources");
+        }
         if (tmp_settings_class == nullptr) {
             tmp_settings_class = class_from_name(image, "TMPro", "TMP_Settings");
+        }
+        if (material_ref_mgr_class == nullptr) {
+            material_ref_mgr_class =
+                    class_from_name(image, "TMPro", "MaterialReferenceManager");
+        }
+        if (tmp_text_utilities_class == nullptr) {
+            tmp_text_utilities_class =
+                    class_from_name(image, "TMPro", "TMP_TextUtilities");
+        }
+        if (shader_utilities_class == nullptr) {
+            shader_utilities_class =
+                    class_from_name(image, "TMPro", "ShaderUtilities");
         }
         if (get_language_method == nullptr) {
             void *klass = class_from_name(image, "LocalSave", "LocalGameOptionData");
@@ -7858,6 +11169,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             class_get_method_from_name(tmp_text_class, "get_text", 0);
     const void *component_get_game_object_method = component_class == nullptr ? nullptr :
             class_get_method_from_name(component_class, "get_gameObject", 0);
+    const void *component_get_component_type_method = find_method_by_signature(
+            component_class, "GetComponent", "System.Type");
     const void *game_object_get_active_in_hierarchy_method =
             game_object_class == nullptr ? nullptr :
             class_get_method_from_name(
@@ -7924,6 +11237,102 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             material_class, "DisableKeyword", "System.String");
     const void *material_is_keyword_enabled_method = find_method_by_signature(
             material_class, "IsKeywordEnabled", "System.String");
+    const void *material_has_property_method = find_method_by_signature(
+            material_class, "HasProperty", "System.String");
+    const void *material_get_shader_method = material_class == nullptr ? nullptr :
+            class_get_method_from_name(material_class, "get_shader", 0);
+    const void *material_get_vector_method = find_method_by_signature(
+            material_class, "GetVector", "System.String");
+    const void *material_set_vector_method = find_method_by_signature(
+            material_class, "SetVector", "System.String,UnityEngine.Vector4");
+    const void *material_set_float_id_method = find_method_by_signature(
+            material_class, "SetFloat", "System.Int32,System.Single");
+    const void *material_set_color_id_method = find_method_by_signature(
+            material_class, "SetColor", "System.Int32,UnityEngine.Color");
+    const void *material_set_vector_id_method = find_method_by_signature(
+            material_class, "SetVector", "System.Int32,UnityEngine.Vector4");
+    const void *shader_property_to_id_method = find_method_by_signature(
+            shader_class, "PropertyToID", "System.String");
+    const void *object_set_name_method = unity_object_class == nullptr ? nullptr :
+            class_get_method_from_name(unity_object_class, "set_name", 1);
+    const void *resources_load_method = find_method_by_signature(
+            resources_class, "Load", "System.String,System.Type");
+    const void *tmp_get_default_font_asset_path_method = tmp_settings_class == nullptr ? nullptr :
+            class_get_method_from_name(tmp_settings_class, "get_defaultFontAssetPath", 0);
+    const void *material_ref_mgr_get_instance_method = material_ref_mgr_class == nullptr ? nullptr :
+            class_get_method_from_name(material_ref_mgr_class, "get_instance", 0);
+    const void *material_ref_mgr_add_font_mat_method = material_ref_mgr_class == nullptr ? nullptr :
+            find_method_by_signature(
+                    material_ref_mgr_class, "AddFontMaterial",
+                    "System.Int32,UnityEngine.Material");
+    if (material_ref_mgr_add_font_mat_method == nullptr &&
+        material_ref_mgr_class != nullptr) {
+        material_ref_mgr_add_font_mat_method = find_method_by_signature(
+                material_ref_mgr_class, "AddFontMaterialInternal",
+                "System.Int32,UnityEngine.Material");
+    }
+    const void *tmp_get_simple_hash_code_method = tmp_text_utilities_class == nullptr ? nullptr :
+            find_method_by_signature(
+                    tmp_text_utilities_class, "GetSimpleHashCode", "System.String");
+    const void *tmp_get_hash_case_insensitive_method =
+            tmp_text_utilities_class == nullptr ? nullptr :
+            find_method_by_signature(
+                    tmp_text_utilities_class, "GetHashCodeCaseInSensitive", "System.String");
+    const void *tmp_get_simple_hash_lower_method =
+            tmp_text_utilities_class == nullptr ? nullptr :
+            find_method_by_signature(
+                    tmp_text_utilities_class, "GetSimpleHashCodeLowercase", "System.String");
+    const void *shader_utilities_update_ratios_method = shader_utilities_class == nullptr ? nullptr :
+            find_method_by_signature(
+                    shader_utilities_class, "UpdateShaderRatios", "UnityEngine.Material");
+    const void *battle_lyrics_init_method = find_method_by_signature(
+            battle_lyrics_class, "Init",
+            "System.String,System.Single,System.Int32,System.Boolean,System.Int32");
+    const void *battle_lyrics_create_pres_method = battle_lyrics_class == nullptr ? nullptr :
+            class_get_method_from_name(battle_lyrics_class, "CreatePresentationMaterial", 0);
+    const void *battle_lyrics_set_dot_method = battle_lyrics_class == nullptr ? nullptr :
+            class_get_method_from_name(battle_lyrics_class, "SetPresentationDot", 1);
+    const void *battle_lyrics_reset_color_method = battle_lyrics_class == nullptr ? nullptr :
+            class_get_method_from_name(battle_lyrics_class, "ResetPresentationColor", 0);
+    const void *bgm_lyrics_get_data_method = bgm_lyrics_list_class == nullptr ? nullptr :
+            find_method_by_signature(
+                    bgm_lyrics_list_class, "GetLyricsData",
+                    "System.String,System.Int32,System.Int32&");
+    const void *mat_setter_write_props_method = text_mat_setter_class == nullptr ? nullptr :
+            class_get_method_from_name(text_mat_setter_class, "WriteMaterialProperty", 0);
+    const void *mat_setter_write_method = text_mat_setter_class == nullptr ? nullptr :
+            class_get_method_from_name(text_mat_setter_class, "write", 0);
+    const void *mat_setter_reset_method = text_mat_setter_class == nullptr ? nullptr :
+            class_get_method_from_name(text_mat_setter_class, "ResetProperty", 0);
+    const void *mat_setter_reset_material_method = text_mat_setter_class == nullptr ? nullptr :
+            class_get_method_from_name(text_mat_setter_class, "ResetMaterial", 0);
+    const void *mat_setter_clone_method = text_mat_setter_class == nullptr ? nullptr :
+            class_get_method_from_name(text_mat_setter_class, "CloneFontMaterial", 0);
+    const void *battle_effect_clear_accent_method = battle_effect_mgr_class == nullptr ? nullptr :
+            class_get_method_from_name(battle_effect_mgr_class, "ClearDialogMaterialAccent", 0);
+    const void *battle_effect_set_dialog_method = find_method_by_signature(
+            battle_effect_mgr_class, "SetDialog",
+            "System.String,System.Single,System.Boolean");
+    const void *battle_effect_set_dialog_mid_method = find_method_by_signature(
+            battle_effect_mgr_class, "SetDialog_Mid",
+            "System.String,System.Single");
+    const void *battle_effect_set_dialog_upper_method = find_method_by_signature(
+            battle_effect_mgr_class, "SetDialog_Upper",
+            "System.String,System.Single,System.Single");
+    LT_LOGI("Lyrics & SpecialShader APIs battle=%p bgm=%p refMgr=%p/%p hash=%p ratios=%p propToID=%p",
+            battle_lyrics_class, bgm_lyrics_list_class,
+            material_ref_mgr_get_instance_method, material_ref_mgr_add_font_mat_method,
+            tmp_get_simple_hash_code_method, shader_utilities_update_ratios_method,
+            shader_property_to_id_method);
+    LT_LOGI("TextMeshProMaterialSetter APIs class=%p writeProps=%p write=%p reset=%p resetMat=%p clone=%p getComp=%p",
+            text_mat_setter_class, mat_setter_write_props_method,
+            mat_setter_write_method, mat_setter_reset_method,
+            mat_setter_reset_material_method,
+            mat_setter_clone_method, component_get_component_type_method);
+    LT_LOGI("BattleEffectManager APIs class=%p clearAccent=%p setDlg=%p mid=%p upper=%p",
+            battle_effect_mgr_class, battle_effect_clear_accent_method,
+            battle_effect_set_dialog_method, battle_effect_set_dialog_mid_method,
+            battle_effect_set_dialog_upper_method);
     const void *unity_object_instantiate_method = find_method_by_signature(
             unity_object_class, "Instantiate", "UnityEngine.Object");
     const void *get_fallback_fonts_method = tmp_settings_class == nullptr ? nullptr :
@@ -8025,6 +11434,25 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         g_field_get_type = field_get_type;
         g_field_get_value = field_get_value;
         g_field_set_value = field_set_value;
+        g_field_static_get_value = field_static_get_value;
+        g_field_get_flags = field_get_flags;
+        g_class_get_type = class_get_type;
+        g_type_get_object = type_get_object;
+        g_class_from_type = class_from_type;
+        g_class_is_valuetype = class_is_valuetype;
+        g_class_is_enum = class_is_enum;
+        g_method_get_flags = method_get_flags;
+        g_tmp_text_class = tmp_text_class;
+        if (class_get_type != nullptr && type_get_object != nullptr) {
+            if (material_class != nullptr) {
+                const void *t = class_get_type(material_class);
+                if (t != nullptr) g_material_type_object = type_get_object(t);
+            }
+            if (tmp_text_class != nullptr) {
+                const void *t = class_get_type(tmp_text_class);
+                if (t != nullptr) g_tmp_text_type_object = type_get_object(t);
+            }
+        }
         g_type_get_name = type_get_name;
         g_il2cpp_free = il2cpp_free;
         g_create_dynamic_font = reinterpret_cast<create_dynamic_font_fn>(create_dynamic_font_pointer);
@@ -8109,6 +11537,7 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         g_object_get_name_info = object_get_name_method;
         g_component_get_transform_info = component_get_transform_method;
         g_component_get_game_object_info = component_get_game_object_method;
+        g_component_get_component_type_info = component_get_component_type_method;
         g_game_object_get_active_in_hierarchy_info =
                 game_object_get_active_in_hierarchy_method;
         g_transform_get_parent_info = transform_get_parent_method;
@@ -8121,6 +11550,24 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         g_material_enable_keyword_info = material_enable_keyword_method;
         g_material_disable_keyword_info = material_disable_keyword_method;
         g_material_is_keyword_enabled_info = material_is_keyword_enabled_method;
+        g_material_has_property_info = material_has_property_method;
+        g_material_get_shader_info = material_get_shader_method;
+        g_material_get_vector_info = material_get_vector_method;
+        g_material_set_vector_info = material_set_vector_method;
+        g_material_set_float_id_info = material_set_float_id_method;
+        g_material_set_color_id_info = material_set_color_id_method;
+        g_material_set_vector_id_info = material_set_vector_id_method;
+        g_shader_property_to_id_info = shader_property_to_id_method;
+        g_object_set_name_info = object_set_name_method;
+        g_tmp_get_default_font_asset_path_info = tmp_get_default_font_asset_path_method;
+        g_resources_load_info = resources_load_method;
+        g_material_ref_mgr_get_instance_info = material_ref_mgr_get_instance_method;
+        g_material_ref_mgr_add_font_mat_info = material_ref_mgr_add_font_mat_method;
+        g_tmp_get_simple_hash_code_info = tmp_get_simple_hash_code_method;
+        g_tmp_get_hash_case_insensitive_info = tmp_get_hash_case_insensitive_method;
+        g_tmp_get_simple_hash_lower_info = tmp_get_simple_hash_lower_method;
+        g_shader_utilities_update_ratios_info = shader_utilities_update_ratios_method;
+        g_unity_object_class = unity_object_class;
         g_unity_object_instantiate_info = unity_object_instantiate_method;
         MSHookFunction(tmp_pointer, reinterpret_cast<void *>(replacement_tmp_set_text),
                        reinterpret_cast<void **>(&g_original_tmp_set_text));
@@ -8143,6 +11590,49 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             return position != pointers.end() && *position == address &&
                     (position + 1 == pointers.end() || *(position + 1) - address >= 16);
         };
+
+        auto install_optional_hook = [&](void *klass, const void *method_info,
+                                         void *replacement, void **original_out,
+                                         const char *label) {
+            void *pointer = nullptr;
+            if (method_info != nullptr) memcpy(&pointer, method_info, sizeof(pointer));
+            if (klass == nullptr || pointer == nullptr ||
+                !has_inline_hook_space(klass, pointer)) {
+                LT_LOGW("Skip unsafe optional hook %s ptr=%p class=%p",
+                        label, pointer, klass);
+                return;
+            }
+            MSHookFunction(pointer, replacement, original_out);
+            LT_LOGI("Installed optional hook %s ptr=%p orig=%p",
+                    label, pointer, original_out == nullptr ? nullptr : *original_out);
+        };
+        install_optional_hook(
+                battle_lyrics_class, battle_lyrics_init_method,
+                reinterpret_cast<void *>(replacement_battle_lyrics_init),
+                reinterpret_cast<void **>(&g_original_battle_lyrics_init),
+                "BattleLyricsContoller.Init");
+        install_optional_hook(
+                battle_lyrics_class, battle_lyrics_create_pres_method,
+                reinterpret_cast<void *>(
+                        replacement_battle_lyrics_create_presentation_material),
+                reinterpret_cast<void **>(&g_original_battle_lyrics_create_pres),
+                "BattleLyricsContoller.CreatePresentationMaterial");
+        install_optional_hook(
+                battle_lyrics_class, battle_lyrics_set_dot_method,
+                reinterpret_cast<void *>(replacement_battle_lyrics_set_presentation_dot),
+                reinterpret_cast<void **>(&g_original_battle_lyrics_set_dot),
+                "BattleLyricsContoller.SetPresentationDot");
+        install_optional_hook(
+                battle_lyrics_class, battle_lyrics_reset_color_method,
+                reinterpret_cast<void *>(
+                        replacement_battle_lyrics_reset_presentation_color),
+                reinterpret_cast<void **>(&g_original_battle_lyrics_reset_color),
+                "BattleLyricsContoller.ResetPresentationColor");
+        install_optional_hook(
+                bgm_lyrics_list_class, bgm_lyrics_get_data_method,
+                reinterpret_cast<void *>(replacement_bgm_lyrics_get_data),
+                reinterpret_cast<void **>(&g_original_bgm_lyrics_get_data),
+                "BgmLyricsJsonDataList.GetLyricsData");
 
         if (tmp_set_font_pointer != nullptr &&
             has_inline_hook_space(tmp_text_class, tmp_set_font_pointer)) {
@@ -8243,6 +11733,121 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             LT_LOGW("Skip unsafe adjacent Material.SetFloat pointer=%p",
                     material_set_float_pointer);
         }
+        std::unordered_set<void *> hooked_mat_ptrs;
+        if (material_set_color_pointer != nullptr) {
+            hooked_mat_ptrs.insert(material_set_color_pointer);
+        }
+        if (material_set_float_pointer != nullptr) {
+            hooked_mat_ptrs.insert(material_set_float_pointer);
+        }
+        auto install_mat_hook = [&](const void *method_info, void *replacement,
+                                    void **original_out, const char *label) {
+            void *pointer = nullptr;
+            if (method_info != nullptr) memcpy(&pointer, method_info, sizeof(pointer));
+            if (pointer == nullptr || !hooked_mat_ptrs.insert(pointer).second) return;
+            if (!has_inline_hook_space(material_class, pointer)) {
+                LT_LOGW("Skip unsafe adjacent %s pointer=%p", label, pointer);
+                return;
+            }
+            MSHookFunction(pointer, replacement, original_out);
+            LT_LOGI("Installed %s ptr=%p orig=%p",
+                    label, pointer, original_out == nullptr ? nullptr : *original_out);
+        };
+        install_mat_hook(
+                material_set_vector_method,
+                reinterpret_cast<void *>(replacement_material_set_vector),
+                reinterpret_cast<void **>(&g_original_material_set_vector),
+                "Material.SetVector(string)");
+        install_mat_hook(
+                material_set_float_id_method,
+                reinterpret_cast<void *>(replacement_material_set_float_id),
+                reinterpret_cast<void **>(&g_original_material_set_float_id),
+                "Material.SetFloat(int)");
+        install_mat_hook(
+                material_set_color_id_method,
+                reinterpret_cast<void *>(replacement_material_set_color_id),
+                reinterpret_cast<void **>(&g_original_material_set_color_id),
+                "Material.SetColor(int)");
+        install_mat_hook(
+                material_set_vector_id_method,
+                reinterpret_cast<void *>(replacement_material_set_vector_id),
+                reinterpret_cast<void **>(&g_original_material_set_vector_id),
+                "Material.SetVector(int)");
+        install_mat_hook(
+                material_enable_keyword_method,
+                reinterpret_cast<void *>(replacement_material_enable_keyword),
+                reinterpret_cast<void **>(&g_original_material_enable_keyword),
+                "Material.EnableKeyword");
+        install_mat_hook(
+                material_disable_keyword_method,
+                reinterpret_cast<void *>(replacement_material_disable_keyword),
+                reinterpret_cast<void **>(&g_original_material_disable_keyword),
+                "Material.DisableKeyword");
+        std::unordered_set<void *> hooked_setter_ptrs;
+        auto install_setter_hook = [&](const void *method_info, void *replacement,
+                                       void **original_out, const char *label) {
+            void *pointer = nullptr;
+            if (method_info != nullptr) memcpy(&pointer, method_info, sizeof(pointer));
+            if (pointer == nullptr || !hooked_setter_ptrs.insert(pointer).second) return;
+            install_optional_hook(
+                    text_mat_setter_class, method_info, replacement,
+                    original_out, label);
+        };
+        install_setter_hook(
+                mat_setter_write_props_method,
+                reinterpret_cast<void *>(replacement_mat_setter_write_props),
+                reinterpret_cast<void **>(&g_original_mat_setter_write_props),
+                "TextMeshProMaterialSetter.WriteMaterialProperty");
+        install_setter_hook(
+                mat_setter_write_method,
+                reinterpret_cast<void *>(replacement_mat_setter_write),
+                reinterpret_cast<void **>(&g_original_mat_setter_write),
+                "TextMeshProMaterialSetter.write");
+        install_setter_hook(
+                mat_setter_reset_method,
+                reinterpret_cast<void *>(replacement_mat_setter_reset),
+                reinterpret_cast<void **>(&g_original_mat_setter_reset),
+                "TextMeshProMaterialSetter.ResetProperty");
+        install_setter_hook(
+                mat_setter_reset_material_method,
+                reinterpret_cast<void *>(replacement_mat_setter_reset_material),
+                reinterpret_cast<void **>(&g_original_mat_setter_reset_material),
+                "TextMeshProMaterialSetter.ResetMaterial");
+        install_setter_hook(
+                mat_setter_clone_method,
+                reinterpret_cast<void *>(replacement_mat_setter_clone),
+                reinterpret_cast<void **>(&g_original_mat_setter_clone),
+                "TextMeshProMaterialSetter.CloneFontMaterial");
+        std::unordered_set<void *> hooked_battle_effect_ptrs;
+        auto install_battle_effect_hook = [&](const void *method_info, void *replacement,
+                                              void **original_out, const char *label) {
+            void *pointer = nullptr;
+            if (method_info != nullptr) memcpy(&pointer, method_info, sizeof(pointer));
+            if (pointer == nullptr || !hooked_battle_effect_ptrs.insert(pointer).second) return;
+            install_optional_hook(
+                    battle_effect_mgr_class, method_info, replacement,
+                    original_out, label);
+        };
+        install_battle_effect_hook(
+                battle_effect_clear_accent_method,
+                reinterpret_cast<void *>(replacement_battle_effect_clear_accent),
+                reinterpret_cast<void **>(&g_original_battle_effect_clear_accent),
+                "BattleEffectManager.ClearDialogMaterialAccent");
+        install_battle_effect_hook(
+                battle_effect_set_dialog_method,
+                reinterpret_cast<void *>(replacement_battle_effect_set_dialog),
+                reinterpret_cast<void **>(&g_original_battle_effect_set_dialog),
+                "BattleEffectManager.SetDialog");
+        install_battle_effect_hook(
+                battle_effect_set_dialog_mid_method,
+                reinterpret_cast<void *>(replacement_battle_effect_set_dialog_mid),
+                reinterpret_cast<void **>(&g_original_battle_effect_set_dialog_mid),
+                "BattleEffectManager.SetDialog_Mid");
+        install_battle_effect_hook(
+                battle_effect_set_dialog_upper_method,
+                reinterpret_cast<void *>(replacement_battle_effect_set_dialog_upper),
+                reinterpret_cast<void **>(&g_original_battle_effect_set_dialog_upper),
+                "BattleEffectManager.SetDialog_Upper");
         LT_LOGI("TMP vertex and material mutation hooks color=%p/%p"
                 " materialColor=%p/%p materialFloat=%p/%p",
                 text_color_pointer,
@@ -8463,6 +12068,13 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                             g_acquisition2_battle_hint_tables[slot] = battle_hint_table;
                         }
                     }
+                    if (target.name == "TextData_Lyrics") {
+                        if (parameter_count == 1) {
+                            g_acquisition1_is_lyrics[slot] = true;
+                        } else {
+                            g_acquisition2_is_lyrics[slot] = true;
+                        }
+                    }
                     acquisition_pointers.insert(pointer);
                     acquisition_counts[parameter_count]++;
                     LT_LOGI("Text acquisition hook class=%s method=%s argc=%u pointer=%p"
@@ -8642,6 +12254,7 @@ void configure_limbus_translation_runtime(const char *active_index_pointer) {
     g_keyword_alias_index.clear();
     g_keyword_name_index.clear();
     g_package_line_breaks.clear();
+    g_line_fragment_index.clear();
     g_term_trie.clear();
     g_keyword_name_trie.clear();
     bool index_loaded = load_active_index();
