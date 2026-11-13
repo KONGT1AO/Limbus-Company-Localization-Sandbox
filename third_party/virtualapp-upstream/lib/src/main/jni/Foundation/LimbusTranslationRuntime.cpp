@@ -238,6 +238,9 @@ std::atomic<uint64_t> g_egogift_name_diagnostics{0};
 std::atomic<uint64_t> g_fallback_primary_promotions{0};
 std::atomic<uint64_t> g_tmp_font_reset_blocks{0};
 std::atomic<uint64_t> g_skill_title_cache_actions{0};
+std::atomic<uint64_t> g_preserved_source_color_count{0};
+std::atomic<uint64_t> g_wedge_outis_skill_fixes{0};
+std::atomic<int64_t> g_last_wedge_office_context_ns{0};
 struct SkillTitleCacheEntry {
     uintptr_t instance_weak_handle = 0;
     std::string full_text;
@@ -3312,11 +3315,61 @@ bool translate_exact_ui_text(const std::string &source, std::string *translation
             {"連携解除", "解除绑定"},
             {"オン", "开启"},
             {"オフ", "关闭"},
+            // 第10章末尾演出将 S1042B 默尔索独白拆分为独立短语依次显示，
+            // 官方日文表与汉化包均未单独收录切片词条；按 S1042B 汉化包原文精确对应。
+            {"記憶か", "记忆"},
+            {"経験か", "还是经验呢"},
+            {"そのどちらでもない", "二者都不是"},
+            {"そのどちらでもない。", "二者都不是"},
+            {"どちらでもない", "二者都不是"},
+            {"どちらでもない。", "二者都不是"},
     };
     auto match = overrides.find(source);
-    if (match == overrides.end()) return false;
-    *translation = match->second;
-    return true;
+    if (match != overrides.end()) {
+        *translation = match->second;
+        return true;
+    }
+    // 部分剧情/演出短语（如第10章末尾独白）可能带外层单色标签 <color=#293b95>...</color>，
+    // 剥离最外层成对富文本标签后再精确查表，并在命中时保留原外层样式标签。
+    size_t prefix_len = 0;
+    size_t suffix_len = 0;
+    while (source.size() > prefix_len + suffix_len &&
+           source[prefix_len] == '<' &&
+           source[source.size() - suffix_len - 1] == '>') {
+        const size_t open_end = source.find('>', prefix_len + 1);
+        const size_t tail_end = source.size() - suffix_len;
+        const size_t close_start = source.rfind("</", tail_end - 1);
+        if (open_end == std::string::npos || close_start == std::string::npos ||
+            open_end >= close_start) {
+            break;
+        }
+        // 提取开标签名（遇到 '=' 或 '>' 结束）并校验与最外层闭标签名一致。
+        size_t name_end = prefix_len + 1;
+        while (name_end < open_end && source[name_end] != '=' &&
+               source[name_end] != ' ' && source[name_end] != '>') {
+            ++name_end;
+        }
+        const size_t tag_name_len = name_end - (prefix_len + 1);
+        if (tag_name_len == 0 ||
+            tail_end - (close_start + 2) - 1 != tag_name_len ||
+            source.compare(prefix_len + 1, tag_name_len, source, close_start + 2, tag_name_len) != 0) {
+            break;
+        }
+        prefix_len = open_end + 1;
+        suffix_len += (tail_end - close_start);
+    }
+    if (prefix_len > 0 && source.size() > prefix_len + suffix_len) {
+        const std::string inner = source.substr(prefix_len, source.size() - prefix_len - suffix_len);
+        if (inner.find('<') == std::string::npos) {
+            auto inner_match = overrides.find(inner);
+            if (inner_match != overrides.end()) {
+                *translation = source.substr(0, prefix_len) + inner_match->second +
+                               source.substr(source.size() - suffix_len);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool is_display_string_field(const char *name) {
@@ -3798,7 +3851,7 @@ void clear_tmp_font_fallback_table(void *asset);
 void prepend_tmp_font_fallback(void *asset, void *chinese_font);
 bool is_mirror_dungeon_gift_or_shop_name(const std::string &component_name,
                                          const std::string &parent_name);
-bool should_preserve_mirror_dungeon_source_color(
+bool should_preserve_source_material_color(
         void *instance, const TmpComponentState &state,
         const std::string &component_name, const std::string &parent_name);
 bool is_battle_winrate_control(
@@ -6704,7 +6757,7 @@ void sync_translated_tmp_materials(void *instance, bool force = false) {
             is_top_battle_state_control(component_name, parent_name);
     const bool bottom_status =
             is_bottom_battle_status_control(component_name, parent_name);
-    const bool preserve_source_color = should_preserve_mirror_dungeon_source_color(
+    const bool preserve_source_color = should_preserve_source_material_color(
             instance, state, component_name, parent_name);
     if (top_status) {
         restore_tmp_visual_colors(instance, state);
@@ -7122,7 +7175,7 @@ bool is_mirror_dungeon_gift_or_shop_name(const std::string &component_name,
     return false;
 }
 
-bool should_preserve_mirror_dungeon_source_color(
+bool should_preserve_source_material_color(
         void *instance, const TmpComponentState &state,
         const std::string &component_name, const std::string &parent_name) {
     const MaterialVisualStyle &style = state.source_material_style;
@@ -7139,17 +7192,20 @@ bool should_preserve_mirror_dungeon_source_color(
     if (!non_white) return false;
 
     if (!is_unity_object_alive(instance)) return false;
-    auto is_mirror_dungeon = [](const std::string &name) {
-        return name.find("MirrorDungeon") != std::string::npos;
-    };
-    if (is_mirror_dungeon(component_name) || is_mirror_dungeon(parent_name)) {
-        return true;
+    if (is_mirror_dungeon_reward_control(component_name, parent_name)) {
+        return false;
     }
-    const std::vector<std::string> ancestors =
-            read_unity_ancestor_names(instance, 12);
-    return std::any_of(
-            ancestors.begin(), ancestors.end(),
-            [&](const std::string &name) { return is_mirror_dungeon(name); });
+    uint64_t count = g_preserved_source_color_count.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (count <= 40 || count % 100 == 0) {
+        LT_LOGI("TMP preserved source material color count=%llu instance=%p name=%s parent=%s"
+                " face=(%.3f,%.3f,%.3f,%.3f)",
+                static_cast<unsigned long long>(count), instance,
+                component_name.c_str(), parent_name.c_str(),
+                style.face_color[0], style.face_color[1],
+                style.face_color[2], style.face_color[3]);
+    }
+    return true;
 }
 
 bool is_battle_skill_banner_control(const std::string &component_name,
@@ -7396,7 +7452,7 @@ void *ensure_translated_tmp_material(void *instance) {
             is_top_battle_state_control(component_name, parent_name);
     const bool bottom_status =
             is_bottom_battle_status_control(component_name, parent_name);
-    const bool preserve_source_color = should_preserve_mirror_dungeon_source_color(
+    const bool preserve_source_color = should_preserve_source_material_color(
             instance, state, component_name, parent_name);
     if (top_status) {
         restore_tmp_visual_colors(instance, state);
@@ -8940,6 +8996,50 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                     }
                 }
             }
+            std::string rep_text_for_check;
+            int32_t rep_len = (replacement != nullptr && g_string_length != nullptr) ?
+                    g_string_length(replacement) : 0;
+            if (rep_len > 0 && rep_len <= 32 && g_string_chars != nullptr) {
+                utf16_to_utf8(g_string_chars(replacement), rep_len, &rep_text_for_check);
+            }
+            if (source == "貫く" || source == "穿刺" || rep_text_for_check == "穿刺") {
+                int64_t now_ns = monotonic_time_ns();
+                int64_t last_wedge_ns =
+                        g_last_wedge_office_context_ns.load(std::memory_order_relaxed);
+                if (last_wedge_ns > 0 && (now_ns - last_wedge_ns) <= 15000000000LL) {
+                    std::string c_name = read_unity_object_name(instance);
+                    std::string p_name = read_unity_parent_name(instance);
+                    std::vector<std::string> ancestors = read_unity_ancestor_names(instance, 8);
+                    bool is_skill = is_battle_skill_banner_control(c_name, p_name) ||
+                            c_name.find("Skill") != std::string::npos ||
+                            c_name.find("Name") != std::string::npos ||
+                            c_name.find("Title") != std::string::npos ||
+                            p_name.find("Skill") != std::string::npos ||
+                            p_name.find("Info") != std::string::npos ||
+                            std::any_of(ancestors.begin(), ancestors.end(),
+                                    [](const std::string &a) {
+                                        return a.find("Skill") != std::string::npos ||
+                                               a.find("Popup") != std::string::npos;
+                                    });
+                    if (is_skill) {
+                        void *corrected = new_managed_string("贯穿");
+                        if (corrected != nullptr && remember_translation_owned_string(corrected)) {
+                            replacement = corrected;
+                            pthread_mutex_lock(&g_font_state_lock);
+                            g_translated_managed_texts.insert("贯穿");
+                            pthread_mutex_unlock(&g_font_state_lock);
+                            uint64_t fixes = g_wedge_outis_skill_fixes.fetch_add(
+                                    1, std::memory_order_relaxed) + 1;
+                            if (fixes <= 30 || fixes % 100 == 0) {
+                                LT_LOGI("Corrected skill name from 穿刺 to 贯穿 for Wedge Office Outis fixes=%llu"
+                                        " instance=%p name=%s parent=%s source=%s",
+                                        static_cast<unsigned long long>(fixes), instance,
+                                        c_name.c_str(), p_name.c_str(), source.c_str());
+                            }
+                        }
+                    }
+                }
+            }
             if (replacement != managed_text && !ensure_tmp_font()) {
                 return managed_text;
             }
@@ -8948,6 +9048,17 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
             int32_t display_length = g_string_length(replacement);
             if (display_length >= 0 && display_length <= 1024 * 1024) {
                 utf16_to_utf8(g_string_chars(replacement), display_length, &display_text);
+            }
+            if (display_text.find("楔子事务所") != std::string::npos ||
+                source.find("楔子事务所") != std::string::npos ||
+                source.find("WedgeOffice") != std::string::npos ||
+                source.find("ComboWedgeDawn") != std::string::npos) {
+                g_last_wedge_office_context_ns.store(
+                        monotonic_time_ns(), std::memory_order_relaxed);
+            } else if (display_text.find("W公司") != std::string::npos ||
+                       display_text.find("整理要员") != std::string::npos ||
+                       display_text.find("整理要員") != std::string::npos) {
+                g_last_wedge_office_context_ns.store(0, std::memory_order_relaxed);
             }
             void *current_font = g_tmp_get_font == nullptr ? nullptr :
                     g_tmp_get_font(instance, g_tmp_get_font_info);

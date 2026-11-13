@@ -20,7 +20,7 @@ android {
         applicationId = "io.limbuspe.box"
         minSdk = 26
         targetSdk = 35
-        versionCode = 255
+        versionCode = 260
         versionName = "1.0.5"
 
         ndk {
