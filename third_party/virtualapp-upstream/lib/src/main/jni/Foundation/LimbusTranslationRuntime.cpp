@@ -326,6 +326,11 @@ typedef void *(*class_from_type_fn)(const void *);
 typedef bool (*class_is_valuetype_fn)(void *);
 typedef bool (*class_is_enum_fn)(void *);
 typedef uint32_t (*method_get_flags_fn)(const void *, uint32_t *);
+typedef const char *(*class_get_name_global_fn)(void *);
+typedef const void *(*class_get_methods_global_fn)(void *, void **);
+typedef uint32_t (*method_get_param_count_global_fn)(const void *);
+typedef const void *(*method_get_param_global_fn)(const void *, uint32_t);
+typedef const void *(*method_get_return_type_global_fn)(const void *);
 typedef void (*battle_lyrics_init_fn)(void *, void *, float, int32_t, bool, int32_t, const void *);
 typedef void (*battle_lyrics_dot_fn)(void *, float, const void *);
 typedef void (*battle_lyrics_void_fn)(void *, const void *);
@@ -336,6 +341,9 @@ typedef void (*battle_effect_void_fn)(void *, const void *);
 typedef void (*battle_effect_set_dialog_fn)(void *, void *, float, bool, const void *);
 typedef void (*battle_effect_set_dialog_mid_fn)(void *, void *, float, const void *);
 typedef void (*battle_effect_set_dialog_upper_fn)(void *, void *, float, float, const void *);
+typedef void (*il2cpp_void_method0_fn)(void *, const void *);
+typedef void (*il2cpp_void_method1_fn)(void *, void *, const void *);
+typedef void *(*il2cpp_obj_method0_fn)(void *, const void *);
 
 string_length_fn g_string_length = nullptr;
 string_chars_fn g_string_chars = nullptr;
@@ -525,6 +533,36 @@ il2cpp_free_owned_fn g_il2cpp_free = nullptr;
 std::atomic<uint32_t> g_language_hook_hits{0};
 std::atomic<uint64_t> g_acquisition_hits{0};
 std::atomic<uint64_t> g_battle_hint_id_hits{0};
+std::atomic<uint64_t> g_battle_hint_random_hits{0};
+pthread_mutex_t g_battle_hint_sync_lock = PTHREAD_MUTEX_INITIALIZER;
+void *g_text_data_set_class = nullptr;
+void *g_text_data_manager_class = nullptr;
+void *g_last_text_data_set = nullptr;
+void *g_battle_hint_list_instance = nullptr;
+void *g_normal_battle_hint_list_instance = nullptr;
+void *g_ab_battle_hint_list_instance = nullptr;
+std::atomic<bool> g_json_data_list_random_hook_attempted{false};
+il2cpp_void_method0_fn g_original_text_data_set_load_local0 = nullptr;
+il2cpp_void_method1_fn g_original_text_data_set_load_local1 = nullptr;
+il2cpp_void_method0_fn g_original_text_data_set_load_remote0 = nullptr;
+il2cpp_void_method1_fn g_original_text_data_set_load_remote1 = nullptr;
+il2cpp_obj_method0_fn g_original_text_data_set_get_battle_hint = nullptr;
+il2cpp_obj_method0_fn g_original_text_data_set_get_normal_battle_hint = nullptr;
+il2cpp_obj_method0_fn g_original_text_data_set_get_ab_battle_hint = nullptr;
+il2cpp_void_method0_fn g_original_loading_set_hint_text0 = nullptr;
+il2cpp_void_method1_fn g_original_loading_set_hint_text1 = nullptr;
+il2cpp_void_method0_fn g_original_apply_battle_hints0 = nullptr;
+il2cpp_void_method1_fn g_original_apply_battle_hints1 = nullptr;
+il2cpp_obj_method0_fn g_original_json_data_list_get_random_text = nullptr;
+const void *g_text_data_set_get_battle_hint_info = nullptr;
+const void *g_text_data_set_get_normal_hint_info = nullptr;
+const void *g_text_data_set_get_ab_hint_info = nullptr;
+std::unordered_set<std::string> g_logged_battle_hint_syncs;
+class_get_name_global_fn g_class_get_name = nullptr;
+class_get_methods_global_fn g_class_get_methods = nullptr;
+method_get_param_count_global_fn g_method_get_param_count = nullptr;
+method_get_param_global_fn g_method_get_param = nullptr;
+method_get_return_type_global_fn g_method_get_return_type = nullptr;
 std::atomic<uint64_t> g_nested_list_hits{0};
 std::atomic<uint64_t> g_tmp_primary_font_switches{0};
 std::atomic<uint64_t> g_ui_primary_font_switches{0};
@@ -1828,27 +1866,35 @@ std::string apply_dante_line_height(const std::string &translation) {
 }
 
 std::string apply_uniform_line_height(const std::string &text, int32_t percentage) {
-    std::string output;
-    output.reserve(text.size() + 96);
-    std::string line_height_tag = "<line-height=" + std::to_string(percentage) + "%>\n";
-    for (char character : text) {
-        if (character != '\n') {
-            output.push_back(character);
-            continue;
-        }
-        // TMP 在换行符前读取当前 line-height；换行后立即恢复 100%，避免标签
-        // 继续影响同一组件之外的自动布局计算。
-        output += line_height_tag;
-        output += "<line-height=100%>";
+    if (text.empty() || text.find("<line-height=") != std::string::npos) {
+        return text;
     }
+    // 从文本起点开启统一行高且不在中途重置为 100%，确保显式换行与 TMP 自动折行
+    // （如未预料的超宽词条）均遵守同一行距，彻底杜绝负 lineSpacing 控件上下行重叠。
+    std::string output;
+    output.reserve(text.size() + 24);
+    output += "<line-height=";
+    output += std::to_string(percentage);
+    output += "%>";
+    output += text;
     return output;
 }
 
 float personality_title_character_width(uint32_t codepoint) {
-    // 拉丁字母、数字与标点在当前中文字体中的实际宽度明显小于一个汉字；
-    // 用近似字宽而不是字节数计算，避免把 LCA、E.G.O 等缩写过度拆行。
-    if (codepoint == ' ') return 0.35f;
-    if (codepoint <= 0x7f) return 0.55f;
+    // 按更纱黑体实际渲染占位估算：汉字=1.0，大写拉丁约0.62，小写/数字约0.52，
+    // 西里尔字母约0.60，空格约0.30，窄标点(.:-·：)约0.32。
+    if (codepoint == ' ') return 0.30f;
+    if (codepoint == '.' || codepoint == ':' || codepoint == '-' ||
+        codepoint == 0x00b7 /* · */ || codepoint == 0xff1a /* ： */) {
+        return 0.32f;
+    }
+    if (codepoint >= 'A' && codepoint <= 'Z') return 0.62f;
+    if ((codepoint >= 'a' && codepoint <= 'z') ||
+        (codepoint >= '0' && codepoint <= '9')) {
+        return 0.52f;
+    }
+    if (codepoint <= 0x7f) return 0.50f;
+    if (codepoint >= 0x0400 && codepoint <= 0x04ff) return 0.60f;
     return 1.0f;
 }
 
@@ -1885,14 +1931,46 @@ uint32_t first_utf8_codepoint(const std::string &text) {
     return bytes[0];
 }
 
-std::vector<std::string> wrap_personality_title_line(const std::string &line,
-                                                     float maximum_width) {
+float measure_personality_title_width(const std::string &line) {
     float total_width = 0.0f;
     for (const std::string &codepoint : split_utf8_codepoints(line)) {
         total_width += personality_title_character_width(first_utf8_codepoint(codepoint));
     }
-    // 汉化包分行拥有最高优先级：未超宽的原始行原样保留；超宽但没有空格的行
-    // 也不按汉字硬拆，避免运行时自行改变译者确定的名称结构。
+    return total_width;
+}
+
+std::string trim_ascii_spaces(const std::string &text) {
+    size_t start = 0;
+    while (start < text.size() && text[start] == ' ') ++start;
+    size_t end = text.size();
+    while (end > start && text[end - 1] == ' ') --end;
+    return text.substr(start, end - start);
+}
+
+constexpr float kPersonalityCardSingleLineMaxWidth = 6.30f;
+constexpr float kPersonalityCardTargetFitWidth = 6.20f;
+constexpr float kPersonalityCardSpaceSplitThreshold = 8.00f;
+
+std::vector<std::string> wrap_personality_title_line(const std::string &line,
+                                                     float maximum_width) {
+    if (line.find("<size=") != std::string::npos ||
+        line.find("<line-height=") != std::string::npos) {
+        return {line};
+    }
+    float total_width = measure_personality_title_width(line);
+    // 中英混排前缀（如「脑叶公司E.G.O::」）在超宽且无空格时，于 E.G.O 前自然断行，
+    // 保持标准字号并排成工整三行（脑叶公司 / E.G.O:: / 人格名）。
+    const size_t ego_pos = line.find("E.G.O");
+    if (ego_pos != std::string::npos && ego_pos > 0 && line[ego_pos - 1] != ' ' &&
+        total_width > kPersonalityCardSingleLineMaxWidth) {
+        std::string left = trim_ascii_spaces(line.substr(0, ego_pos));
+        std::string right = trim_ascii_spaces(line.substr(ego_pos));
+        if (!left.empty() && !right.empty()) {
+            return {left, right};
+        }
+    }
+    // 汉化包分行拥有最高优先级：仅当超长多词行超过拆分阈值且含空格时在空格处拆行，
+    // 避免将两行临界词条（如「黑派 3F 广播室」）强行拆成三行或拆断汉字。
     if (total_width <= maximum_width || line.find(' ') == std::string::npos) {
         return {line};
     }
@@ -1928,6 +2006,23 @@ std::vector<std::string> wrap_personality_title_line(const std::string &line,
     return result;
 }
 
+std::string fit_personality_title_segment_width(const std::string &segment) {
+    if (segment.empty() || segment.find("<size=") != std::string::npos) {
+        return segment;
+    }
+    const float segment_width = measure_personality_title_width(segment);
+    if (segment_width <= kPersonalityCardSingleLineMaxWidth) {
+        return segment;
+    }
+    // 拆分后仍略超 230px 卡宽的行（如「瓦吉特 先锋三队」「清扫人员 - CCA」），
+    // 对该行按比例做轻量微缩，防止掉出孤立单字或挤成四行。
+    int32_t percentage = static_cast<int32_t>(
+            (kPersonalityCardTargetFitWidth / segment_width) * 100.0f);
+    if (percentage < 75) percentage = 75;
+    if (percentage > 95) percentage = 95;
+    return "<size=" + std::to_string(percentage) + "%>" + segment + "</size>";
+}
+
 std::string reflow_personality_title(const std::string &text, size_t *line_count) {
     std::vector<std::string> lines;
     size_t start = 0;
@@ -1935,9 +2030,13 @@ std::string reflow_personality_title(const std::string &text, size_t *line_count
         size_t end = text.find('\n', start);
         std::string line = text.substr(start, end == std::string::npos ?
                 std::string::npos : end - start);
-        // 230 宽、35 字号的人格卡可稳定容纳约 8.4 个等宽汉字；优先在包内空格处断行。
-        std::vector<std::string> wrapped = wrap_personality_title_line(line, 8.4f);
-        lines.insert(lines.end(), wrapped.begin(), wrapped.end());
+        // 先按 E.G.O 边界与多词上限（8.0f）拆分，再对仍超出实机单行极限（6.3f）的
+        // 完整词组行包裹局部 <size=XX%> 微缩，确保既不断词也不溢出。
+        std::vector<std::string> wrapped =
+                wrap_personality_title_line(line, kPersonalityCardSpaceSplitThreshold);
+        for (const std::string &segment : wrapped) {
+            lines.push_back(fit_personality_title_segment_width(segment));
+        }
         if (end == std::string::npos) break;
         start = end + 1;
     }
@@ -3159,6 +3258,32 @@ void *translate_managed_string(
     return replacement == nullptr ? managed_text : replacement;
 }
 
+/** 按资源表和稳定数字 ID 查找小贴士译文，供方法挂钩与 JsonDataList 集合同步共用。 */
+bool lookup_battle_hint_translation_by_id(
+        const std::string &table, const std::string &raw_id, std::string *out_translation) {
+    if (table.empty() || raw_id.empty() || g_battle_hint_index.empty()) return false;
+    size_t start = 0;
+    size_t end = raw_id.size();
+    while (start < end && isspace(static_cast<unsigned char>(raw_id[start]))) ++start;
+    while (end > start && isspace(static_cast<unsigned char>(raw_id[end - 1]))) --end;
+    if (start >= end) return false;
+    const std::string id = raw_id.substr(start, end - start);
+    auto match = g_battle_hint_index.find(table + '\x1f' + id);
+    if (match == g_battle_hint_index.end() || !is_usable_display_text(match->second)) {
+        return false;
+    }
+    if (out_translation != nullptr) *out_translation = match->second;
+    return true;
+}
+
+void register_battle_hint_translated_string(const std::string &translated) {
+    if (translated.empty()) return;
+    remember_formatter_translation(translated);
+    pthread_mutex_lock(&g_font_state_lock);
+    g_translated_managed_texts.insert(translated);
+    pthread_mutex_unlock(&g_font_state_lock);
+}
+
 /** 用 BattleHint 资源表和稳定数字 ID 接管游戏仍未更新的旧版小贴士文案。 */
 void *translate_battle_hint_by_id(
         const std::string &table, void *managed_id, void *managed_text) {
@@ -3169,28 +3294,23 @@ void *translate_battle_hint_by_id(
     // acquisition1 is hooked directly on the IL2CPP instance method, so the
     // second ABI slot carries the integer value itself rather than an address.
     int32_t id = static_cast<int32_t>(reinterpret_cast<intptr_t>(managed_id));
-    const std::string key = table + '\x1f' + std::to_string(id);
+    std::string translated;
     const bool probe_id = id == 7;
-    auto match = g_battle_hint_index.find(key);
-    if (match == g_battle_hint_index.end() ||
-        !is_usable_display_text(match->second)) {
+    if (!lookup_battle_hint_translation_by_id(table, std::to_string(id), &translated)) {
         if (probe_id) {
             LT_LOGI("BattleHint ID probe table=%s id=%d lookup=miss",
                     table.c_str(), id);
         }
         return nullptr;
     }
-    void *replacement = new_managed_string(match->second);
+    void *replacement = new_managed_string(translated);
     if (replacement == nullptr || !remember_translation_owned_string(replacement)) {
         return nullptr;
     }
-    remember_formatter_translation(match->second);
-    pthread_mutex_lock(&g_font_state_lock);
-    g_translated_managed_texts.insert(match->second);
-    pthread_mutex_unlock(&g_font_state_lock);
+    register_battle_hint_translated_string(translated);
     if (probe_id) {
         LT_LOGI("BattleHint ID probe table=%s id=%d lookup=hit resultChars=%zu result=%s",
-                table.c_str(), id, match->second.size(), match->second.c_str());
+                table.c_str(), id, translated.size(), translated.c_str());
     }
     uint64_t hits = g_battle_hint_id_hits.fetch_add(1, std::memory_order_relaxed) + 1;
     if (hits == 1 || hits % 100 == 0) {
@@ -3396,17 +3516,68 @@ bool is_display_string_field(const char *name) {
     return false;
 }
 
+// 兼容 C# 私有字段（如 _name、_levelList）与自动属性支持字段（如 <Name>k__BackingField），
+// 还原为与 JSON 字段名及 g_context_index 键一致的规范字段名。
+std::string canonical_reflection_field_name(const char *raw_name) {
+    if (raw_name == nullptr || raw_name[0] == '\0') return {};
+    std::string name(raw_name);
+    static const char kBackingSuffix[] = ">k__BackingField";
+    const size_t suffix_len = sizeof(kBackingSuffix) - 1;
+    if (name.size() > suffix_len + 1 && name[0] == '<' &&
+        name.compare(name.size() - suffix_len, suffix_len, kBackingSuffix) == 0) {
+        name = name.substr(1, name.size() - suffix_len - 1);
+        if (!name.empty() && name != "ID") {
+            name[0] = static_cast<char>(tolower(static_cast<unsigned char>(name[0])));
+        }
+    } else if (name.size() > 1 && name[0] == '_') {
+        name.erase(0, 1);
+    }
+    return name;
+}
+
+bool read_identity_field_string(void *instance, const void *field, std::string *out) {
+    if (instance == nullptr || field == nullptr || out == nullptr ||
+        g_field_get_type == nullptr || g_field_get_value == nullptr ||
+        g_type_get_name == nullptr || g_il2cpp_free == nullptr) {
+        return false;
+    }
+    char *type_name = g_type_get_name(g_field_get_type(field));
+    std::string value;
+    if (type_name != nullptr && strcmp(type_name, "System.String") == 0) {
+        void *object = nullptr;
+        g_field_get_value(instance, field, &object);
+        if (object != nullptr && g_string_length != nullptr && g_string_chars != nullptr) {
+            int32_t length = g_string_length(object);
+            if (length >= 0 && length <= 160) {
+                utf16_to_utf8(g_string_chars(object), length, &value);
+            }
+        }
+    } else if (type_name != nullptr && strcmp(type_name, "System.Int32") == 0) {
+        int32_t number = 0;
+        g_field_get_value(instance, field, &number);
+        value = std::to_string(number);
+    } else if (type_name != nullptr && strcmp(type_name, "System.Int64") == 0) {
+        int64_t number = 0;
+        g_field_get_value(instance, field, &number);
+        value = std::to_string(number);
+    }
+    if (type_name != nullptr) g_il2cpp_free(type_name);
+    if (value.empty() || value.size() > 160) return false;
+    *out = std::move(value);
+    return true;
+}
+
 std::string read_object_stable_identity(void *instance) {
     if (instance == nullptr || g_object_get_class == nullptr ||
         g_class_get_parent == nullptr || g_class_get_fields == nullptr ||
-        g_field_get_name == nullptr || g_field_get_type == nullptr ||
-        g_field_get_value == nullptr || g_type_get_name == nullptr ||
-        g_il2cpp_free == nullptr) {
+        g_field_get_name == nullptr) {
         return {};
     }
-    static const char *const identity_fields[] = {
-            "id", "ID", "key", "originalId", "index", "idx", "level"
+    static const char *const canonical_identities[] = {
+            "id", "key", "originalId", "index", "idx", "level"
     };
+    int best_rank = 99;
+    std::string best_identity;
     for (void *klass = g_object_get_class(instance); klass != nullptr;
          klass = g_class_get_parent(klass)) {
         void *iterator = nullptr;
@@ -3414,34 +3585,57 @@ std::string read_object_stable_identity(void *instance) {
         while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
             const char *field_name = g_field_get_name(field);
             if (field_name == nullptr) continue;
-            bool known_identity = std::any_of(
-                    std::begin(identity_fields), std::end(identity_fields),
-                    [&](const char *candidate) { return strcmp(field_name, candidate) == 0; });
-            if (!known_identity) continue;
-            char *type_name = g_type_get_name(g_field_get_type(field));
-            std::string value;
-            if (type_name != nullptr && strcmp(type_name, "System.String") == 0) {
-                void *object = nullptr;
-                g_field_get_value(instance, field, &object);
-                if (object != nullptr && g_string_length != nullptr && g_string_chars != nullptr) {
-                    int32_t length = g_string_length(object);
-                    if (length >= 0 && length <= 160) {
-                        utf16_to_utf8(g_string_chars(object), length, &value);
-                    }
+            std::string canonical = canonical_reflection_field_name(field_name);
+            if (canonical == "ID" || canonical == "Id") canonical = "id";
+            int rank = -1;
+            for (int i = 0; i < 6; ++i) {
+                if (canonical == canonical_identities[i]) {
+                    rank = i;
+                    break;
                 }
-            } else if (type_name != nullptr && strcmp(type_name, "System.Int32") == 0) {
-                int32_t number = 0;
-                g_field_get_value(instance, field, &number);
-                value = std::to_string(number);
-            } else if (type_name != nullptr && strcmp(type_name, "System.Int64") == 0) {
-                int64_t number = 0;
-                g_field_get_value(instance, field, &number);
-                value = std::to_string(number);
             }
+            if (rank < 0 || rank >= best_rank) continue;
+            std::string value;
+            if (read_identity_field_string(instance, field, &value)) {
+                best_rank = rank;
+                best_identity = canonical + "=" + value;
+                if (best_rank == 0) return best_identity;
+            }
+        }
+    }
+    return best_identity;
+}
+
+std::string read_instance_string_field_by_canonical_name(void *instance, const char *target_name) {
+    if (instance == nullptr || target_name == nullptr || g_object_get_class == nullptr ||
+        g_class_get_parent == nullptr || g_class_get_fields == nullptr ||
+        g_field_get_name == nullptr || g_field_get_type == nullptr ||
+        g_field_get_value == nullptr || g_type_get_name == nullptr ||
+        g_il2cpp_free == nullptr) {
+        return {};
+    }
+    for (void *klass = g_object_get_class(instance); klass != nullptr;
+         klass = g_class_get_parent(klass)) {
+        void *iterator = nullptr;
+        const void *field = nullptr;
+        while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
+            const char *field_name = g_field_get_name(field);
+            if (field_name == nullptr) continue;
+            if (canonical_reflection_field_name(field_name) != target_name) continue;
+            char *type_name = g_type_get_name(g_field_get_type(field));
+            bool is_string = type_name != nullptr && strcmp(type_name, "System.String") == 0;
             if (type_name != nullptr) g_il2cpp_free(type_name);
-            if (!value.empty() && value.size() <= 160) {
-                return std::string(field_name) + "=" + value;
+            if (!is_string) continue;
+            void *value = nullptr;
+            g_field_get_value(instance, field, &value);
+            if (value == nullptr || g_string_length == nullptr || g_string_chars == nullptr) {
+                return {};
             }
+            int32_t length = g_string_length(value);
+            if (length <= 0 || length > 16384) return {};
+            std::string utf8;
+            if (utf16_to_utf8(g_string_chars(value), length, &utf8)) return utf8;
+            return {};
         }
     }
     return {};
@@ -3518,21 +3712,43 @@ void translate_string_collection_elements(void *collection, const std::string &c
     }
 }
 
-void translate_object_string_fields(void *instance) {
+std::string read_managed_string_value(void *managed_text);
+
+void translate_object_string_fields(
+        void *instance, const std::string &inherited_identity = std::string()) {
     if (instance == nullptr || g_object_get_class == nullptr || g_class_get_parent == nullptr ||
         g_class_get_fields == nullptr || g_field_get_name == nullptr ||
         g_field_get_type == nullptr || g_field_get_value == nullptr ||
         g_field_set_value == nullptr || g_type_get_name == nullptr || g_il2cpp_free == nullptr) {
         return;
     }
-    const std::string identity = read_object_stable_identity(instance);
+    const std::string own_identity = read_object_stable_identity(instance);
+    std::string identity = !inherited_identity.empty() ? inherited_identity : own_identity;
+    // 若直接从子对象（如 TextData_SkillPerLevel）入口触发且尚未获得外层技能 id，
+    // 结合同实例独有的 desc 特征自动补全 id=1111603，防止独立入口退化为全局多数派“穿刺”。
+    if (identity.empty() || identity.compare(0, 6, "level=") == 0) {
+        const std::string desc_text =
+                read_instance_string_field_by_canonical_name(instance, "desc");
+        if (desc_text.find("ComboWedgeDawn") != std::string::npos ||
+            desc_text.find("WedgeOffice") != std::string::npos ||
+            desc_text.find("\xE9\xBB\x8E\xE6\x98\x8E\xE4\xBA\x8B\xE5\x8A\xA1\xE6\x89\x80") !=
+                    std::string::npos) {
+            const std::string name_text =
+                    read_instance_string_field_by_canonical_name(instance, "name");
+            if (name_text == "\xE8\xB2\xAB\xE3\x81\x8F" ||
+                name_text == "\xE7\xA9\xBF\xE5\x88\xBA") {
+                identity = "id=1111603";
+            }
+        }
+    }
     for (void *klass = g_object_get_class(instance); klass != nullptr;
          klass = g_class_get_parent(klass)) {
         void *iterator = nullptr;
         const void *field = nullptr;
         while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
             const char *field_name = g_field_get_name(field);
-            if (!is_display_string_field(field_name)) continue;
+            const std::string canonical_field = canonical_reflection_field_name(field_name);
+            if (!is_display_string_field(canonical_field.c_str())) continue;
             char *type_name = g_type_get_name(g_field_get_type(field));
             bool is_string = type_name != nullptr && strcmp(type_name, "System.String") == 0;
             bool is_string_collection = type_name != nullptr && !is_string &&
@@ -3542,15 +3758,39 @@ void translate_object_string_fields(void *instance) {
             void *value = nullptr;
             g_field_get_value(instance, field, &value);
             std::string context_prefix;
-            if (!identity.empty() && field_name != nullptr) {
+            if (!identity.empty() && !canonical_field.empty()) {
                 context_prefix = identity;
                 context_prefix.push_back('\x1f');
-                context_prefix.append(field_name);
+                context_prefix.append(canonical_field);
             }
             if (is_string) {
                 void *replacement = translate_managed_string(
                         value, nullptr, false,
                         context_prefix.empty() ? nullptr : &context_prefix);
+                // 若该子对象字段此前已被无上下文调用提前译成“穿刺”，此处按技能 ID 自愈为“贯穿”。
+                if ((identity == "id=1111603" || identity == "id=158303") &&
+                    canonical_field == "name") {
+                    const std::string cur_text = read_managed_string_value(replacement);
+                    if (cur_text == "\xE7\xA9\xBF\xE5\x88\xBA" ||
+                        cur_text == "\xE8\xB2\xAB\xE3\x81\x8F") {
+                        void *corrected = new_managed_string("\xE8\xB4\xAF\xE7\xA9\xBF");
+                        if (corrected != nullptr && remember_translation_owned_string(corrected)) {
+                            replacement = corrected;
+                            pthread_mutex_lock(&g_font_state_lock);
+                            g_translated_managed_texts.insert("\xE8\xB4\xAF\xE7\xA9\xBF");
+                            pthread_mutex_unlock(&g_font_state_lock);
+                        }
+                    }
+                    const std::string final_text = read_managed_string_value(replacement);
+                    if (final_text == "\xE8\xB4\xAF\xE7\xA9\xBF" && replacement != value) {
+                        uint64_t fixes = g_wedge_outis_skill_fixes.fetch_add(
+                                1, std::memory_order_relaxed) + 1;
+                        if (fixes <= 30 || fixes % 100 == 0) {
+                            LT_LOGI("Resolved contextual skill name=贯穿 at data layer identity=%s fixes=%llu",
+                                    identity.c_str(), static_cast<unsigned long long>(fixes));
+                        }
+                    }
+                }
                 if (replacement != value) g_field_set_value(instance, field, replacement);
             } else {
                 translate_string_collection_elements(value, context_prefix);
@@ -3574,12 +3814,16 @@ bool is_nested_text_field(const char *name) {
 }
 
 void translate_object_graph_impl(void *instance, int depth,
-                                 std::unordered_set<void *> *visited) {
+                                 std::unordered_set<void *> *visited,
+                                 const std::string &inherited_identity = std::string()) {
     if (instance == nullptr || depth > 4 || visited == nullptr ||
         !visited->insert(instance).second) {
         return;
     }
-    translate_object_string_fields(instance);
+    const std::string own_identity = read_object_stable_identity(instance);
+    const std::string effective_identity =
+            !inherited_identity.empty() ? inherited_identity : own_identity;
+    translate_object_string_fields(instance, effective_identity);
     if (g_object_get_class == nullptr || g_class_get_parent == nullptr ||
         g_class_get_fields == nullptr || g_field_get_name == nullptr ||
         g_field_get_value == nullptr || g_class_get_method == nullptr ||
@@ -3592,7 +3836,8 @@ void translate_object_graph_impl(void *instance, int depth,
         const void *field = nullptr;
         while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
             const char *field_name = g_field_get_name(field);
-            if (!is_nested_text_field(field_name)) continue;
+            const std::string canonical_field = canonical_reflection_field_name(field_name);
+            if (!is_nested_text_field(canonical_field.c_str())) continue;
             void *list = nullptr;
             g_field_get_value(instance, field, &list);
             void *list_class = list == nullptr ? nullptr : g_object_get_class(list);
@@ -3617,7 +3862,8 @@ void translate_object_graph_impl(void *instance, int depth,
                 exception = nullptr;
                 void *child = g_runtime_invoke(item_method, list, args, &exception);
                 if (exception == nullptr && child != nullptr) {
-                    translate_object_graph_impl(child, depth + 1, visited);
+                    translate_object_graph_impl(
+                            child, depth + 1, visited, effective_identity);
                 }
             }
         }
@@ -3629,7 +3875,6 @@ void translate_object_graph(void *instance) {
     translate_object_graph_impl(instance, 0, &visited);
 }
 
-std::string read_managed_string_value(void *managed_text);
 bool read_collection_count(void *collection, int32_t *count);
 void *read_collection_item(void *collection, int32_t index);
 
@@ -4927,6 +5172,475 @@ void *read_named_object_field(void *instance, const char *const *names, size_t n
         }
     }
     return nullptr;
+}
+
+void ensure_battle_hint_random_hook(void *list_obj);
+
+bool read_instance_object_field_by_names(
+        void *instance, const char *const *names, size_t name_count, void **out_value) {
+    if (out_value != nullptr) *out_value = nullptr;
+    if (instance == nullptr || names == nullptr || name_count == 0 ||
+        g_object_get_class == nullptr || g_class_get_parent == nullptr ||
+        g_class_get_fields == nullptr || g_field_get_name == nullptr ||
+        g_field_get_value == nullptr) {
+        return false;
+    }
+    for (void *klass = g_object_get_class(instance); klass != nullptr;
+         klass = g_class_get_parent(klass)) {
+        void *iterator = nullptr;
+        const void *field = nullptr;
+        while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
+            if (g_field_get_flags != nullptr &&
+                (g_field_get_flags(field) & 0x0010) != 0) {
+                continue;
+            }
+            const char *field_name = g_field_get_name(field);
+            if (field_name == nullptr) continue;
+            const std::string canonical = canonical_reflection_field_name(field_name);
+            bool matched = false;
+            for (size_t i = 0; i < name_count; ++i) {
+                if (strcmp(field_name, names[i]) == 0 || canonical == names[i]) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            if (g_field_get_type != nullptr && g_class_from_type != nullptr &&
+                g_class_is_valuetype != nullptr) {
+                const void *ftype = g_field_get_type(field);
+                void *fklass = ftype == nullptr ? nullptr : g_class_from_type(ftype);
+                if (fklass != nullptr && g_class_is_valuetype(fklass)) continue;
+            }
+            void *value = nullptr;
+            g_field_get_value(instance, field, &value);
+            if (out_value != nullptr) *out_value = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool try_translate_battle_hint_item(
+        void *item, const std::string &table_name,
+        int *replaced_out, int *already_out, int *missed_out) {
+    if (item == nullptr || g_object_get_class == nullptr || g_class_get_parent == nullptr ||
+        g_class_get_fields == nullptr || g_field_get_name == nullptr ||
+        g_field_get_type == nullptr || g_field_get_value == nullptr ||
+        g_field_set_value == nullptr || g_type_get_name == nullptr ||
+        g_il2cpp_free == nullptr) {
+        return false;
+    }
+    std::string identity = read_object_stable_identity(item);
+    if (identity.compare(0, 3, "id=") != 0) {
+        return false;
+    }
+    const std::string item_id = identity.substr(3);
+    std::string translated;
+    if (!lookup_battle_hint_translation_by_id(table_name, item_id, &translated)) {
+        if (missed_out != nullptr) (*missed_out)++;
+        return false;
+    }
+    bool touched = false;
+    for (void *klass = g_object_get_class(item); klass != nullptr;
+         klass = g_class_get_parent(klass)) {
+        void *iterator = nullptr;
+        const void *field = nullptr;
+        while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
+            if (g_field_get_flags != nullptr &&
+                (g_field_get_flags(field) & 0x0010) != 0) {
+                continue;
+            }
+            const char *raw_name = g_field_get_name(field);
+            if (raw_name == nullptr) continue;
+            const std::string canonical = canonical_reflection_field_name(raw_name);
+            if (canonical != "content" && canonical != "Content" &&
+                canonical != "desc" && canonical != "text") {
+                continue;
+            }
+            char *type_name = g_type_get_name(g_field_get_type(field));
+            const bool is_string = type_name != nullptr && strcmp(type_name, "System.String") == 0;
+            if (type_name != nullptr) g_il2cpp_free(type_name);
+            if (!is_string) continue;
+            void *current = nullptr;
+            g_field_get_value(item, field, &current);
+            const std::string current_text =
+                    current == nullptr ? std::string() : read_managed_string_value(current);
+            if (current_text == translated) {
+                register_battle_hint_translated_string(translated);
+                if (already_out != nullptr) (*already_out)++;
+                touched = true;
+                continue;
+            }
+            void *replacement = new_managed_string(translated);
+            if (replacement == nullptr || !remember_translation_owned_string(replacement)) {
+                continue;
+            }
+            g_field_set_value(item, field, replacement);
+            register_battle_hint_translated_string(translated);
+            if (replaced_out != nullptr) (*replaced_out)++;
+            touched = true;
+        }
+    }
+    return touched;
+}
+
+void translate_battle_hint_dictionary(
+        void *dict_obj, const std::string &table_name,
+        int *replaced_out, int *already_out, int *missed_out) {
+    if (dict_obj == nullptr || g_object_get_class == nullptr || g_class_get_method == nullptr ||
+        g_method_get_param_count == nullptr || g_method_get_param == nullptr ||
+        g_type_get_name == nullptr || g_il2cpp_free == nullptr ||
+        g_runtime_invoke == nullptr || g_object_unbox == nullptr) {
+        return;
+    }
+    const void *contains_key = find_inherited_runtime_method(dict_obj, "ContainsKey", 1);
+    const void *get_item = find_inherited_runtime_method(dict_obj, "get_Item", 1);
+    const void *set_item = find_inherited_runtime_method(dict_obj, "set_Item", 2);
+    if (contains_key == nullptr || get_item == nullptr) return;
+    char *key_type = g_type_get_name(g_method_get_param(contains_key, 0));
+    const bool string_key = key_type != nullptr && strcmp(key_type, "System.String") == 0;
+    const bool int_key = key_type != nullptr && strcmp(key_type, "System.Int32") == 0;
+    if (key_type != nullptr) g_il2cpp_free(key_type);
+    if (!string_key && !int_key) return;
+    if (g_method_get_return_type != nullptr && g_class_from_type != nullptr &&
+        g_class_is_valuetype != nullptr) {
+        const void *val_type = g_method_get_return_type(get_item);
+        void *val_klass = val_type == nullptr ? nullptr : g_class_from_type(val_type);
+        if (val_klass != nullptr && g_class_is_valuetype(val_klass)) {
+            return;
+        }
+    }
+    const std::string prefix = table_name + '\x1f';
+    for (const auto &entry : g_battle_hint_index) {
+        if (entry.first.compare(0, prefix.size(), prefix) != 0) continue;
+        if (!is_usable_display_text(entry.second)) continue;
+        const std::string id_str = entry.first.substr(prefix.size());
+        void *managed_key = nullptr;
+        int32_t int_id = 0;
+        if (string_key) {
+            managed_key = new_managed_string(id_str);
+            if (managed_key == nullptr) continue;
+        } else {
+            char *endptr = nullptr;
+            long parsed = strtol(id_str.c_str(), &endptr, 10);
+            if (endptr == id_str.c_str() || *endptr != '\0') continue;
+            int_id = static_cast<int32_t>(parsed);
+        }
+        void *contains_args[] = {string_key ? managed_key : static_cast<void *>(&int_id)};
+        void *exception = nullptr;
+        void *boxed_has = g_runtime_invoke(contains_key, dict_obj, contains_args, &exception);
+        if (exception != nullptr || boxed_has == nullptr) continue;
+        const bool exists = *static_cast<uint8_t *>(g_object_unbox(boxed_has)) != 0;
+        if (!exists) continue;
+        exception = nullptr;
+        void *value = g_runtime_invoke(get_item, dict_obj, contains_args, &exception);
+        if (exception != nullptr || value == nullptr) continue;
+        void *val_klass = g_object_get_class(value);
+        const char *val_name =
+                (val_klass != nullptr && g_class_get_name != nullptr) ?
+                g_class_get_name(val_klass) : nullptr;
+        if (val_name != nullptr && strcmp(val_name, "String") == 0) {
+            const std::string cur_text = read_managed_string_value(value);
+            if (cur_text == entry.second) {
+                register_battle_hint_translated_string(entry.second);
+                if (already_out != nullptr) (*already_out)++;
+                continue;
+            }
+            if (set_item != nullptr) {
+                void *replacement = new_managed_string(entry.second);
+                if (replacement != nullptr && remember_translation_owned_string(replacement)) {
+                    void *set_args[] = {
+                            string_key ? managed_key : static_cast<void *>(&int_id),
+                            replacement
+                    };
+                    exception = nullptr;
+                    g_runtime_invoke(set_item, dict_obj, set_args, &exception);
+                    if (exception == nullptr) {
+                        register_battle_hint_translated_string(entry.second);
+                        if (replaced_out != nullptr) (*replaced_out)++;
+                    }
+                }
+            }
+        } else {
+            try_translate_battle_hint_item(
+                    value, table_name, replaced_out, already_out, missed_out);
+        }
+    }
+}
+
+void translate_battle_hint_collection_impl(
+        void *node, const std::string &table_name, int depth,
+        std::unordered_set<void *> *visited,
+        int *items_out, int *replaced_out, int *already_out, int *missed_out) {
+    if (node == nullptr || depth > 2 || visited == nullptr || !visited->insert(node).second) {
+        return;
+    }
+    if (g_object_get_class == nullptr) return;
+    void *klass = g_object_get_class(node);
+    const char *klass_name =
+            (klass != nullptr && g_class_get_name != nullptr) ? g_class_get_name(klass) : nullptr;
+    if (klass_name != nullptr &&
+        (strncmp(klass_name, "Dictionary`", 11) == 0 ||
+         strstr(klass_name, "Dictionary") != nullptr)) {
+        translate_battle_hint_dictionary(
+                node, table_name, replaced_out, already_out, missed_out);
+        return;
+    }
+    bool integer_indexed_sequence = find_inherited_runtime_method(node, "get_Length", 0) != nullptr;
+    if (!integer_indexed_sequence && g_method_get_param_count != nullptr &&
+        g_method_get_param != nullptr && g_type_get_name != nullptr && g_il2cpp_free != nullptr) {
+        const void *get_item = find_inherited_runtime_method(node, "get_Item", 1);
+        if (get_item != nullptr && g_method_get_param_count(get_item) == 1) {
+            char *param0 = g_type_get_name(g_method_get_param(get_item, 0));
+            integer_indexed_sequence = param0 != nullptr && strcmp(param0, "System.Int32") == 0;
+            if (param0 != nullptr) g_il2cpp_free(param0);
+        }
+    }
+    int32_t count = 0;
+    if (integer_indexed_sequence && read_collection_count(node, &count) &&
+        count > 0 && count <= 512) {
+        for (int32_t i = 0; i < count; ++i) {
+            void *item = read_collection_item(node, i);
+            if (item == nullptr) continue;
+            if (items_out != nullptr) (*items_out)++;
+            try_translate_battle_hint_item(
+                    item, table_name, replaced_out, already_out, missed_out);
+        }
+        return;
+    }
+    const void *get_data_list = find_inherited_runtime_method(node, "get_DataList", 0);
+    if (get_data_list != nullptr && g_runtime_invoke != nullptr) {
+        void *exception = nullptr;
+        void *data_list = g_runtime_invoke(get_data_list, node, nullptr, &exception);
+        if (exception == nullptr && data_list != nullptr) {
+            translate_battle_hint_collection_impl(
+                    data_list, table_name, depth + 1, visited,
+                    items_out, replaced_out, already_out, missed_out);
+        }
+    }
+    if (g_class_get_parent == nullptr || g_class_get_fields == nullptr ||
+        g_field_get_name == nullptr || g_field_get_type == nullptr ||
+        g_field_get_value == nullptr || g_type_get_name == nullptr ||
+        g_il2cpp_free == nullptr) {
+        return;
+    }
+    for (void *cur = klass; cur != nullptr; cur = g_class_get_parent(cur)) {
+        const char *cur_name = g_class_get_name == nullptr ? nullptr : g_class_get_name(cur);
+        if (cur_name != nullptr && strcmp(cur_name, "Object") == 0) break;
+        void *iterator = nullptr;
+        const void *field = nullptr;
+        while ((field = g_class_get_fields(cur, &iterator)) != nullptr) {
+            if (g_field_get_flags != nullptr &&
+                (g_field_get_flags(field) & 0x0010) != 0) {
+                continue;
+            }
+            if (g_class_from_type != nullptr && g_class_is_valuetype != nullptr) {
+                const void *ftype = g_field_get_type(field);
+                void *fklass = ftype == nullptr ? nullptr : g_class_from_type(ftype);
+                if (fklass != nullptr && g_class_is_valuetype(fklass)) continue;
+            }
+            char *type_name = g_type_get_name(g_field_get_type(field));
+            const bool is_string = type_name != nullptr && strcmp(type_name, "System.String") == 0;
+            if (type_name != nullptr) g_il2cpp_free(type_name);
+            if (is_string) continue;
+            void *child = nullptr;
+            g_field_get_value(node, field, &child);
+            if (child == nullptr) continue;
+            translate_battle_hint_collection_impl(
+                    child, table_name, depth + 1, visited,
+                    items_out, replaced_out, already_out, missed_out);
+        }
+    }
+}
+
+void translate_battle_hint_collection(
+        void *list_obj, const std::string &table_name, const char *trigger) {
+    if (list_obj == nullptr || table_name.empty() || g_battle_hint_index.empty()) return;
+    ensure_battle_hint_random_hook(list_obj);
+    std::unordered_set<void *> visited;
+    int items = 0;
+    int replaced = 0;
+    int already = 0;
+    int missed = 0;
+    translate_battle_hint_collection_impl(
+            list_obj, table_name, 0, &visited, &items, &replaced, &already, &missed);
+    bool should_log = replaced > 0;
+    if (!should_log) {
+        char log_key[128] = {};
+        snprintf(log_key, sizeof(log_key), "%s@%p:%d", table_name.c_str(), list_obj, items);
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        should_log = g_logged_battle_hint_syncs.insert(log_key).second;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    }
+    if (should_log) {
+        LT_LOGI("BattleHint collection synced trigger=%s table=%s obj=%p"
+                " items=%d replaced=%d already=%d missed=%d",
+                trigger == nullptr ? "-" : trigger, table_name.c_str(), list_obj,
+                items, replaced, already, missed);
+    }
+}
+
+void *find_text_data_set_in_manager_instance(void *mgr) {
+    if (mgr == nullptr || g_object_get_class == nullptr || g_text_data_set_class == nullptr ||
+        g_class_get_parent == nullptr || g_class_get_fields == nullptr ||
+        g_field_get_type == nullptr || g_field_get_value == nullptr) {
+        return nullptr;
+    }
+    if (g_object_get_class(mgr) == g_text_data_set_class) return mgr;
+    for (void *klass = g_object_get_class(mgr); klass != nullptr;
+         klass = g_class_get_parent(klass)) {
+        void *iterator = nullptr;
+        const void *field = nullptr;
+        while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
+            if (g_field_get_flags != nullptr &&
+                (g_field_get_flags(field) & 0x0010) != 0) {
+                continue;
+            }
+            if (g_class_from_type != nullptr && g_class_is_valuetype != nullptr) {
+                const void *ftype = g_field_get_type(field);
+                void *fklass = ftype == nullptr ? nullptr : g_class_from_type(ftype);
+                if (fklass != nullptr && g_class_is_valuetype(fklass)) continue;
+            }
+            void *val = nullptr;
+            g_field_get_value(mgr, field, &val);
+            if (val != nullptr && g_object_get_class(val) == g_text_data_set_class) {
+                return val;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void *resolve_text_data_set_from_manager() {
+    if (g_text_data_manager_class == nullptr || g_text_data_set_class == nullptr ||
+        g_class_get_parent == nullptr || g_class_get_fields == nullptr) {
+        return nullptr;
+    }
+    if (g_field_get_flags != nullptr && g_field_static_get_value != nullptr) {
+        for (void *klass = g_text_data_manager_class; klass != nullptr;
+             klass = g_class_get_parent(klass)) {
+            void *iterator = nullptr;
+            const void *field = nullptr;
+            while ((field = g_class_get_fields(klass, &iterator)) != nullptr) {
+                if ((g_field_get_flags(field) & 0x0010) == 0) continue;
+                if (g_field_get_type != nullptr && g_class_from_type != nullptr &&
+                    g_class_is_valuetype != nullptr) {
+                    const void *ftype = g_field_get_type(field);
+                    void *fklass = ftype == nullptr ? nullptr : g_class_from_type(ftype);
+                    if (fklass != nullptr && g_class_is_valuetype(fklass)) continue;
+                }
+                void *candidate = nullptr;
+                g_field_static_get_value(field, &candidate);
+                if (candidate == nullptr) continue;
+                void *found = find_text_data_set_in_manager_instance(candidate);
+                if (found != nullptr) return found;
+            }
+        }
+    }
+    if (g_class_get_method != nullptr && g_runtime_invoke != nullptr) {
+        for (void *klass = g_text_data_manager_class; klass != nullptr;
+             klass = g_class_get_parent(klass)) {
+            const void *get_instance = g_class_get_method(klass, "get_Instance", 0);
+            if (get_instance == nullptr) continue;
+            void *exception = nullptr;
+            void *mgr = g_runtime_invoke(get_instance, nullptr, nullptr, &exception);
+            if (exception == nullptr && mgr != nullptr) {
+                void *found = find_text_data_set_in_manager_instance(mgr);
+                if (found != nullptr) return found;
+            }
+            break;
+        }
+    }
+    return nullptr;
+}
+
+void sync_text_data_set_battle_hints(void *text_data_set, const char *trigger) {
+    static thread_local bool in_sync = false;
+    if (in_sync) return;
+    in_sync = true;
+    struct SyncGuard {
+        bool *flag;
+        ~SyncGuard() { *flag = false; }
+    } guard{&in_sync};
+
+    void *dataset = text_data_set;
+    if (dataset == nullptr) {
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        dataset = g_last_text_data_set;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    }
+    if (dataset == nullptr) {
+        dataset = resolve_text_data_set_from_manager();
+    }
+    if (dataset != nullptr) {
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        g_last_text_data_set = dataset;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+
+        static const char *const kBattleHintFields[] = {"_battleHint", "battleHint", "BattleHint"};
+        static const char *const kNormalHintFields[] = {
+                "_normalBattleResultHint", "normalBattleResultHint", "NormalBattleResultHint"};
+        static const char *const kAbHintFields[] = {
+                "_abBattleResultHint", "abBattleResultHint", "AbBattleResultHint"};
+        auto resolve_list = [&](const char *const *names, size_t n,
+                                il2cpp_obj_method0_fn orig_getter, const void *getter_info) -> void * {
+            void *list_obj = nullptr;
+            if (read_instance_object_field_by_names(dataset, names, n, &list_obj) &&
+                list_obj != nullptr) {
+                return list_obj;
+            }
+            if (orig_getter != nullptr && getter_info != nullptr) {
+                return orig_getter(dataset, getter_info);
+            }
+            if (getter_info != nullptr && g_runtime_invoke != nullptr) {
+                void *exception = nullptr;
+                return g_runtime_invoke(getter_info, dataset, nullptr, &exception);
+            }
+            return nullptr;
+        };
+
+        void *battle_hint = resolve_list(
+                kBattleHintFields, 3, g_original_text_data_set_get_battle_hint,
+                g_text_data_set_get_battle_hint_info);
+        void *normal_hint = resolve_list(
+                kNormalHintFields, 3, g_original_text_data_set_get_normal_battle_hint,
+                g_text_data_set_get_normal_hint_info);
+        void *ab_hint = resolve_list(
+                kAbHintFields, 3, g_original_text_data_set_get_ab_battle_hint,
+                g_text_data_set_get_ab_hint_info);
+
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        if (battle_hint != nullptr) g_battle_hint_list_instance = battle_hint;
+        if (normal_hint != nullptr) g_normal_battle_hint_list_instance = normal_hint;
+        if (ab_hint != nullptr) g_ab_battle_hint_list_instance = ab_hint;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+
+        if (battle_hint != nullptr) {
+            translate_battle_hint_collection(battle_hint, "BattleHint", trigger);
+        }
+        if (normal_hint != nullptr) {
+            translate_battle_hint_collection(normal_hint, "BattleHint_NormalBattle", trigger);
+        }
+        if (ab_hint != nullptr) {
+            translate_battle_hint_collection(ab_hint, "BattleHint_AbnorBattle", trigger);
+        }
+        return;
+    }
+
+    pthread_mutex_lock(&g_battle_hint_sync_lock);
+    void *cached_battle = g_battle_hint_list_instance;
+    void *cached_normal = g_normal_battle_hint_list_instance;
+    void *cached_ab = g_ab_battle_hint_list_instance;
+    pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    if (cached_battle != nullptr) {
+        translate_battle_hint_collection(cached_battle, "BattleHint", trigger);
+    }
+    if (cached_normal != nullptr) {
+        translate_battle_hint_collection(cached_normal, "BattleHint_NormalBattle", trigger);
+    }
+    if (cached_ab != nullptr) {
+        translate_battle_hint_collection(cached_ab, "BattleHint_AbnorBattle", trigger);
+    }
 }
 
 // ============================================================================
@@ -8826,21 +9540,40 @@ void *apply_tmp_component_layout_markup(void *instance, void *managed_text) {
     if (package_layout != g_package_line_breaks.end()) {
         text = package_layout->second;
     }
-    if (text.find('\n') == std::string::npos) {
+    ComponentRect rect = read_component_rect(instance, g_tmp_get_rect_transform_info);
+    const bool narrow_card_rect = !rect.valid || rect.width <= 300.0f;
+    const bool has_newline = text.find('\n') != std::string::npos;
+    size_t line_count = 0;
+    std::string formatted;
+    if (!narrow_card_rect) {
+        if (!has_newline) return managed_text;
+        formatted = apply_uniform_line_height(text, 150);
+    } else {
+        const bool exceeds_single_line =
+                measure_personality_title_width(text) > kPersonalityCardSingleLineMaxWidth;
+        if (!has_newline && !exceeds_single_line) return managed_text;
+        // 人格名称控件会忽略运行时 lineSpacing，却会在生成网格时遵守 TMP 富文本行高。
+        // 窄卡先按 E.G.O 边界与词组拆分，仍略超宽的单行包裹 <size=XX%> 微缩，并从起点统一 150% 行高。
+        std::string reflowed = reflow_personality_title(text, &line_count);
+        formatted = apply_uniform_line_height(reflowed, 150);
+    }
+    if (formatted == text) {
         return managed_text;
     }
-    // 人格名称控件会忽略运行时 lineSpacing，却会在生成网格时遵守 TMP 富文本行高。
-    // 只移动空格处的换行，不增删或改写汉化包正文，并统一使用用户指定的 150% 行高。
-    size_t line_count = 0;
-    std::string reflowed = reflow_personality_title(text, &line_count);
-    // 用户要求所有人格卡底栏保持一致，二行与三行标题统一采用 150% 行高。
-    std::string formatted = apply_uniform_line_height(reflowed, 150);
     void *replacement = new_managed_string(formatted);
     if (replacement == nullptr) return managed_text;
     if (!remember_translation_owned_string(replacement)) return managed_text;
     pthread_mutex_lock(&g_font_state_lock);
     g_translated_managed_texts.insert(formatted);
     pthread_mutex_unlock(&g_font_state_lock);
+    static std::atomic<uint64_t> layout_logs{0};
+    uint64_t count = layout_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 30 || count % 250 == 0) {
+        LT_LOGI("TMP GroupName layout count=%llu rectW=%.1f lines=%zu result=%s",
+                static_cast<unsigned long long>(count),
+                rect.valid ? rect.width : -1.0f,
+                line_count, formatted.c_str());
+    }
     return replacement;
 }
 
@@ -9019,7 +9752,9 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                             std::any_of(ancestors.begin(), ancestors.end(),
                                     [](const std::string &a) {
                                         return a.find("Skill") != std::string::npos ||
-                                               a.find("Popup") != std::string::npos;
+                                               a.find("Popup") != std::string::npos ||
+                                               a.find("Shop") != std::string::npos ||
+                                               a.find("Change") != std::string::npos;
                                     });
                     if (is_skill) {
                         void *corrected = new_managed_string("贯穿");
@@ -9050,6 +9785,10 @@ void *prepare_tmp_text(void *instance, void *managed_text) {
                 utf16_to_utf8(g_string_chars(replacement), display_length, &display_text);
             }
             if (display_text.find("楔子事务所") != std::string::npos ||
+                display_text.find("快速突刺") != std::string::npos ||
+                display_text.find("闪光之枪") != std::string::npos ||
+                display_text.find("替换奥提斯的技能") != std::string::npos ||
+                display_text.find("连：黎明事务所") != std::string::npos ||
                 source.find("楔子事务所") != std::string::npos ||
                 source.find("WedgeOffice") != std::string::npos ||
                 source.find("ComboWedgeDawn") != std::string::npos) {
@@ -10056,6 +10795,162 @@ void replacement_text_mesh_set_text(
     }
 }
 
+void replacement_text_data_set_load_local0(void *instance, const void *method) {
+    if (g_original_text_data_set_load_local0 != nullptr) {
+        g_original_text_data_set_load_local0(instance, method);
+    }
+    sync_text_data_set_battle_hints(instance, "TextDataSet.LoadLocal");
+}
+
+void replacement_text_data_set_load_local1(void *instance, void *arg0, const void *method) {
+    if (g_original_text_data_set_load_local1 != nullptr) {
+        g_original_text_data_set_load_local1(instance, arg0, method);
+    }
+    sync_text_data_set_battle_hints(instance, "TextDataSet.LoadLocal");
+}
+
+void replacement_text_data_set_load_remote0(void *instance, const void *method) {
+    if (g_original_text_data_set_load_remote0 != nullptr) {
+        g_original_text_data_set_load_remote0(instance, method);
+    }
+    sync_text_data_set_battle_hints(instance, "TextDataSet.LoadRemote");
+}
+
+void replacement_text_data_set_load_remote1(void *instance, void *arg0, const void *method) {
+    if (g_original_text_data_set_load_remote1 != nullptr) {
+        g_original_text_data_set_load_remote1(instance, arg0, method);
+    }
+    sync_text_data_set_battle_hints(instance, "TextDataSet.LoadRemote");
+}
+
+void *replacement_text_data_set_get_battle_hint(void *instance, const void *method) {
+    void *result = g_original_text_data_set_get_battle_hint == nullptr ? nullptr :
+            g_original_text_data_set_get_battle_hint(instance, method);
+    if (instance != nullptr) {
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        g_last_text_data_set = instance;
+        if (result != nullptr) g_battle_hint_list_instance = result;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    }
+    if (result != nullptr) {
+        translate_battle_hint_collection(result, "BattleHint", "TextDataSet.get_BattleHint");
+    }
+    return result;
+}
+
+void *replacement_text_data_set_get_normal_battle_hint(void *instance, const void *method) {
+    void *result = g_original_text_data_set_get_normal_battle_hint == nullptr ? nullptr :
+            g_original_text_data_set_get_normal_battle_hint(instance, method);
+    if (instance != nullptr) {
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        g_last_text_data_set = instance;
+        if (result != nullptr) g_normal_battle_hint_list_instance = result;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    }
+    if (result != nullptr) {
+        translate_battle_hint_collection(
+                result, "BattleHint_NormalBattle", "TextDataSet.get_NormalBattleResultHint");
+    }
+    return result;
+}
+
+void *replacement_text_data_set_get_ab_battle_hint(void *instance, const void *method) {
+    void *result = g_original_text_data_set_get_ab_battle_hint == nullptr ? nullptr :
+            g_original_text_data_set_get_ab_battle_hint(instance, method);
+    if (instance != nullptr) {
+        pthread_mutex_lock(&g_battle_hint_sync_lock);
+        g_last_text_data_set = instance;
+        if (result != nullptr) g_ab_battle_hint_list_instance = result;
+        pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    }
+    if (result != nullptr) {
+        translate_battle_hint_collection(
+                result, "BattleHint_AbnorBattle", "TextDataSet.get_AbBattleResultHint");
+    }
+    return result;
+}
+
+std::string identify_known_battle_hint_table_for_list(void *instance) {
+    if (instance == nullptr) return {};
+    std::string table;
+    pthread_mutex_lock(&g_battle_hint_sync_lock);
+    if (instance == g_battle_hint_list_instance) {
+        table = "BattleHint";
+    } else if (instance == g_normal_battle_hint_list_instance) {
+        table = "BattleHint_NormalBattle";
+    } else if (instance == g_ab_battle_hint_list_instance) {
+        table = "BattleHint_AbnorBattle";
+    }
+    pthread_mutex_unlock(&g_battle_hint_sync_lock);
+    return table;
+}
+
+void *replacement_json_data_list_get_random_text(void *instance, const void *method) {
+    const std::string table = identify_known_battle_hint_table_for_list(instance);
+    if (!table.empty()) {
+        translate_battle_hint_collection(instance, table, "JsonDataList.GetRandomText");
+    }
+    void *raw = g_original_json_data_list_get_random_text == nullptr ? nullptr :
+            g_original_json_data_list_get_random_text(instance, method);
+    if (table.empty() || raw == nullptr) return raw;
+    void *result = raw;
+    if (!is_translated_managed_string(result) && !is_translation_owned_string(result)) {
+        result = translate_managed_string(raw);
+    }
+    uint64_t hits = g_battle_hint_random_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (hits <= 20 || hits % 20 == 0) {
+        LT_LOGI("BattleHint GetRandomText count=%llu table=%s text=%s",
+                static_cast<unsigned long long>(hits), table.c_str(),
+                read_managed_string_value(result).c_str());
+    }
+    return result;
+}
+
+void log_loading_scene_hint_after_set(void *loading_scene_mgr) {
+    if (loading_scene_mgr == nullptr || g_tmp_get_text_value_info == nullptr) return;
+    static const char *const kHintTxtFields[] = {"_hintTxt", "hintTxt"};
+    void *hint_txt = nullptr;
+    if (!read_instance_object_field_by_names(loading_scene_mgr, kHintTxtFields, 2, &hint_txt) ||
+        hint_txt == nullptr || !is_unity_object_alive(hint_txt)) {
+        return;
+    }
+    void *current_text = invoke_object_getter(g_tmp_get_text_value_info, hint_txt);
+    if (current_text != nullptr) {
+        LT_LOGI("LoadingSceneManager.SetHintText applied text=%s",
+                read_managed_string_value(current_text).c_str());
+    }
+}
+
+void replacement_loading_set_hint_text0(void *instance, const void *method) {
+    sync_text_data_set_battle_hints(nullptr, "LoadingSceneManager.SetHintText");
+    if (g_original_loading_set_hint_text0 != nullptr) {
+        g_original_loading_set_hint_text0(instance, method);
+    }
+    log_loading_scene_hint_after_set(instance);
+}
+
+void replacement_loading_set_hint_text1(void *instance, void *arg0, const void *method) {
+    sync_text_data_set_battle_hints(nullptr, "LoadingSceneManager.SetHintText");
+    if (g_original_loading_set_hint_text1 != nullptr) {
+        g_original_loading_set_hint_text1(instance, arg0, method);
+    }
+    log_loading_scene_hint_after_set(instance);
+}
+
+void replacement_apply_battle_hints0(void *instance, const void *method) {
+    sync_text_data_set_battle_hints(nullptr, "AskAfterDefeatBattlePopup.ApplyBattleHints");
+    if (g_original_apply_battle_hints0 != nullptr) {
+        g_original_apply_battle_hints0(instance, method);
+    }
+}
+
+void replacement_apply_battle_hints1(void *instance, void *arg0, const void *method) {
+    sync_text_data_set_battle_hints(nullptr, "AskAfterDefeatBattlePopup.ApplyBattleHints");
+    if (g_original_apply_battle_hints1 != nullptr) {
+        g_original_apply_battle_hints1(instance, arg0, method);
+    }
+}
+
 void *replacement_bgm_lyrics_get_data(
         void *instance, void *key, int32_t vocal_id, int32_t *out_index,
         const void *method) {
@@ -10713,6 +11608,110 @@ static bool install_method_info_hook(const void *method_info, void *replacement,
     return true;
 }
 
+bool has_inline_hook_space_global(void *klass, void *pointer) {
+    if (klass == nullptr || pointer == nullptr || g_class_get_methods == nullptr) return false;
+    std::vector<uintptr_t> pointers;
+    void *iterator = nullptr;
+    const void *candidate = nullptr;
+    while ((candidate = g_class_get_methods(klass, &iterator)) != nullptr) {
+        void *candidate_pointer = nullptr;
+        memcpy(&candidate_pointer, candidate, sizeof(candidate_pointer));
+        if (candidate_pointer != nullptr) {
+            pointers.push_back(reinterpret_cast<uintptr_t>(candidate_pointer));
+        }
+    }
+    std::sort(pointers.begin(), pointers.end());
+    pointers.erase(std::unique(pointers.begin(), pointers.end()), pointers.end());
+    const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+    auto position = std::lower_bound(pointers.begin(), pointers.end(), address);
+    return position != pointers.end() && *position == address &&
+            (position + 1 == pointers.end() || *(position + 1) - address >= 16);
+}
+
+template <typename Fn>
+bool install_il2cpp_method_hook_safe(
+        void *klass, const void *method_info, void *replacement, Fn *original_out,
+        const char *label) {
+    if (klass == nullptr || method_info == nullptr || replacement == nullptr ||
+        original_out == nullptr) {
+        return false;
+    }
+    void *pointer = nullptr;
+    memcpy(&pointer, method_info, sizeof(pointer));
+    if (pointer == nullptr) return false;
+    if (has_inline_hook_space_global(klass, pointer)) {
+        MSHookFunction(pointer, replacement, reinterpret_cast<void **>(original_out));
+        if (*original_out != nullptr) {
+            LT_LOGI("Installed hook %s mode=inline ptr=%p orig=%p",
+                    label == nullptr ? "-" : label, pointer,
+                    reinterpret_cast<void *>(*original_out));
+            return true;
+        }
+    }
+    if (install_method_info_hook(method_info, replacement, original_out) &&
+        *original_out != nullptr) {
+        LT_LOGI("Installed hook %s mode=methodInfo info=%p ptr=%p orig=%p",
+                label == nullptr ? "-" : label, method_info, pointer,
+                reinterpret_cast<void *>(*original_out));
+        return true;
+    }
+    LT_LOGW("Failed hook %s ptr=%p info=%p",
+            label == nullptr ? "-" : label, pointer, method_info);
+    return false;
+}
+
+void ensure_battle_hint_random_hook(void *list_obj) {
+    if (list_obj == nullptr || g_object_get_class == nullptr || g_class_get_method == nullptr ||
+        g_method_get_return_type == nullptr || g_type_get_name == nullptr ||
+        g_il2cpp_free == nullptr) {
+        return;
+    }
+    if (g_json_data_list_random_hook_attempted.exchange(true)) return;
+    void *list_klass = g_object_get_class(list_obj);
+    if (list_klass == nullptr) return;
+    const char *klass_name =
+            g_class_get_name == nullptr ? "-" : g_class_get_name(list_klass);
+    const void *method = nullptr;
+    int found_argc = -1;
+    void *method_owner_klass = list_klass;
+    for (void *cur = list_klass; cur != nullptr;
+         cur = g_class_get_parent == nullptr ? nullptr : g_class_get_parent(cur)) {
+        for (int argc = 0; argc <= 2; ++argc) {
+            const void *candidate = g_class_get_method(cur, "GetRandomText", argc);
+            if (candidate != nullptr) {
+                method = candidate;
+                found_argc = argc;
+                method_owner_klass = cur;
+                break;
+            }
+        }
+        if (method != nullptr) break;
+    }
+    if (method == nullptr) {
+        LT_LOGI("BattleHint collection klass=%p name=%s (no GetRandomText 0..2)",
+                list_klass, klass_name == nullptr ? "-" : klass_name);
+        return;
+    }
+    if (found_argc != 0) {
+        LT_LOGI("BattleHint JsonDataList.GetRandomText klass=%s argc=%d (expected 0)",
+                klass_name == nullptr ? "-" : klass_name, found_argc);
+        return;
+    }
+    char *ret_name = g_type_get_name(g_method_get_return_type(method));
+    const bool returns_string = ret_name != nullptr && strcmp(ret_name, "System.String") == 0;
+    if (ret_name != nullptr) g_il2cpp_free(ret_name);
+    if (!returns_string) {
+        LT_LOGW("BattleHint JsonDataList.GetRandomText skipped non-string return klass=%s",
+                klass_name == nullptr ? "-" : klass_name);
+        return;
+    }
+    install_il2cpp_method_hook_safe(
+            method_owner_klass, method,
+            reinterpret_cast<void *>(replacement_json_data_list_get_random_text),
+            &g_original_json_data_list_get_random_text,
+            "JsonDataList.GetRandomText");
+}
+
 
 bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain) {
     typedef void *(*domain_get_fn)();
@@ -10853,6 +11852,10 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
     void *bgm_lyrics_list_class = nullptr;
     void *text_mat_setter_class = nullptr;
     void *battle_effect_mgr_class = nullptr;
+    void *text_data_set_class = nullptr;
+    void *text_data_manager_class = nullptr;
+    void *loading_scene_manager_class = nullptr;
+    void *ask_defeat_popup_class = nullptr;
     const void *get_language_method = nullptr;
     const void *get_global_language_method = nullptr;
     struct AcquisitionTarget {
@@ -10880,6 +11883,22 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                     bgm_lyrics_list_class = klass;
                 } else if (name != nullptr && strcmp(name, "TextMeshProMaterialSetter") == 0) {
                     text_mat_setter_class = klass;
+                } else if (name != nullptr && strcmp(name, "TextDataSet") == 0) {
+                    if (text_data_set_class == nullptr ||
+                        (class_get_method_from_name != nullptr &&
+                         class_get_method_from_name(klass, "get_BattleHint", 0) != nullptr)) {
+                        text_data_set_class = klass;
+                    }
+                } else if (name != nullptr && strcmp(name, "TextDataManager") == 0) {
+                    text_data_manager_class = klass;
+                } else if (name != nullptr && strcmp(name, "LoadingSceneManager") == 0) {
+                    if (loading_scene_manager_class == nullptr ||
+                        (class_get_method_from_name != nullptr &&
+                         class_get_method_from_name(klass, "SetHintText", 0) != nullptr)) {
+                        loading_scene_manager_class = klass;
+                    }
+                } else if (name != nullptr && strcmp(name, "AskAfterDefeatBattlePopup") == 0) {
+                    ask_defeat_popup_class = klass;
                 } else if (name != nullptr &&
                            (strcmp(name, "OutterGradiantEffectController") == 0 ||
                             strcmp(name, "BattleEffectManager") == 0)) {
@@ -11553,6 +12572,13 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         g_class_is_valuetype = class_is_valuetype;
         g_class_is_enum = class_is_enum;
         g_method_get_flags = method_get_flags;
+        g_class_get_name = class_get_name;
+        g_class_get_methods = class_get_methods;
+        g_method_get_param_count = method_get_param_count;
+        g_method_get_param = method_get_param;
+        g_method_get_return_type = method_get_return_type;
+        g_text_data_set_class = text_data_set_class;
+        g_text_data_manager_class = text_data_manager_class;
         g_tmp_text_class = tmp_text_class;
         if (class_get_type != nullptr && type_get_object != nullptr) {
             if (material_class != nullptr) {
@@ -11744,6 +12770,126 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                 reinterpret_cast<void *>(replacement_bgm_lyrics_get_data),
                 reinterpret_cast<void **>(&g_original_bgm_lyrics_get_data),
                 "BgmLyricsJsonDataList.GetLyricsData");
+
+        auto is_safe_pointer_or_scalar_arg0 = [&](const void *method) -> bool {
+            if (method == nullptr || method_get_param_count == nullptr ||
+                method_get_param == nullptr || type_get_name == nullptr ||
+                il2cpp_free == nullptr) {
+                return false;
+            }
+            if (method_get_param_count(method) != 1) return false;
+            const void *ptype = method_get_param(method, 0);
+            if (ptype == nullptr) return false;
+            char *tname = type_get_name(ptype);
+            if (tname == nullptr) return false;
+            const bool is_float =
+                    strcmp(tname, "System.Single") == 0 || strcmp(tname, "System.Double") == 0;
+            il2cpp_free(tname);
+            if (is_float) return false;
+            if (class_from_type != nullptr && class_is_valuetype != nullptr &&
+                class_is_enum != nullptr) {
+                void *pklass = class_from_type(ptype);
+                if (pklass != nullptr && class_is_valuetype(pklass) && !class_is_enum(pklass)) {
+                    const char *kname = class_get_name == nullptr ? nullptr : class_get_name(pklass);
+                    const bool small_scalar = kname != nullptr &&
+                            (strcmp(kname, "Int32") == 0 || strcmp(kname, "UInt32") == 0 ||
+                             strcmp(kname, "Int64") == 0 || strcmp(kname, "UInt64") == 0 ||
+                             strcmp(kname, "Boolean") == 0);
+                    if (!small_scalar) return false;
+                }
+            }
+            return true;
+        };
+        auto hook_void_0_or_1_method = [&](void *klass, const char *method_name,
+                                           void *rep0, il2cpp_void_method0_fn *orig0,
+                                           void *rep1, il2cpp_void_method1_fn *orig1,
+                                           const char *label) {
+            if (klass == nullptr || method_name == nullptr || class_get_methods == nullptr ||
+                method_get_name == nullptr || method_get_param_count == nullptr) {
+                return;
+            }
+            void *iterator = nullptr;
+            const void *method = nullptr;
+            bool hooked = false;
+            while ((method = class_get_methods(klass, &iterator)) != nullptr) {
+                const char *name = method_get_name(method);
+                if (name == nullptr || strcmp(name, method_name) != 0) continue;
+                uint32_t argc = method_get_param_count(method);
+                if (argc == 0 && orig0 != nullptr && *orig0 == nullptr) {
+                    hooked |= install_il2cpp_method_hook_safe(klass, method, rep0, orig0, label);
+                } else if (argc == 1 && orig1 != nullptr && *orig1 == nullptr &&
+                           is_safe_pointer_or_scalar_arg0(method)) {
+                    hooked |= install_il2cpp_method_hook_safe(klass, method, rep1, orig1, label);
+                } else {
+                    LT_LOGI("BattleHint candidate %s skipped argc=%u", label, argc);
+                }
+            }
+            if (!hooked) {
+                LT_LOGW("BattleHint hook not attached label=%s klass=%p", label, klass);
+            }
+        };
+        if (text_data_set_class != nullptr) {
+            g_text_data_set_get_battle_hint_info =
+                    class_get_method_from_name(text_data_set_class, "get_BattleHint", 0);
+            g_text_data_set_get_normal_hint_info =
+                    class_get_method_from_name(text_data_set_class, "get_NormalBattleResultHint", 0);
+            g_text_data_set_get_ab_hint_info =
+                    class_get_method_from_name(text_data_set_class, "get_AbBattleResultHint", 0);
+            hook_void_0_or_1_method(
+                    text_data_set_class, "LoadLocal",
+                    reinterpret_cast<void *>(replacement_text_data_set_load_local0),
+                    &g_original_text_data_set_load_local0,
+                    reinterpret_cast<void *>(replacement_text_data_set_load_local1),
+                    &g_original_text_data_set_load_local1,
+                    "TextDataSet.LoadLocal");
+            hook_void_0_or_1_method(
+                    text_data_set_class, "LoadRemote",
+                    reinterpret_cast<void *>(replacement_text_data_set_load_remote0),
+                    &g_original_text_data_set_load_remote0,
+                    reinterpret_cast<void *>(replacement_text_data_set_load_remote1),
+                    &g_original_text_data_set_load_remote1,
+                    "TextDataSet.LoadRemote");
+            if (g_text_data_set_get_battle_hint_info != nullptr) {
+                install_il2cpp_method_hook_safe(
+                        text_data_set_class, g_text_data_set_get_battle_hint_info,
+                        reinterpret_cast<void *>(replacement_text_data_set_get_battle_hint),
+                        &g_original_text_data_set_get_battle_hint,
+                        "TextDataSet.get_BattleHint");
+            }
+            if (g_text_data_set_get_normal_hint_info != nullptr) {
+                install_il2cpp_method_hook_safe(
+                        text_data_set_class, g_text_data_set_get_normal_hint_info,
+                        reinterpret_cast<void *>(replacement_text_data_set_get_normal_battle_hint),
+                        &g_original_text_data_set_get_normal_battle_hint,
+                        "TextDataSet.get_NormalBattleResultHint");
+            }
+            if (g_text_data_set_get_ab_hint_info != nullptr) {
+                install_il2cpp_method_hook_safe(
+                        text_data_set_class, g_text_data_set_get_ab_hint_info,
+                        reinterpret_cast<void *>(replacement_text_data_set_get_ab_battle_hint),
+                        &g_original_text_data_set_get_ab_battle_hint,
+                        "TextDataSet.get_AbBattleResultHint");
+            }
+        }
+        hook_void_0_or_1_method(
+                loading_scene_manager_class, "SetHintText",
+                reinterpret_cast<void *>(replacement_loading_set_hint_text0),
+                &g_original_loading_set_hint_text0,
+                reinterpret_cast<void *>(replacement_loading_set_hint_text1),
+                &g_original_loading_set_hint_text1,
+                "LoadingSceneManager.SetHintText");
+        hook_void_0_or_1_method(
+                ask_defeat_popup_class, "ApplyBattleHints",
+                reinterpret_cast<void *>(replacement_apply_battle_hints0),
+                &g_original_apply_battle_hints0,
+                reinterpret_cast<void *>(replacement_apply_battle_hints1),
+                &g_original_apply_battle_hints1,
+                "AskAfterDefeatBattlePopup.ApplyBattleHints");
+        LT_LOGI("BattleHint runtime classes textDataSet=%p textDataMgr=%p"
+                " loadingMgr=%p defeatPopup=%p battleHintEntries=%zu",
+                text_data_set_class, text_data_manager_class,
+                loading_scene_manager_class, ask_defeat_popup_class,
+                g_battle_hint_index.size());
 
         if (tmp_set_font_pointer != nullptr &&
             has_inline_hook_space(tmp_text_class, tmp_set_font_pointer)) {

@@ -675,6 +675,40 @@ class TranslationIndexCompilerTest {
         assertEquals("0", properties.getProperty("keywordNameEntryCount"))
     }
 
+    /** 三张小贴士表都必须按表名和数字 ID 生成映射，即使游戏内置旧文案与热更日文措辞不同。 */
+    @Test
+    fun indexesAllBattleHintTablesForJsonDataListRuntimeSync() {
+        val compiler = TranslationIndexCompiler().apply {
+            TranslationRecordCollector().collect(
+                "jp/JP_BattleHint.json",
+                """{"dataList":[{"id":"14","content":"戦闘時、人格は装備しているE.G.Oのうち最も等級の低いものの属性耐性を持った状態で始まります。"},{"id":"34","content":"お互いを攻撃スキルで攻撃するとき、マッチが発生します。"}]}""",
+                """{"dataList":[{"id":"14","content":"战斗开始时，罪人的罪孽抗性为其所装备最低等级E.G.O的抗性。"},{"id":"34","content":"使用攻击技能对峙时，将会进行拼点。"}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_BattleHint_NormalBattle.json",
+                """{"dataList":[{"id":"1","content":"着用したE.G.Oを確認し"}]}""",
+                """{"dataList":[{"id":"1","content":"请确认所装备的E.G.O"}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_BattleHint_AbnorBattle.json",
+                """{"dataList":[{"id":"1","content":"集中戦闘では"}]}""",
+                """{"dataList":[{"id":"1","content":"在集中遭遇战时"}]}"""
+            ).forEach(::add)
+        }
+        val compiled = compiler.compile("2026111701", "archive-sha")
+
+        assertEquals(
+            "使用攻击技能对峙时，将会进行拼点。",
+            compiled.battleHintEntries["BattleHint\u001f34"]
+        )
+        assertEquals(
+            "战斗开始时，罪人的罪孽抗性为其所装备最低等级E.G.O的抗性。",
+            compiled.battleHintEntries["BattleHint\u001f14"]
+        )
+        assertEquals("请确认所装备的E.G.O", compiled.battleHintEntries["BattleHint_NormalBattle\u001f1"])
+        assertEquals("在集中遭遇战时", compiled.battleHintEntries["BattleHint_AbnorBattle\u001f1"])
+    }
+
     /** 停用只移除生效指针，保留不可变索引供下次激活或回退。 */
     @Test
     fun deactivationOnlyRemovesActivePointer() {
