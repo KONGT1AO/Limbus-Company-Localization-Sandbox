@@ -1,107 +1,55 @@
 # Limbus Localizer — 《边狱公司》Android 免 Root 沙箱汉化启动器
 
-[![Android 12~17 Supported](https://img.shields.io/badge/Android-12%20~%2017-brightgreen.svg)](#系统兼容性)
-[![Architecture](https://img.shields.io/badge/Architecture-arm64--v8a-blue.svg)](#构建说明)
-[![Target SDK](https://img.shields.io/badge/Target%20SDK-35-orange.svg)](#构建说明)
+[![Release](https://img.shields.io/github/v/release/KONGT1AO/Limbus-Company-Localization-Sandbox?color=crimson)](https://github.com/KONGT1AO/Limbus-Company-Localization-Sandbox/releases)
+[![Android 12~17 Supported](https://img.shields.io/badge/Android-12%20~%2017-brightgreen.svg)](#下载与快速上手)
 [![License](https://img.shields.io/badge/License-GPL--3.0-lightgrey.svg)](LICENSE)
 
-专为 **《边狱公司》（Limbus Company）** Android 端构建的单应用免 Root 虚拟化沙箱汉化启动器。
-
-基于深度定制的 **VirtualApp 容器内核** 与 **IL2CPP 原生运行时动态注入引擎**，在不修改官方 APK 原生签名与本体二进制文件的前提下，原生承载 Google Play 正版客户端，提供**容器内热更新隔离**、**内置 microG Google 服务**与**高品质中文字体排版渲染**。
-
----
-
-## 🌟 核心特性
-
-### 1. 动态 IL2CPP 运行时汉化引擎（免改包运行架构）
-- **动态符号反射与 Native Hook**：基于 `libv++_64.so` 在 Unity 进程底层挂钩 TextMeshPro（TMP）与 UGUI 文本流，在内存层动态匹配日文/韩文字符串并替换为对应中文。
-- **免改包字体注入与动态字形预热**：主线程动态反射载入中文矢量字体（更纱黑体 / Sarasa Gothic），自动创建并挂载中文 `TMP_FontAsset`；对未激活（Inactive）预制体及动态图集提供字形预热，有效避免缺字方块与字符乱码。
-- **专业级排版与视觉定制**：
-  - **战斗技能横幅**：适配 Regular 字体资产 + 0.14f 膨胀度（`FaceDilate`）+ 紧凑单行自适应排版，笔画清晰开阔，保持技能名称完整呈现且兼顾战局视野；
-  - **UI 界面与结算面板**：深度适配 Unity UGUI `Mask` 与 `RectMask2D` 遮罩管线，镜像迷宫结算奖励弹窗、背包、人格详情等均完整呈现原生质感与阴影（Underlay）。
-
-### 2. 双层存储隔离架构（周四增量热更新兼容）
-- **Clean Game Data（纯净本体层）**：沙箱内保持官方原始文件结构，十几 GB 游戏本体资源与官方增量热更新直接写入该层，确保官方热更新与资源校验顺畅通行。
-- **Merged Cache（汉化叠加层）**：通过内核级 `openat` / `fstatat` 智能重定向，写操作安全穿透至纯净层，校验通过后的只读操作无缝切换至中文合并缓存。
-
-### 3. 免 Root 容器内 Google 账号支持
-- 深度预置 **microG (`com.google.android.gms`)** 与 **FakeStore (`com.android.vending`)** 核心支持。
-- `VPackageManager` 官方证书 `SHA-1` 透明透传代理，配合进程级 `WebView.setDataDirectorySuffix` 存储隔离与 `recaptcha://` 认证跳板，提供便捷的容器内 Google 账号登录体验。
-
-### 4. 易用的管理与诊断启动台
-- **Jetpack Compose 现代化启动台**：一键检测游戏安装状态、汉化包版本更新与沙箱运行环境。
-- **脱敏日志导出**：内置一键导出诊断日志功能，自动剔除个人账号与敏感路径信息，方便排查兼容性问题。
+专为 **《边狱公司》（Limbus Company）** Android 端打造的免 Root 沙箱汉化启动器。  
+无需修改正版游戏安装包签名，也无需卸载重下十余 GB 数据，即可在独立容器中体验完整中文汉化与 Google 登录服务。
 
 ---
 
-## 🛠️ 工程模块架构
+## 📦 下载与快速上手
 
-```text
-Limbus-Company-Localization-Sandbox/
-├── app/                  # 宿主启动器应用（Jetpack Compose，启动台/环境检测/汉化更新/脱敏诊断）
-└── third_party/
-    └── virtualapp-upstream/
-        └── lib/          # VirtualApp 核心虚拟化容器内核
-            └── src/main/jni/
-                └── Foundation/
-                    ├── LimbusTranslationRuntime.cpp  # IL2CPP 汉化引擎核心与 TMP/UI Hook
-                    ├── LimbusTextLayoutPolicy.h     # 中文字体、排版规则与 FaceDilate 视觉策略
-                    ├── IORelocator64.cpp            # 虚拟文件 IO 智能重定向
-                    └── MapsRedirector.cpp           # 内存 Maps 特征隐藏与虚拟环境适配
-```
+- **适用设备**：Android 12 ～ Android 17，主流 64 位（`arm64-v8a`）手机，建议预留 **15～20 GB** 以上存储空间
+- **下载地址**：前往 [**Releases 页面**](https://github.com/KONGT1AO/Limbus-Company-Localization-Sandbox/releases) 下载最新 `LimbusLocalizer-v*-arm64-v8a.apk`
 
----
+### 初次使用步骤
+1. 先在本机安装官方正版《边狱公司》，再安装本启动器 APK。
+2. 打开启动器，在 **「01 启程」** 页同步本机正版游戏（**请勿卸载原机正版 APP**，后续大版本更新后点“重新同步”即可）。
+3. 切换到 **「02 汉化」** 页，选择 **在线下载并更新汉化**，或本地导入汉化资源（支持 `.zip` / `.7z` 压缩包或文件夹）。
+4. 回到 **「01 启程」**，点击 **「进入《边狱公司》」** 即可开始游玩。
 
-## 📱 系统兼容性
-
-- **支持架构**：仅支持 64 位 `arm64-v8a`（现代主流 Android 设备）。
-- **支持 Android 版本**：Android 12 (API 31) ～ **Android 17 (API 36+)**。
-- **真机实测涵盖**：
-  - vivo / iQOO（OriginOS 5 / Android 17）
-  - 一加 / OPPO（ColorOS 15 / Android 16）
-  - 小米 / 红米（Xiaomi HyperOS / Android 14+）
+> [!IMPORTANT]
+> **更新启动器请直接覆盖安装，千万不要先卸载！**  
+> 本应用所有版本均保持统一包名与签名，覆盖安装后，沙箱内已下载的十几 GB 游戏资源与账号登录状态都会完整保留。
 
 ---
 
-## 🔨 构建说明
+## 🌟 主要特点
 
-### 环境要求
-1. **操作系统**：Windows 10/11、Linux 或 macOS
-2. **JDK**：OpenJDK 17（推荐 Temurin 或 Eclipse Adoptium JDK 17）
-3. **Android SDK**：API 35（Android 15+）
-4. **Android NDK**：`27.0.12077973`
-5. **CMake**：`3.22.1`
+- **免改包更安全**：不改动官方 APK 二进制与签名，降低完整性校验异常与账号风险。
+- **周四热更新无忧**：采用纯净本体层与汉化叠加层隔离设计，每周例行更新直接写入游戏层，更新后汉化依然生效，无需每次手动重装补丁。
+- **高还原度中文排版**：
+  - 内置更纱黑体矢量字库，字迹清晰、不缺字；
+  - 完整适配第 6 章 / 第 10 章等动态渐变与打字机台词效果；
+  - 修复战斗超长技能横幅截断、人格卡标题折行重叠以及 UI 材质发白失色等问题，加载界面随机战斗小贴士也已全部汉化。
+- **支持 Google 账号登录**：内置 microG 与基础验证环境，可在容器内直接登录绑定正版账号。
+- **切后台保活与多包管理**：切回桌面回消息更稳健，同时支持多汉化包管理、版本锁定与编辑删除。
 
-### 命令行构建
+---
 
-在工程根目录下执行：
+## ❓ 常见问题
 
-**Windows PowerShell 示例：**
-```powershell
-# 配置环境变量（请根据本机实际安装路径调整）
-$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.x"
-$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-
-# 执行编译与打包
-cmd.exe /c "gradlew.bat assembleDebug --no-daemon 2>&1"
-```
-
-**Linux / macOS 示例：**
-```bash
-export JAVA_HOME="/usr/lib/jvm/java-17-openjdk"
-export PATH="$JAVA_HOME/bin:$PATH"
-
-./gradlew assembleDebug --no-daemon
-```
-
-构建成功后产物位于：
-`app/build/outputs/apk/debug/app-debug.apk`
+- **Q：更新启动器需要重新下载十几 GB 游戏资源吗？**  
+  不需要。只要**不卸载旧版**、直接下载新 APK 覆盖安装，所有数据都会原样继承；官方大版本更新后在「01 启程」重新同步一次原版 APK 即可，不会清除容器内资源。
+- **Q：遇到文字异常、闪退或黑屏怎么反馈？**  
+  可以在启动器 **「03 维护」** 页面点击导出诊断包（工具会自动剔除账号等个人隐私信息），连同截图一并提交 Issue。
 
 ---
 
 ## ⚠️ 免责声明 (Disclaimer)
 
-1. **项目定位**：本项目为开源的技术探索与本地化学习研究成果，由社区开发者独立维护，**非** Project Moon 官方产品，亦未获得 Project Moon 的授权、赞助或背书。
-2. **游戏版权**：《边狱公司》（Limbus Company）及其相关的一切美术、音频、游戏文本、商标及知识产权均归属于 **Project Moon** 官方所有。
-3. **翻译文本**：本项目所配套的中文汉化资源来自于社区翻译团队或开源本地化项目，文本版权归原翻译作者所有。
-4. **风险须知**：本项目通过免修改 APK 的内存及虚拟沙箱技术实现本地化，旨在最大限度保留正版游戏环境。但鉴于网络游戏运营策略及客户端安全机制的不确定性，开发者不对任何使用本工具所导致的账号异常、数据受损或其他损失承担保证或责任，请使用者充分知悉并自行承担相关风险。
+1. 本项目为社区开源技术探索项目，**非** Project Moon 官方产品，与官方无任何隶属或授权关系。
+2. 《边狱公司》（Limbus Company）游戏本体及其美术、音乐、文本等相关权利均归 **Project Moon** 所有；配套使用的中文汉化文本版权归对应翻译团队所有。
+3. 请使用者知悉第三方沙箱工具的潜在不确定性并自行承担使用风险。
