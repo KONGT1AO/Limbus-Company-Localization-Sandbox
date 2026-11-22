@@ -169,7 +169,7 @@ class GeminiLangPackImporter(
                 return String.format(Locale.US, "Context 主字体已就绪 (%.1f MB)", sizeMb)
             }
         }
-        return "内置 Sarasa 中文主字体已就绪"
+        return "内置 Sarasa Bold/Regular 双字重已就绪"
     }
 
     /**

@@ -179,6 +179,8 @@ public final class VClient extends IVClient.Stub {
     private static final String LIMBUS_TRANSLATION_REDIRECT_GATE_FILE = "redirect-gate.pid";
     private static final String LIMBUS_TRANSLATION_FONT_FILE = "ChineseFont-6541a94a.ttf";
     private static final long LIMBUS_TRANSLATION_FONT_SIZE = 24047784L;
+    private static final String LIMBUS_TRANSLATION_BOLD_FONT_FILE = "ChineseFontBold-a56a06f1.ttf";
+    private static final long LIMBUS_TRANSLATION_BOLD_FONT_SIZE = 23870096L;
     private static final String LIMBUS_PACKAGE_NAME = "com.ProjectMoon.LimbusCompany";
     private static final String FRAMEWORK_CREDENTIAL_SERVICE_NAME = "credential";
     private static final String MICROG_PACKAGE_NAME = "com.google.android.gms";
@@ -1249,8 +1251,34 @@ public final class VClient extends IVClient.Stub {
      */
     private void prepareLimbusTranslationFont(Context context) {
         File fontDirectory = new File(context.getFilesDir(), "translation-cache/runtime-font");
-        File fontFile = new File(fontDirectory, LIMBUS_TRANSLATION_FONT_FILE);
-        if (fontFile.isFile() && fontFile.length() == LIMBUS_TRANSLATION_FONT_SIZE) {
+        extractBundledTranslationFont(
+                fontDirectory,
+                context,
+                "runtime/ChineseFont.ttf",
+                LIMBUS_TRANSLATION_FONT_FILE,
+                LIMBUS_TRANSLATION_FONT_SIZE
+        );
+        extractBundledTranslationFont(
+                fontDirectory,
+                context,
+                "runtime/ChineseFontBold.ttf",
+                LIMBUS_TRANSLATION_BOLD_FONT_FILE,
+                LIMBUS_TRANSLATION_BOLD_FONT_SIZE
+        );
+    }
+
+    /**
+     * 将 APK assets 内置的单个运行期中文字体解压到宿主私有目录并校验字节长度。
+     */
+    private void extractBundledTranslationFont(
+            File fontDirectory,
+            Context context,
+            String assetPath,
+            String targetFileName,
+            long expectedSize
+    ) {
+        File fontFile = new File(fontDirectory, targetFileName);
+        if (fontFile.isFile() && fontFile.length() == expectedSize) {
             return;
         }
         if (!fontDirectory.isDirectory() && !fontDirectory.mkdirs()) {
@@ -1258,7 +1286,7 @@ public final class VClient extends IVClient.Stub {
             return;
         }
         File staging = new File(fontDirectory, fontFile.getName() + ".tmp");
-        try (InputStream input = context.getAssets().open("runtime/ChineseFont.ttf");
+        try (InputStream input = context.getAssets().open(assetPath);
              FileOutputStream output = new FileOutputStream(staging)) {
             byte[] buffer = new byte[64 * 1024];
             int count;
@@ -1266,8 +1294,8 @@ public final class VClient extends IVClient.Stub {
                 if (count > 0) output.write(buffer, 0, count);
             }
             output.getFD().sync();
-            if (staging.length() != LIMBUS_TRANSLATION_FONT_SIZE) {
-                throw new IOException("Unexpected ChineseFont.ttf size=" + staging.length());
+            if (staging.length() != expectedSize) {
+                throw new IOException("Unexpected " + assetPath + " size=" + staging.length());
             }
             if (fontFile.exists() && !fontFile.delete()) {
                 throw new IOException("Unable to replace translation font=" + fontFile);
@@ -1277,7 +1305,7 @@ public final class VClient extends IVClient.Stub {
             }
             Log.i("LimbusVA", "Prepared bundled translation font=" + fontFile);
         } catch (Throwable e) {
-            Log.w("LimbusVA", "Unable to prepare bundled translation font", e);
+            Log.w("LimbusVA", "Unable to prepare bundled translation font asset=" + assetPath, e);
         }
     }
 

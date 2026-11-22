@@ -22,7 +22,8 @@ class GameResourceTransfer(
     private val stagingRoot: Path,
     private val gameVersion: Long,
     private val cancelled: () -> Boolean = { false },
-    private val progress: (ResourceTransferProgress) -> Unit = {}
+    private val progress: (ResourceTransferProgress) -> Unit = {},
+    private val usableSpaceProvider: (Path) -> Long = { path -> path.toFile().usableSpace }
 ) {
     private val roots = storage.resourceMigrationRoots().mapValues { it.value.toAbsolutePath().normalize() }
     private data class Entry(val path: String, val size: Long, val hash: String)
@@ -107,7 +108,11 @@ class GameResourceTransfer(
                 count = metadata.getProperty("files")?.toIntOrNull() ?: -1
                 sourceVersion = metadata.getProperty("versionCode")?.toLongOrNull() ?: -1
                 require(total in 1..MAX_BYTES && count in 1..MAX_FILES && sourceVersion > 0) { "迁移包大小或版本信息无效" }
-                require(Files.getFileStore(stage).usableSpace > total + 64 * 1024 * 1024) { "空间不足：迁入前需要暂存并校验整份资源" }
+                val requiredBytes = total + 64L * 1024 * 1024
+                val usableBytes = usableSpaceProvider(stage)
+                require(usableBytes > requiredBytes) {
+                    "空间不足：迁入前需暂存并校验整份资源，至少需要 ${(requiredBytes / (1024 * 1024)) + 1} MiB，当前可用 ${usableBytes / (1024 * 1024)} MiB"
+                }
                 var entry = zip.nextEntry
                 while (entry != null) {
                     checkCancelled()
@@ -148,23 +153,38 @@ class GameResourceTransfer(
             var kept = 0
             var added = 0
             FileOutputStream(stage.resolve(JOURNAL).toFile()).use { journal ->
-                expected.forEach { item ->
-                    checkCancelled()
-                    val target = destination(item.path)
-                    Files.createDirectories(target.parent)
-                    if (Files.exists(target, NOFOLLOW_LINKS)) {
-                        require(Files.isRegularFile(target, NOFOLLOW_LINKS)) { "目标资源不是普通文件" }
-                        kept++
-                    } else {
-                        // Persist the rollback intent before making the new file visible.
-                        journal.write((item.path + "\n").toByteArray(Charsets.UTF_8))
-                        journal.fd.sync()
-                        Files.move(safeStagePath(stage, item.path), target)
-                        added++
+                expected.chunked(JOURNAL_BATCH_SIZE).forEach { batch ->
+                    val toMove = mutableListOf<Entry>()
+                    batch.forEach { item ->
+                        checkCancelled()
+                        val target = destination(item.path)
+                        Files.createDirectories(target.parent)
+                        if (Files.exists(target, NOFOLLOW_LINKS)) {
+                            require(Files.isRegularFile(target, NOFOLLOW_LINKS)) { "目标资源不是普通文件" }
+                            kept++
+                        } else {
+                            toMove += item
+                        }
                     }
-                    report("正在合并资源", added.toLong() + kept, expected.size.toLong())
+                    if (toMove.isNotEmpty()) {
+                        // 每批写入撤销日志并同步一次磁盘后再移动，兼顾崩溃回滚安全性与上万小文件落盘性能。
+                        toMove.forEach { item ->
+                            journal.write((item.path + "\n").toByteArray(Charsets.UTF_8))
+                        }
+                        journal.fd.sync()
+                        toMove.forEach { item ->
+                            checkCancelled()
+                            val target = destination(item.path)
+                            Files.move(safeStagePath(stage, item.path), target)
+                            added++
+                            report("正在合并资源", added.toLong() + kept, expected.size.toLong())
+                        }
+                    } else {
+                        report("正在合并资源", added.toLong() + kept, expected.size.toLong())
+                    }
                 }
             }
+            checkCancelled()
             Files.createFile(stage.resolve(COMPLETE))
             committed = true
             ResourceTransferResult(added, copied, kept, sourceVersion)
@@ -267,6 +287,7 @@ class GameResourceTransfer(
         private const val INDEX = "checksums.bin"
         private const val JOURNAL = "journal.tsv"
         private const val COMPLETE = "complete"
+        private const val JOURNAL_BATCH_SIZE = 128
         private const val MAX_FILES = 50_000
         private const val MAX_FILE_BYTES = 16L * 1024 * 1024 * 1024
         private const val MAX_BYTES = 64L * 1024 * 1024 * 1024

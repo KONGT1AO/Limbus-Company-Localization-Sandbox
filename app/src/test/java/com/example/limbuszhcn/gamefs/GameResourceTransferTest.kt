@@ -156,4 +156,57 @@ class GameResourceTransferTest {
         assertArrayEquals(bytes, target.resolve("assets/large.bundle").readBytes())
         assertEquals(483L, result.sourceVersion)
     }
+
+    @Test
+    fun reportsClearMiBMessageWhenUsableSpaceIsInsufficient() {
+        val (_, archive) = sample()
+        val target = Files.createTempDirectory("resource-low-space")
+        file(target, "assets/existing", "keep")
+        val transfer = GameResourceTransfer(
+            storage = ContainerWorkspaceStorage(
+                target.resolve("assets/Resources_moved/Localize"),
+                mapOf("assets" to target.resolve("assets"), "cache" to target.resolve("cache/Shared"))
+            ),
+            stagingRoot = target.resolve("staging"),
+            gameVersion = 483,
+            usableSpaceProvider = { 1024L }
+        )
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            transfer.importResources(ByteArrayInputStream(archive))
+        }
+        assertTrue(error.message.orEmpty().contains("空间不足"))
+        assertTrue(error.message.orEmpty().contains("MiB"))
+        assertEquals("keep", target.resolve("assets/existing").readText())
+        Files.list(target.resolve("staging")).use { assertEquals(0, it.count()) }
+    }
+
+    @Test
+    fun batchedJournalCommitsAndRollsBackAcrossMoreThanOneBatch() {
+        val source = Files.createTempDirectory("resource-batch-src")
+        for (i in 0 until 150) {
+            file(source, "assets/pack/file_%03d.dat".format(i), "payload-$i")
+        }
+        val archive = ByteArrayOutputStream().also { transfer(source).exportResources(it) }.toByteArray()
+
+        val target = Files.createTempDirectory("resource-batch-dst")
+        file(target, "assets/pack/file_000.dat", "keep-existing")
+        val result = transfer(target).importResources(ByteArrayInputStream(archive))
+        assertEquals(149, result.files)
+        assertEquals(1, result.keptExisting)
+        assertEquals("keep-existing", target.resolve("assets/pack/file_000.dat").readText())
+        assertEquals("payload-149", target.resolve("assets/pack/file_149.dat").readText())
+
+        val rollbackTarget = Files.createTempDirectory("resource-batch-rollback")
+        file(rollbackTarget, "assets/pack/file_000.dat", "keep-existing")
+        assertThrows(CancellationException::class.java) {
+            transfer(
+                rollbackTarget,
+                cancel = { Files.exists(rollbackTarget.resolve("assets/pack/file_130.dat")) }
+            ).importResources(ByteArrayInputStream(archive))
+        }
+        assertEquals("keep-existing", rollbackTarget.resolve("assets/pack/file_000.dat").readText())
+        assertFalse(Files.exists(rollbackTarget.resolve("assets/pack/file_001.dat")))
+        assertFalse(Files.exists(rollbackTarget.resolve("assets/pack/file_130.dat")))
+        assertFalse(Files.exists(rollbackTarget.resolve("assets/pack/file_149.dat")))
+    }
 }

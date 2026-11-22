@@ -8,9 +8,11 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Process
 import android.os.SystemClock
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -145,6 +147,39 @@ class MainActivity : ComponentActivity() {
             storage = containerRuntime.storage()
         )
 
+    private fun hasDropInStorageAccess(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+
+    private fun openAllFilesAccessSettings(): String {
+        val appSpecific = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        return runCatching {
+            startActivity(appSpecific)
+            PersistentDiagnosticLog.info(TAG, "Opened app-specific all files access settings")
+            "请在系统页面开启「授予所有文件的管理权限」，返回后将自动刷新热投递目录"
+        }.getOrElse { primaryError ->
+            PersistentDiagnosticLog.warn(
+                TAG,
+                "App-specific all files access intent unavailable, falling back",
+                primaryError
+            )
+            runCatching {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                PersistentDiagnosticLog.info(TAG, "Opened global all files access settings")
+                "请在系统列表中找到「Limbus 汉化容器」并允许管理所有文件"
+            }.getOrElse { fallbackError ->
+                PersistentDiagnosticLog.error(
+                    TAG,
+                    "Unable to open all files access settings",
+                    fallbackError
+                )
+                fallbackError.userMessage()
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PersistentDiagnosticLog.info(
@@ -204,6 +239,7 @@ class MainActivity : ComponentActivity() {
             }
             var installedPatches by remember { mutableStateOf<List<CachedPatchMetadata>>(emptyList()) }
             var dropInCandidates by remember { mutableStateOf<List<GeminiLangPackImporter.DropInCandidate>>(emptyList()) }
+            var hasDropInAccess by remember { mutableStateOf(hasDropInStorageAccess()) }
             var message by remember {
                 mutableStateOf(containerStatus.message)
             }
@@ -217,6 +253,7 @@ class MainActivity : ComponentActivity() {
                 val font = runCatching { geminiImporter.describeActiveFont() }.getOrDefault("未检测")
                 val report = runCatching { deviceCompatibility.report() }.getOrNull()
                 val patches = runCatching { installer?.listInstalledPatches() }.getOrNull().orEmpty()
+                val access = hasDropInStorageAccess()
                 val candidates = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
                 runOnUiThread {
                     containerStatus = status
@@ -225,6 +262,7 @@ class MainActivity : ComponentActivity() {
                     cachedMeta = meta
                     fontStatus = font
                     installedPatches = patches
+                    hasDropInAccess = access
                     dropInCandidates = candidates
                     if (report != null) {
                         compatibilityReport = report
@@ -240,8 +278,16 @@ class MainActivity : ComponentActivity() {
                     val report = runCatching {
                         deviceCompatibility.report()
                     }.getOrNull()
+                    val access = hasDropInStorageAccess()
+                    val patches = runCatching { createInstaller().listInstalledPatches() }.getOrNull().orEmpty()
+                    val candidates = runCatching {
+                        geminiImporter.listDropInCandidates(applicationContext)
+                    }.getOrNull().orEmpty()
                     runOnUiThread {
                         gameRunning = running
+                        hasDropInAccess = access
+                        installedPatches = patches
+                        dropInCandidates = candidates
                         if (report != null) {
                             compatibilityReport = report
                         }
@@ -481,11 +527,22 @@ class MainActivity : ComponentActivity() {
                 busyMessage = if (exporting) "正在准备迁出容器游戏资源" else "正在准备迁入容器游戏资源"
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 Thread {
+                    PersistentDiagnosticLog.info(
+                        TAG,
+                        "Starting resource transfer exporting=$exporting uri=$uri"
+                    )
                     val result = runCatching {
-                        if (!exporting) prepareGame()
+                        if (!exporting) {
+                            runOnUiThread { busyMessage = "正在校验并同步容器游戏环境..." }
+                            prepareGame()
+                        }
                         val status = readContainerStatus()
                         require(status.gameImported) { "请先同步游戏到容器" }
+                        runOnUiThread { busyMessage = "正在停止运行中的容器游戏..." }
                         containerRuntime.stopGameForResourceTransfer()
+                        runOnUiThread {
+                            busyMessage = if (exporting) "正在扫描可迁出资源..." else "正在打开并校验迁移包..."
+                        }
                         val transfer = GameResourceTransfer(
                             storage = containerRuntime.storage(),
                             stagingRoot = filesDir.toPath().resolve("resource-transfers"),
@@ -514,6 +571,27 @@ class MainActivity : ComponentActivity() {
                             contentResolver.openInputStream(uri).use { input ->
                                 transfer.importResources(requireNotNull(input) { "无法打开所选迁移包" })
                             }
+                        }
+                    }.onSuccess { summary ->
+                        PersistentDiagnosticLog.info(
+                            TAG,
+                            "Resource transfer finished exporting=$exporting files=${summary.files} " +
+                                "bytes=${summary.bytes} keptExisting=${summary.keptExisting} " +
+                                "sourceVersion=${summary.sourceVersion}"
+                        )
+                    }.onFailure { error ->
+                        if (error is java.util.concurrent.CancellationException) {
+                            PersistentDiagnosticLog.warn(
+                                TAG,
+                                "Resource transfer cancelled exporting=$exporting",
+                                error
+                            )
+                        } else {
+                            PersistentDiagnosticLog.error(
+                                TAG,
+                                "Resource transfer failed exporting=$exporting",
+                                error
+                            )
                         }
                     }
                     syncUiSnapshots()
@@ -557,6 +635,10 @@ class MainActivity : ComponentActivity() {
                     busyMessage = busyMessage,
                     gameRunning = gameRunning,
                     message = message,
+                    hasDropInAccess = hasDropInAccess,
+                    onRequestDropInAccessClick = {
+                        message = openAllFilesAccessSettings()
+                    },
                     onCancelTask = resourceCancellation?.let { flag ->
                         { flag.set(true); busyMessage = "正在取消资源迁移..." }
                     },
@@ -584,9 +666,11 @@ class MainActivity : ComponentActivity() {
                         showPackSelectionDialog = true
                         Thread {
                             val installer = runCatching { createInstaller() }.getOrNull()
+                            val access = hasDropInStorageAccess()
                             val patches = runCatching { installer?.listInstalledPatches() }.getOrNull().orEmpty()
                             val candidates = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
                             runOnUiThread {
+                                hasDropInAccess = access
                                 installedPatches = patches
                                 dropInCandidates = candidates
                             }
@@ -607,26 +691,30 @@ class MainActivity : ComponentActivity() {
                         openFolderLauncher.launch(null)
                     },
                     onScanDropInAndRefreshClick = {
-                        runTask("正在扫描热投递目录并对齐游戏资源...") {
-                            val autoImported = geminiImporter.scanAutoImportSources(applicationContext)
-                            val installer = createInstaller()
-                            if (autoImported != null) {
-                                pendingGameRestartForNewIndex = true
-                                if (translationEnabled) {
-                                    val summary = installer.activateRedirect(
-                                        autoImported.extraction.outputDirectory,
-                                        autoImported.extraction.manifest
-                                    )
-                                    installResultMessage(summary, autoImported.sourceLabel)
+                        if (!hasDropInStorageAccess()) {
+                            message = openAllFilesAccessSettings()
+                        } else {
+                            runTask("正在扫描热投递目录并对齐游戏资源...") {
+                                val autoImported = geminiImporter.scanAutoImportSources(applicationContext)
+                                val installer = createInstaller()
+                                if (autoImported != null) {
+                                    pendingGameRestartForNewIndex = true
+                                    if (translationEnabled) {
+                                        val summary = installer.activateRedirect(
+                                            autoImported.extraction.outputDirectory,
+                                            autoImported.extraction.manifest
+                                        )
+                                        installResultMessage(summary, autoImported.sourceLabel)
+                                    } else {
+                                        "已从热投递目录导入 v${autoImported.version}"
+                                    }
+                                } else if (translationEnabled && installer.latestCachedPatchMetadata() != null) {
+                                    val summary = installer.refreshActiveRedirects()
+                                    pendingGameRestartForNewIndex = summary.indexActivated
+                                    installResultMessage(summary, "重新对齐容器日文表")
                                 } else {
-                                    "已从热投递目录导入 v${autoImported.version}"
+                                    "热投递目录暂无新压缩包；当前状态已刷新"
                                 }
-                            } else if (translationEnabled && installer.latestCachedPatchMetadata() != null) {
-                                val summary = installer.refreshActiveRedirects()
-                                pendingGameRestartForNewIndex = summary.indexActivated
-                                installResultMessage(summary, "重新对齐容器日文表")
-                            } else {
-                                "热投递目录暂无新压缩包；当前状态已刷新"
                             }
                         }
                     },
@@ -716,7 +804,13 @@ class MainActivity : ComponentActivity() {
                         createResourceDocument.launch("LimbusResources-$stamp.zip")
                     },
                     onImportResources = {
-                        openResourceDocument.launch(arrayOf("application/zip", "application/octet-stream"))
+                        openResourceDocument.launch(
+                            arrayOf(
+                                "application/zip",
+                                "application/x-zip-compressed",
+                                "application/octet-stream"
+                            )
+                        )
                     },
                     onExportDebugLogs = {
                         busy = true
@@ -819,6 +913,35 @@ class MainActivity : ComponentActivity() {
                                     color = if (isPackManageMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(bottom = 4.dp)
                                 )
+
+                                if (!hasDropInAccess) {
+                                    Surface(
+                                        shape = packCardShape,
+                                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+                                        ),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text(
+                                                text = "未开启「所有文件访问权限」，暂无法读取外部放入 Download/LimbusLocalizer 的汉化包：",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Button(
+                                                onClick = { message = openAllFilesAccessSettings() },
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text("前往授权访问公共热投递目录")
+                                            }
+                                        }
+                                    }
+                                }
 
                                 if (dropInCandidates.isNotEmpty()) {
                                     Row(

@@ -516,7 +516,9 @@ private class VirtualAppReflectionBridge(
             "external-unity-cache" to external.resolve("cache/UnityCache/Shared").toPath(),
             "external-files-unity-cache" to files.resolve("UnityCache/Shared").toPath(),
             "internal-unity-cache" to internal.resolve("cache/UnityCache/Shared").toPath(),
-            "internal-files-unity-cache" to internal.resolve("files/UnityCache/Shared").toPath()
+            "internal-files-unity-cache" to internal.resolve("files/UnityCache/Shared").toPath(),
+            "external-addressables" to files.resolve("com.unity.addressables").toPath(),
+            "external-fmod" to files.resolve("fmod").toPath()
         )
     }
 

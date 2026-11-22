@@ -108,6 +108,8 @@ internal fun LimbusPeScreenRedesign(
     onExportResources: () -> Unit,
     onImportResources: () -> Unit,
     onExportDebugLogs: () -> Unit,
+    hasDropInAccess: Boolean = true,
+    onRequestDropInAccessClick: () -> Unit = {},
     screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
     onScreenOrientationModeChange: (Int) -> Unit = {}
 ) {
@@ -160,17 +162,20 @@ internal fun LimbusPeScreenRedesign(
                     dropInPath = dropInPath,
                     translationEnabled = translationEnabled,
                     busy = busy,
+                    hasDropInAccess = hasDropInAccess,
                     onToggleTranslationEnabled = onToggleTranslationEnabled,
                     onManagePacksClick = onManagePacksClick,
                     onImportArchiveClick = onImportArchiveClick,
                     onImportFolderClick = onImportFolderClick,
-                    onScanDropInAndRefreshClick = onScanDropInAndRefreshClick
+                    onScanDropInAndRefreshClick = onScanDropInAndRefreshClick,
+                    onRequestDropInAccessClick = onRequestDropInAccessClick
                 )
 
                 HostTab.Maintenance -> MaintenancePage(
                     containerStatus = containerStatus,
                     githubReleaseUrl = githubReleaseUrl,
                     busy = busy,
+                    message = message,
                     screenOrientationMode = screenOrientationMode,
                     onScreenOrientationModeChange = onScreenOrientationModeChange,
                     onSyncInstalledGame = onSyncInstalledGame,
@@ -590,11 +595,13 @@ private fun TranslationPage(
     dropInPath: String,
     translationEnabled: Boolean,
     busy: Boolean,
+    hasDropInAccess: Boolean = true,
     onToggleTranslationEnabled: (Boolean) -> Unit,
     onManagePacksClick: () -> Unit = {},
     onImportArchiveClick: () -> Unit,
     onImportFolderClick: () -> Unit,
-    onScanDropInAndRefreshClick: () -> Unit
+    onScanDropInAndRefreshClick: () -> Unit,
+    onRequestDropInAccessClick: () -> Unit = {}
 ) {
     val versionDisplay = when {
         lastInstall != null -> "v${lastInstall.version}（已激活）"
@@ -659,6 +666,36 @@ private fun TranslationPage(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
+            if (!hasDropInAccess) {
+                Surface(
+                    shape = ControlShape,
+                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f),
+                    border = BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "未获得「所有文件访问权限」：Android 11 及以上系统在重装启动器后，外部文件管理器放入该目录的汉化包将无法被检测。",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Button(
+                            onClick = onRequestDropInAccessClick,
+                            enabled = !busy,
+                            shape = ControlShape,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("授权访问公共热投递目录")
+                        }
+                    }
+                }
+            }
         }
         SectionCard(
             title = "汉化包管理与导入",
@@ -711,6 +748,7 @@ private fun MaintenancePage(
     containerStatus: ContainerStatus,
     githubReleaseUrl: String,
     busy: Boolean,
+    message: String,
     onSyncInstalledGame: () -> Unit,
     onGithubReleaseUrlChange: (String) -> Unit,
     onPullFromGithubClick: () -> Unit,
@@ -720,12 +758,24 @@ private fun MaintenancePage(
     screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
     onScreenOrientationModeChange: (Int) -> Unit = {}
 ) {
-    PageColumn {
-        PageHeading(
-            index = "03",
-            title = "维护终端",
-            subtitle = "同步游戏、迁移资源并保存诊断现场。"
-        )
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (message.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .padding(top = 12.dp, bottom = 4.dp)
+            ) {
+                SystemMessage(message)
+            }
+        }
+        Box(modifier = Modifier.weight(1f)) {
+            PageColumn {
+                PageHeading(
+                    index = "03",
+                    title = "维护终端",
+                    subtitle = "同步游戏、迁移资源并保存诊断现场。"
+                )
         SectionCard(
             title = "游戏与容器",
             badge = if (containerStatus.gameImported) "数据已关联" else "等待同步"
@@ -882,6 +932,8 @@ private fun MaintenancePage(
             }
         }
         Spacer(modifier = Modifier.height(4.dp))
+            }
+        }
     }
 }
 

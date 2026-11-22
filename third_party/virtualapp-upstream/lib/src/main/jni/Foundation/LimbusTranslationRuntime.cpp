@@ -4379,15 +4379,20 @@ bool ensure_tmp_font() {
         separator = font_base.find_last_of('/');
         if (separator != std::string::npos) font_base.resize(separator);
         std::string custom_font = font_base + "/runtime-font/CustomChineseFont.ttf";
+        std::string bundled_bold_font = font_base + "/runtime-font/ChineseFontBold-a56a06f1.ttf";
         std::string bundled_font = font_base + "/runtime-font/ChineseFont-6541a94a.ttf";
         struct stat bundled_stat = {};
+        struct stat bundled_bold_stat = {};
         struct stat custom_stat = {};
-        // 描边与字面膨胀已经清零，优先使用汉化包自带的 Sarasa Bold 以贴近日文原版的
-        // 中等偏粗字重；仅当汉化包未提供字体时才回退到内置 Regular。
-        std::string font_file =
-                (stat(custom_font.c_str(), &custom_stat) == 0 && custom_stat.st_size > 102400)
-                ? custom_font
-                : bundled_font;
+        const bool has_custom_font =
+                stat(custom_font.c_str(), &custom_stat) == 0 && custom_stat.st_size > 102400;
+        const bool has_bundled_bold =
+                stat(bundled_bold_font.c_str(), &bundled_bold_stat) == 0 &&
+                bundled_bold_stat.st_size > 102400;
+        // 描边与字面膨胀已经清零，主字体按“汉化包自定义 > 内置 Sarasa Bold > 内置 Regular”选择，
+        // 导入不含字体文件的轻量汉化包时也默认保持接近原版的 Bold 字重。
+        std::string font_file = has_custom_font ? custom_font :
+                (has_bundled_bold ? bundled_bold_font : bundled_font);
         LT_LOGI("Preparing TMP Chinese font asset from path=%s", font_file.c_str());
         void *font_path = new_managed_string(font_file);
         int32_t face_index = 0;
@@ -4410,8 +4415,21 @@ bool ensure_tmp_font() {
             g_tmp_font_asset = g_runtime_invoke(
                     g_create_tmp_font_info, nullptr, asset_args, &exception);
         }
+        if (g_tmp_font_asset == nullptr && font_file != bundled_bold_font && has_bundled_bold) {
+            LT_LOGW("Custom TMP Chinese font failed to load; falling back to bundled bold=%s",
+                    bundled_bold_font.c_str());
+            font_file = bundled_bold_font;
+            void *fallback_bold_path = new_managed_string(bundled_bold_font);
+            asset_args[0] = fallback_bold_path;
+            exception = nullptr;
+            if (fallback_bold_path != nullptr && g_runtime_invoke != nullptr) {
+                g_tmp_font_asset = g_runtime_invoke(
+                        g_create_tmp_font_info, nullptr, asset_args, &exception);
+            }
+        }
         if (g_tmp_font_asset == nullptr && font_file != bundled_font) {
-            LT_LOGW("Custom TMP Chinese font failed to load; falling back to bundled font=%s", bundled_font.c_str());
+            LT_LOGW("Primary TMP Chinese font failed to load; falling back to bundled regular=%s",
+                    bundled_font.c_str());
             void *fallback_path = new_managed_string(bundled_font);
             asset_args[0] = fallback_path;
             exception = nullptr;
