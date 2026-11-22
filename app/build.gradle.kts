@@ -20,8 +20,8 @@ android {
         applicationId = "io.limbuspe.box"
         minSdk = 26
         targetSdk = 35
-        versionCode = 264
-        versionName = "1.0.6"
+        versionCode = 266
+        versionName = "1.0.7"
 
         ndk {
             abiFilters += "arm64-v8a"

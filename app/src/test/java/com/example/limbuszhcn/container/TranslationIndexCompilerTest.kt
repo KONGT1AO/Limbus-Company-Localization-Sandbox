@@ -709,6 +709,58 @@ class TranslationIndexCompilerTest {
         assertEquals("在集中遭遇战时", compiled.battleHintEntries["BattleHint_AbnorBattle\u001f1"])
     }
 
+    /** 纯汉字实体名不得污染全局子串术语，但含假名饰品/技能、括号标签与分类表正常入表。 */
+    @Test
+    fun excludesSkillAndPassiveEntityNamesFromEmbeddedTermsWhileKeepingExactAndBracketMatches() {
+        val compiler = TranslationIndexCompiler().apply {
+            TranslationRecordCollector().collect(
+                "jp/JP_Skills_personality-06.json",
+                """{"dataList":[{"id":1061203,"levelList":[{"level":3,"name":"集中"},{"level":4,"name":"集中"}]}]}""",
+                """{"dataList":[{"id":1061203,"levelList":[{"level":3,"name":"心神凝聚"},{"level":4,"name":"心神凝聚"}]}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_Passives.json",
+                """{"dataList":[{"id":1061101,"name":"集中"}]}""",
+                """{"dataList":[{"id":1061101,"name":"集中精神"}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_EGOgift_Test.json",
+                """{"dataList":[{"id":9432,"name":"逃走"}]}""",
+                """{"dataList":[{"id":9432,"name":"溃退"}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_Skills_test.json",
+                """{"dataList":[{"id":999,"levelList":[{"level":1,"name":"代行[指令]"}]},{"id":1000,"levelList":[{"level":1,"name":"テスト斬撃"}]}]}""",
+                """{"dataList":[{"id":999,"levelList":[{"level":1,"name":"代办[命令]"}]},{"id":1000,"levelList":[{"level":1,"name":"测试斩击"}]}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_EGOgift_MirrorDungeon-EventTheme_2.json",
+                """{"dataList":[{"id":9760,"name":"火の消えた燭台"},{"id":9763,"name":"ラッピングリボン"}]}""",
+                """{"dataList":[{"id":9760,"name":"熄灭的烛台"},{"id":9763,"name":"包装缎带"}]}"""
+            ).forEach(::add)
+            TranslationRecordCollector().collect(
+                "jp/JP_EgoGiftCategory.json",
+                """{"dataList":[{"id":"Penetrate","name":"貫通"}]}""",
+                """{"dataList":[{"id":"Penetrate","name":"突刺"}]}"""
+            ).forEach(::add)
+        }
+        val compiled = compiler.compile("2026112201", "archive-sha")
+
+        assertFalse(compiled.termEntries.containsKey("集中"))
+        assertFalse(compiled.termEntries.containsKey("逃走"))
+        assertFalse(compiled.termEntries.containsKey("代行[指令]"))
+        assertEquals("命令", compiled.termEntries["指令"])
+        assertEquals("测试斩击", compiled.termEntries["テスト斬撃"])
+        assertEquals("熄灭的烛台", compiled.termEntries["火の消えた燭台"])
+        assertEquals("包装缎带", compiled.termEntries["ラッピングリボン"])
+        assertEquals("突刺", compiled.termEntries["貫通"])
+        assertEquals("心神凝聚", compiled.contextEntries["id=1061203\u001fname\u001f集中"])
+        assertEquals("集中精神", compiled.contextEntries["id=1061101\u001fname\u001f集中"])
+        assertEquals("溃退", compiled.uniqueEntries["逃走"])
+        assertEquals("熄灭的烛台", compiled.uniqueEntries["火の消えた燭台"])
+        assertEquals("包装缎带", compiled.uniqueEntries["ラッピングリボン"])
+    }
+
     /** 停用只移除生效指针，保留不可变索引供下次激活或回退。 */
     @Test
     fun deactivationOnlyRemovesActivePointer() {

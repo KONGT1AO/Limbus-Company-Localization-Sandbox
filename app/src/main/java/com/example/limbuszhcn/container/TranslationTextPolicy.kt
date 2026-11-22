@@ -67,6 +67,17 @@ internal object TranslationTextPolicy {
     private val NON_TERM_FILE_PREFIXES: Set<String> = setOf("projectgs")
 
     /**
+     * 无假名纯汉字的技能、被动与 E.G.O 饰品 `name` 字段常含“集中”“回避”“切断”等中日同形词，
+     * 仅应参与全文/上下文精确映射，不得整串提升为跨页面嵌入短术语（仅允许派生其中的 `[...]` 标签）。
+     * 含日文假名的实体名称与中文语料零碰撞，仍允许进入嵌入术语以支持事件饰品等动态拼接文案。
+     */
+    private val NON_EMBEDDED_ENTITY_NAME_PREFIXES: Set<String> = setOf(
+        "skills", "passives", "egogift"
+    )
+
+    private val RICH_TEXT_TAG = Regex("<[^>]+>")
+
+    /**
      * 判断字段能否作为玩家可见文本进入运行时索引。
      *
      * @param field JSON 字段名。
@@ -101,6 +112,43 @@ internal object TranslationTextPolicy {
         return !narrativeDirectory &&
             NARRATIVE_FILE_PREFIXES.none { prefix -> fileName.startsWith(prefix) } &&
             NON_TERM_FILE_PREFIXES.none { prefix -> fileName.startsWith(prefix) }
+    }
+
+    /**
+     * 判断文本在剥离富文本控制标签后是否包含日文平假名或片假名。
+     *
+     * @param value 待检测字符串。
+     * @return 包含日文假名字符时返回 `true`。
+     */
+    fun containsJapaneseKana(value: String): Boolean {
+        val visible = RICH_TEXT_TAG.replace(value, "")
+        return visible.any { character ->
+            character in '\u3040'..'\u30ff' ||
+                character in '\u31f0'..'\u31ff' ||
+                character in '\uff66'..'\uff9f'
+        }
+    }
+
+    /**
+     * 判断该记录的 `name` 字段是否应仅作为实体精确/上下文名称处理，只允许派生内部 `[...]` 标签，
+     * 不允许把整个实体名称放入全局子串短术语表。
+     *
+     * 分类表（如 `egogiftcategory`）及包含日文假名的实体名称不在拦截之列。
+     */
+    fun isEntityNameOnlySource(path: String, field: String, source: String = ""): Boolean {
+        if (field != "name") return false
+        val fileName = path.replace('\\', '/')
+            .substringAfterLast('/')
+            .lowercase()
+            .removePrefix("jp_")
+            .removePrefix("en_")
+            .removePrefix("kr_")
+        if (fileName.startsWith("egogiftcategory")) return false
+        if (NON_EMBEDDED_ENTITY_NAME_PREFIXES.none { prefix -> fileName.startsWith(prefix) }) {
+            return false
+        }
+        if (source.isNotEmpty() && containsJapaneseKana(source)) return false
+        return true
     }
 
     /**

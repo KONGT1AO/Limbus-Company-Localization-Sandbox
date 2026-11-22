@@ -1125,8 +1125,8 @@ bool is_usable_display_text(const std::string &value) {
     return true;
 }
 
-bool contains_japanese_kana(const std::string &value) {
-    // link/ruby 等属性可能保留日文键；控制标签中的假名不能判定可见正文仍未翻译。
+std::string strip_tmp_control_tags_for_prose(const std::string &value) {
+    // link/ruby 等属性可能保留日文键；控制标签中的假名和字符不代表可见正文。
     std::string visible;
     visible.reserve(value.size());
     for (size_t offset = 0; offset < value.size();) {
@@ -1137,11 +1137,15 @@ bool contains_japanese_kana(const std::string &value) {
             size_t name_end = name;
             while (name_end < value.size() &&
                    ((value[name_end] >= 'a' && value[name_end] <= 'z') ||
-                    (value[name_end] >= 'A' && value[name_end] <= 'Z') || value[name_end] == '-')) ++name_end;
+                    (value[name_end] >= 'A' && value[name_end] <= 'Z') ||
+                    value[name_end] == '-')) {
+                ++name_end;
+            }
             // 但丁对白可能用 <えっと…> 包句子，不能把这类正文当成 TMP 属性丢掉。
             bool control_name = name_end > name && name_end < value.size() &&
-                    (value[name_end] == '=' || value[name_end] == '>' || value[name_end] == ' ' ||
-                     value[name_end] == '/' || value[name_end] == '\t');
+                    (value[name_end] == '=' || value[name_end] == '>' ||
+                     value[name_end] == ' ' || value[name_end] == '/' ||
+                     value[name_end] == '\t');
             if (end != std::string::npos && control_name) {
                 offset = end + 1;
                 continue;
@@ -1149,6 +1153,11 @@ bool contains_japanese_kana(const std::string &value) {
         }
         visible.push_back(value[offset++]);
     }
+    return visible;
+}
+
+bool contains_japanese_kana(const std::string &value) {
+    const std::string visible = strip_tmp_control_tags_for_prose(value);
     std::u16string utf16;
     if (!utf8_to_utf16(visible, &utf16)) return false;
     return std::any_of(utf16.begin(), utf16.end(), [](char16_t character) {
@@ -1368,10 +1377,190 @@ size_t internal_term_separator_end(const std::string &source, size_t offset) {
     return offset;
 }
 
+bool looks_like_translated_chinese_prose(const std::string &source) {
+    if (source.empty() || contains_japanese_kana(source)) {
+        return false;
+    }
+    const std::string visible = strip_tmp_control_tags_for_prose(source);
+    // 仍包含未解析方括号标签（如 [戦闘開始時]）的文本继续交给术语表替换。
+    size_t open_bracket = visible.find('[');
+    while (open_bracket != std::string::npos) {
+        size_t close_bracket = visible.find(']', open_bracket + 1);
+        if (close_bracket != std::string::npos && close_bracket > open_bracket + 1) {
+            return false;
+        }
+        open_bracket = visible.find('[', open_bracket + 1);
+    }
+    std::u16string utf16;
+    if (!utf8_to_utf16(visible, &utf16)) {
+        return false;
+    }
+    size_t cjk_count = 0;
+    bool has_cn_prose_punctuation = false;
+    for (char16_t character : utf16) {
+        if (character >= 0x4e00 && character <= 0x9fff) {
+            ++cjk_count;
+        } else if (character == 0xff0c || character == 0x3002 ||
+                   character == 0xff1b || character == 0x3001 ||
+                   character == 0xff1a || character == 0xff08 ||
+                   character == 0xff09) {
+            has_cn_prose_punctuation = true;
+        }
+    }
+    const bool has_link_tag = source.find("<link") != std::string::npos;
+    return (cjk_count >= 4 && has_cn_prose_punctuation) ||
+           cjk_count >= 8 ||
+           (has_link_tag && cjk_count >= 4);
+}
+
+/**
+ * 判断文本是否属于事件界面中“获得/失去 E.G.O 饰品或器物”的结果提示。
+ *
+ * 仅在这类极窄且无歧义的格式语境下，才允许内层 `<color>` 包裹的无假名纯汉字
+ * 实体名（如第八章器物「銅銭」）做整段精确查表替换。
+ */
+bool is_event_reward_result_context(const std::string &source) {
+    if (source.empty() || source.find("<link") != std::string::npos) {
+        return false;
+    }
+    const std::string visible = strip_tmp_control_tags_for_prose(source);
+    if (visible.find('\n') != std::string::npos || visible.find('\r') != std::string::npos) {
+        return false;
+    }
+    std::u16string utf16;
+    if (!utf8_to_utf16(visible, &utf16) || utf16.size() > 48) {
+        return false;
+    }
+    if (visible.find("E.G.O饰品") != std::string::npos ||
+        visible.find("器物") != std::string::npos) {
+        return true;
+    }
+    const bool has_gain_or_lose =
+            visible.find("获得") != std::string::npos ||
+            visible.find("失去") != std::string::npos;
+    return has_gain_or_lose && visible.find("枚") != std::string::npos;
+}
+
+bool match_ascii_ci(const std::string &source, size_t offset, const char *literal, size_t length) {
+    if (offset + length > source.size()) return false;
+    for (size_t i = 0; i < length; ++i) {
+        unsigned char a = static_cast<unsigned char>(source[offset + i]);
+        unsigned char b = static_cast<unsigned char>(literal[i]);
+        if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+/**
+ * 针对嵌套或独立的最内层 `<color=...>SPAN</color>` 片段执行整段精确查表替换，
+ * 保留外层样式与 `<color>` 标签字节不变。
+ */
+bool translate_colored_exact_spans(
+        const std::string &source, std::string *output,
+        const std::vector<limbus_translation_guard::ProtectedSpan> *protected_spans = nullptr) {
+    if (output == nullptr || source.empty() ||
+        (g_index.empty() && g_fallback_index.empty()) ||
+        (source.find("<color") == std::string::npos &&
+         source.find("<COLOR") == std::string::npos)) {
+        return false;
+    }
+    const bool allow_no_kana = is_event_reward_result_context(source);
+    output->clear();
+    output->reserve(source.size());
+    bool changed = false;
+    for (size_t offset = 0; offset < source.size();) {
+        if (source[offset] == '<' && offset + 6 < source.size() &&
+            match_ascii_ci(source, offset, "<color", 6) &&
+            (source[offset + 6] == '=' || source[offset + 6] == '>' ||
+             source[offset + 6] == ' ' || source[offset + 6] == '\t')) {
+            const size_t tag_end = source.find('>', offset + 6);
+            if (tag_end != std::string::npos) {
+                const size_t inner_begin = tag_end + 1;
+                const size_t next_lt = source.find('<', inner_begin);
+                size_t close_end = std::string::npos;
+                if (next_lt != std::string::npos &&
+                    match_ascii_ci(source, next_lt, "</color", 7)) {
+                    size_t cursor = next_lt + 7;
+                    while (cursor < source.size() &&
+                           (source[cursor] == ' ' || source[cursor] == '\t')) {
+                        ++cursor;
+                    }
+                    if (cursor < source.size() && source[cursor] == '>') {
+                        close_end = cursor + 1;
+                    }
+                }
+                if (close_end != std::string::npos && inner_begin < next_lt) {
+                    bool overlaps_protected = false;
+                    if (protected_spans != nullptr) {
+                        for (const auto &span : *protected_spans) {
+                            if (span.begin < next_lt && span.end > inner_begin) {
+                                overlaps_protected = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!overlaps_protected) {
+                        auto is_span_space = [](char ch) {
+                            return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+                        };
+                        size_t core_begin = inner_begin;
+                        while (core_begin < next_lt && is_span_space(source[core_begin])) {
+                            ++core_begin;
+                        }
+                        size_t core_end = next_lt;
+                        while (core_end > core_begin && is_span_space(source[core_end - 1])) {
+                            --core_end;
+                        }
+                        if (core_begin < core_end) {
+                            const std::string core =
+                                    source.substr(core_begin, core_end - core_begin);
+                            if (contains_japanese_kana(core) || allow_no_kana) {
+                                std::string exact_translation;
+                                auto exact = g_index.find(core);
+                                if (exact != g_index.end()) {
+                                    exact_translation = exact->second;
+                                } else {
+                                    auto fallback = g_fallback_index.find(core);
+                                    if (fallback != g_fallback_index.end()) {
+                                        exact_translation = fallback->second;
+                                    }
+                                }
+                                if (!exact_translation.empty() &&
+                                    exact_translation != core &&
+                                    is_usable_display_text(exact_translation)) {
+                                    output->append(source, offset, core_begin - offset);
+                                    output->append(exact_translation);
+                                    output->append(source, core_end, close_end - core_end);
+                                    offset = close_end;
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                output->append(source, offset, tag_end - offset + 1);
+                offset = tag_end + 1;
+                continue;
+            }
+        }
+        output->push_back(source[offset++]);
+    }
+    if (!changed) {
+        output->clear();
+        return false;
+    }
+    return true;
+}
+
 bool translate_embedded_terms(
         const std::string &source, std::string *output,
         const std::vector<limbus_translation_guard::ProtectedSpan> *protected_spans = nullptr) {
-    if (g_term_trie.size() <= 1) return false;
+    if (g_term_trie.size() <= 1 || looks_like_translated_chinese_prose(source)) {
+        return false;
+    }
     output->clear();
     output->reserve(source.size());
     bool changed = false;
@@ -3203,6 +3392,17 @@ void *translate_managed_string(
                 translated = std::move(translated_terms);
                 probe_stage = "rich-text-keyword-and-term-match";
                 g_term_matches.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (translate_colored_exact_spans(source, &translated, &protected_spans)) {
+            probe_stage = "colored-exact-span-match";
+            g_exact_matches.fetch_add(1, std::memory_order_relaxed);
+            if (contains_japanese_kana(translated)) {
+                std::string translated_terms;
+                if (translate_embedded_terms(translated, &translated_terms)) {
+                    translated = std::move(translated_terms);
+                    probe_stage = "colored-exact-span-and-term-match";
+                    g_term_matches.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         } else if (!translate_embedded_terms(source, &translated, &protected_spans)) {
             if (!protected_spans.empty()) {

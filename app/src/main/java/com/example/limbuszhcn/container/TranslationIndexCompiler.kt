@@ -201,7 +201,16 @@ internal class TranslationIndexCompiler {
         sorted.forEach { record ->
             val priority = termSourcePriority(record.path)
             if (TranslationTextPolicy.isTermSource(record.path, record.field)) {
-                normalizedTerms(record.source, record.translation, isCanonicalTerm(record))
+                normalizedTerms(
+                    record.source,
+                    record.translation,
+                    isCanonicalTerm(record),
+                    bracketTermsOnly = TranslationTextPolicy.isEntityNameOnlySource(
+                        record.path,
+                        record.field,
+                        record.source
+                    )
+                )
                     .forEach { (source, translation) ->
                         termCandidates += TermCandidate(source, translation, priority)
                     }
@@ -334,33 +343,36 @@ internal class TranslationIndexCompiler {
     private fun normalizedTerms(
         source: String,
         translation: String,
-        allowIdentity: Boolean
+        allowIdentity: Boolean,
+        bracketTermsOnly: Boolean = false
     ): Set<Pair<String, String>> {
         return buildSet {
-            // 此处只收集形状合适的候选；在统一解决来源优先级之后再检查嵌入幂等性。
-            candidateTerm(source, translation, allowIdentity, requireIdempotence = false)?.let(::add)
-            candidateTerm(
-                RICH_TEXT_TAG.replace(source, ""),
-                RICH_TEXT_TAG.replace(translation, ""),
-                allowIdentity,
-                requireIdempotence = false
-            )?.let(::add)
-            // 游戏 formatter 会删除术语名称中的空格。为空格压缩后的可见字符串建立
-            // 独立别名，不改变译文本身的排版。
-            val compactSource = source.filterNot(Char::isWhitespace)
-            val compactTaglessSource = RICH_TEXT_TAG.replace(source, "").filterNot(Char::isWhitespace)
-            if (compactSource != source) {
+            if (!bracketTermsOnly) {
+                // 此处只收集形状合适的候选；在统一解决来源优先级之后再检查嵌入幂等性。
+                candidateTerm(source, translation, allowIdentity, requireIdempotence = false)?.let(::add)
                 candidateTerm(
-                    compactSource, translation, allowIdentity, requireIdempotence = false
-                )?.let(::add)
-            }
-            if (compactTaglessSource != compactSource) {
-                candidateTerm(
-                    compactTaglessSource,
+                    RICH_TEXT_TAG.replace(source, ""),
                     RICH_TEXT_TAG.replace(translation, ""),
                     allowIdentity,
                     requireIdempotence = false
                 )?.let(::add)
+                // 游戏 formatter 会删除术语名称中的空格。为空格压缩后的可见字符串建立
+                // 独立别名，不改变译文本身的排版。
+                val compactSource = source.filterNot(Char::isWhitespace)
+                val compactTaglessSource = RICH_TEXT_TAG.replace(source, "").filterNot(Char::isWhitespace)
+                if (compactSource != source) {
+                    candidateTerm(
+                        compactSource, translation, allowIdentity, requireIdempotence = false
+                    )?.let(::add)
+                }
+                if (compactTaglessSource != compactSource) {
+                    candidateTerm(
+                        compactTaglessSource,
+                        RICH_TEXT_TAG.replace(translation, ""),
+                        allowIdentity,
+                        requireIdempotence = false
+                    )?.let(::add)
+                }
             }
             val sourceBracketTerms = SQUARE_BRACKET_CONTENT.findAll(source)
                 .map { match -> match.groupValues[1] }
@@ -687,7 +699,7 @@ internal class TranslationIndexStore(private val root: Path) {
         /**
          * 索引布局或选择策略变化时递增，启动前可据此强制重建旧缓存。
          */
-        internal const val COMPILER_VERSION = "keyword-rich-text-v1"
+        internal const val COMPILER_VERSION = "keyword-rich-text-v3"
         private val INDEX_MAGIC = byteArrayOf('L'.code.toByte(), 'Z'.code.toByte(), 'T'.code.toByte(), 'I'.code.toByte(), '1'.code.toByte(), 0)
     }
 }
