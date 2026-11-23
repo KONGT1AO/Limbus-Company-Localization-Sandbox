@@ -884,7 +884,7 @@ private fun MaintenancePage(
             badge = selectedAppIcon.displayName
         ) {
             Text(
-                text = "更换桌面、启动器及通知栏图标（桌面应用名称保持不变）。部分机型切换后返回桌面需等待数秒刷新。",
+                text = "选择后返回桌面自动生效（桌面应用名称保持不变），部分机型需等待数秒刷新。",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )

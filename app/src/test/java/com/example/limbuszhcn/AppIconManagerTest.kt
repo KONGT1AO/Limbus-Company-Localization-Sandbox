@@ -99,6 +99,15 @@ class AppIconManagerTest {
         )
     }
 
+    private class FakePendingPresetStore(
+        private var pendingId: String? = null
+    ) : PendingPresetStore {
+        override fun getPendingPresetId(): String? = pendingId
+        override fun setPendingPresetId(id: String?) {
+            pendingId = id
+        }
+    }
+
     @Test
     fun `reconcileAliasStates disables newly introduced default alias when previous choice is active`() {
         val store = FakeComponentStateStore(
@@ -119,5 +128,56 @@ class AppIconManagerTest {
         )
         assertEquals(AppIconPreset.FAUST, AppIconManager.currentPreset(store))
         assertFalse(AppIconManager.reconcileAliasStates(store))
+    }
+
+    @Test
+    fun `queuePreset previews selection without touching aliases until applyPendingPresetIfNeeded runs`() {
+        val store = FakeComponentStateStore()
+        val pendingStore = FakePendingPresetStore()
+
+        // 连续点选多个角色时，不应立即修改任何 <activity-alias> 状态
+        assertEquals(
+            IconSelectionOutcome.QUEUED,
+            AppIconManager.queuePreset(store, pendingStore, AppIconPreset.YI_SANG)
+        )
+        assertEquals(AppIconPreset.YI_SANG, AppIconManager.selectedPreset(store, pendingStore))
+        assertEquals(AppIconPreset.PWIE, AppIconManager.currentPreset(store))
+        assertTrue(store.operations.isEmpty())
+
+        assertEquals(
+            IconSelectionOutcome.QUEUED,
+            AppIconManager.queuePreset(store, pendingStore, AppIconPreset.GREGOR)
+        )
+        assertEquals(AppIconPreset.GREGOR, AppIconManager.selectedPreset(store, pendingStore))
+        assertTrue(store.operations.isEmpty())
+
+        // 点回当前真实已生效图标时，自动撤销待切换队列
+        assertEquals(
+            IconSelectionOutcome.REVERTED_PENDING,
+            AppIconManager.queuePreset(store, pendingStore, AppIconPreset.PWIE)
+        )
+        assertEquals(null, AppIconManager.pendingPreset(store, pendingStore))
+        assertEquals(AppIconPreset.PWIE, AppIconManager.selectedPreset(store, pendingStore))
+        assertEquals(
+            IconSelectionOutcome.ALREADY_ACTIVE,
+            AppIconManager.queuePreset(store, pendingStore, AppIconPreset.PWIE)
+        )
+
+        // 重新选择格里高尔并在退后台时一次性应用且保持幂等
+        assertEquals(
+            IconSelectionOutcome.QUEUED,
+            AppIconManager.queuePreset(store, pendingStore, AppIconPreset.GREGOR)
+        )
+        assertEquals(
+            AppIconPreset.GREGOR,
+            AppIconManager.applyPendingPresetIfNeeded(store, pendingStore)
+        )
+        assertEquals(AppIconPreset.GREGOR, AppIconManager.currentPreset(store))
+        assertEquals(
+            AppIconPreset.GREGOR.aliasClassName to true,
+            store.operations.first()
+        )
+        assertEquals(null, AppIconManager.pendingPreset(store, pendingStore))
+        assertEquals(null, AppIconManager.applyPendingPresetIfNeeded(store, pendingStore))
     }
 }

@@ -136,17 +136,83 @@ internal interface ComponentStateStore {
     fun setEnabled(aliasClassName: String, enabled: Boolean)
 }
 
+/** 抽象待切换图标的轻量持久化存储，供原生 SharedPreferences 与单测共用。 */
+internal interface PendingPresetStore {
+    fun getPendingPresetId(): String?
+    fun setPendingPresetId(id: String?)
+}
+
+/** 在应用内点选图标时的状态反馈。 */
+enum class IconSelectionOutcome {
+    /** 已记录为待切换图标，将在离开应用返回桌面时静默生效。 */
+    QUEUED,
+    /** 所选角色已是当前生效桌面图标，无需变更。 */
+    ALREADY_ACTIVE,
+    /** 取消此前待切换队列，继续保持当前生效的桌面图标。 */
+    REVERTED_PENDING
+}
+
 /**
  * 基于 Android `<activity-alias>` 管理桌面、通知栏及多任务卡片图标切换。
  *
  * `MainActivity` 本体保持常驻启用，桌面入口全部由对应别名承载；切换时始终先启用目标别名、
  * 再禁用其他别名，确保桌面与通知回跳入口任何时刻都不中断。
+ * 应用内点选先更新界面预览并记入待生效队列，待用户切回桌面进入 `onStop` 时再静默生效，
+ * 避免点选图标时被系统立即退回桌面。
  */
 object AppIconManager {
     private const val TAG = "AppIconManager"
+    private const val PREFS_NAME = "app_icon_prefs"
+    private const val KEY_PENDING_PRESET_ID = "pending_preset_id"
 
     fun currentPreset(context: Context): AppIconPreset =
         currentPreset(AndroidComponentStateStore(context.applicationContext))
+
+    fun pendingPreset(context: Context): AppIconPreset? {
+        val appContext = context.applicationContext
+        return pendingPreset(
+            AndroidComponentStateStore(appContext),
+            SharedPreferencesPendingPresetStore(appContext)
+        )
+    }
+
+    /** 返回当前应在界面和任务栏预览的角色图标（有待切换目标时优先展示待切换项）。 */
+    fun selectedPreset(context: Context): AppIconPreset {
+        val appContext = context.applicationContext
+        return selectedPreset(
+            AndroidComponentStateStore(appContext),
+            SharedPreferencesPendingPresetStore(appContext)
+        )
+    }
+
+    /** 将目标图标加入待生效队列并保持当前已启用桌面入口不变，供退回桌面时静默应用。 */
+    fun queuePreset(context: Context, target: AppIconPreset): IconSelectionOutcome {
+        val appContext = context.applicationContext
+        return queuePreset(
+            AndroidComponentStateStore(appContext),
+            SharedPreferencesPendingPresetStore(appContext),
+            target
+        ).also { outcome ->
+            PersistentDiagnosticLog.info(
+                TAG,
+                "App icon selection outcome=$outcome preset=${target.id} name=${target.displayName}"
+            )
+        }
+    }
+
+    /** 若存在待切换图标则在退后台时执行真实 `<activity-alias>` 切换并清空队列。 */
+    fun applyPendingPresetIfNeeded(context: Context): AppIconPreset? {
+        val appContext = context.applicationContext
+        return applyPendingPresetIfNeeded(
+            AndroidComponentStateStore(appContext),
+            SharedPreferencesPendingPresetStore(appContext)
+        ) { applied ->
+            PersistentDiagnosticLog.info(
+                TAG,
+                "Applied queued app icon on background transition preset=${applied.id} alias=${applied.aliasClassName}"
+            )
+        }
+    }
 
     /**
      * 跨版本升级自愈：若老版本已显式选中了某个非默认角色（例如浮士德），而新版清单引入了
@@ -231,6 +297,54 @@ object AppIconManager {
         } ?: defaultPreset
     }
 
+    internal fun pendingPreset(
+        store: ComponentStateStore,
+        pendingStore: PendingPresetStore
+    ): AppIconPreset? {
+        val pendingId = pendingStore.getPendingPresetId() ?: return null
+        val matched = AppIconPreset.entries.firstOrNull { it.id == pendingId }
+        if (matched == null || matched == currentPreset(store)) {
+            pendingStore.setPendingPresetId(null)
+            return null
+        }
+        return matched
+    }
+
+    internal fun selectedPreset(
+        store: ComponentStateStore,
+        pendingStore: PendingPresetStore
+    ): AppIconPreset = pendingPreset(store, pendingStore) ?: currentPreset(store)
+
+    internal fun queuePreset(
+        store: ComponentStateStore,
+        pendingStore: PendingPresetStore,
+        target: AppIconPreset
+    ): IconSelectionOutcome {
+        val current = currentPreset(store)
+        if (target == current) {
+            val hadPending = pendingStore.getPendingPresetId() != null
+            if (hadPending) {
+                pendingStore.setPendingPresetId(null)
+                return IconSelectionOutcome.REVERTED_PENDING
+            }
+            return IconSelectionOutcome.ALREADY_ACTIVE
+        }
+        pendingStore.setPendingPresetId(target.id)
+        return IconSelectionOutcome.QUEUED
+    }
+
+    internal fun applyPendingPresetIfNeeded(
+        store: ComponentStateStore,
+        pendingStore: PendingPresetStore,
+        onApplied: ((AppIconPreset) -> Unit)? = null
+    ): AppIconPreset? {
+        val target = pendingPreset(store, pendingStore) ?: return null
+        applyPreset(store, target)
+        pendingStore.setPendingPresetId(null)
+        onApplied?.invoke(target)
+        return target
+    }
+
     internal fun reconcileAliasStates(
         store: ComponentStateStore,
         onReconciled: ((AppIconPreset) -> Unit)? = null
@@ -286,6 +400,24 @@ object AppIconManager {
         }
         onApplied?.invoke()
         return true
+    }
+
+    private class SharedPreferencesPendingPresetStore(
+        context: Context
+    ) : PendingPresetStore {
+        private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        override fun getPendingPresetId(): String? = prefs.getString(KEY_PENDING_PRESET_ID, null)
+
+        override fun setPendingPresetId(id: String?) {
+            val editor = prefs.edit()
+            if (id == null) {
+                editor.remove(KEY_PENDING_PRESET_ID)
+            } else {
+                editor.putString(KEY_PENDING_PRESET_ID, id)
+            }
+            editor.commit()
+        }
     }
 
     private class AndroidComponentStateStore(

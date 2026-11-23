@@ -123,6 +123,9 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var pendingGameRestartForNewIndex: Boolean = false
 
+    @Volatile
+    private var suppressPendingIconApplyOnNextStop: Boolean = false
+
     private var onResumeGameStateRefresh: (() -> Unit)? = null
 
     private fun readContainerStatus(): ContainerStatus =
@@ -204,7 +207,7 @@ class MainActivity : ComponentActivity() {
         requestNotificationPermissionOnce(preferences)
         runCatching { AppIconManager.reconcileAliasStates(applicationContext) }
         val initialAppIcon = runCatching {
-            AppIconManager.currentPreset(applicationContext)
+            AppIconManager.selectedPreset(applicationContext)
         }.getOrDefault(AppIconPreset.defaultPreset)
         AppIconManager.applyTaskDescription(this, initialAppIcon)
         LimbusZhCNApplication.clearLegacyNotificationShortcuts(applicationContext)
@@ -264,7 +267,7 @@ class MainActivity : ComponentActivity() {
                 val patches = runCatching { installer?.listInstalledPatches() }.getOrNull().orEmpty()
                 val access = hasDropInStorageAccess()
                 val candidates = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
-                val currentIcon = runCatching { AppIconManager.currentPreset(applicationContext) }
+                val currentIcon = runCatching { AppIconManager.selectedPreset(applicationContext) }
                     .getOrDefault(AppIconPreset.defaultPreset)
                 runOnUiThread {
                     containerStatus = status
@@ -295,7 +298,7 @@ class MainActivity : ComponentActivity() {
                     val candidates = runCatching {
                         geminiImporter.listDropInCandidates(applicationContext)
                     }.getOrNull().orEmpty()
-                    val currentIcon = runCatching { AppIconManager.currentPreset(applicationContext) }
+                    val currentIcon = runCatching { AppIconManager.selectedPreset(applicationContext) }
                         .getOrDefault(AppIconPreset.defaultPreset)
                     runOnUiThread {
                         gameRunning = running
@@ -530,7 +533,13 @@ class MainActivity : ComponentActivity() {
                 }
 
                 updateLaunchStage("正在启动《边狱公司》...")
-                containerRuntime.launchGame()
+                suppressPendingIconApplyOnNextStop = true
+                try {
+                    containerRuntime.launchGame()
+                } catch (error: Throwable) {
+                    suppressPendingIconApplyOnNextStop = false
+                    throw error
+                }
                 val elapsedMillis = SystemClock.elapsedRealtime() - startedAt
                 return "$prepared；$patchNote；启动前检查耗时 ${elapsedMillis}ms"
             }
@@ -735,10 +744,14 @@ class MainActivity : ComponentActivity() {
                     },
                     onLaunchGameClick = {
                         if (gameRunning) {
+                            suppressPendingIconApplyOnNextStop = true
                             Thread {
                                 val resumed = runCatching {
                                     containerRuntime.resumeGameTask()
                                 }.getOrDefault(false)
+                                if (!resumed) {
+                                    suppressPendingIconApplyOnNextStop = false
+                                }
                                 runOnUiThread {
                                     gameRunning = resumed
                                     message = if (resumed) {
@@ -816,31 +829,31 @@ class MainActivity : ComponentActivity() {
                     selectedAppIcon = selectedAppIcon,
                     onSelectAppIcon = { preset ->
                         Thread {
-                            val outcome = runCatching {
+                            val result = runCatching {
                                 if (containerRuntime.isGameRunning()) {
-                                    "游戏正在后台运行中，请先退出游戏后再更换图标"
+                                    selectedAppIcon to "游戏正在后台运行中，请先退出游戏后再更换图标"
                                 } else {
-                                    val changed = AppIconManager.applyPreset(applicationContext, preset)
-                                    val refreshed = AppIconManager.currentPreset(applicationContext)
-                                    LimbusZhCNApplication.refreshForegroundNotificationIfActive(
-                                        applicationContext,
-                                        refreshed
-                                    )
-                                    runOnUiThread {
-                                        selectedAppIcon = refreshed
-                                        AppIconManager.applyTaskDescription(this@MainActivity, refreshed)
+                                    val outcome = AppIconManager.queuePreset(applicationContext, preset)
+                                    val displayPreset = AppIconManager.selectedPreset(applicationContext)
+                                    val hint = when (outcome) {
+                                        IconSelectionOutcome.QUEUED ->
+                                            "已选择「${displayPreset.displayName}」图标，返回桌面后自动生效"
+                                        IconSelectionOutcome.REVERTED_PENDING ->
+                                            "已取消待切换图标，继续使用「${displayPreset.displayName}」"
+                                        IconSelectionOutcome.ALREADY_ACTIVE ->
+                                            "当前已使用「${displayPreset.displayName}」图标"
                                     }
-                                    if (changed) {
-                                        "已切换为「${preset.displayName}」图标，返回桌面稍候几秒刷新"
-                                    } else {
-                                        "当前已使用「${preset.displayName}」图标"
-                                    }
+                                    displayPreset to hint
                                 }
                             }.getOrElse { error ->
                                 PersistentDiagnosticLog.error(TAG, "Failed to switch app icon", error)
-                                error.userMessage()
+                                selectedAppIcon to error.userMessage()
                             }
-                            runOnUiThread { message = outcome }
+                            runOnUiThread {
+                                selectedAppIcon = result.first
+                                AppIconManager.applyTaskDescription(this@MainActivity, result.first)
+                                message = result.second
+                            }
                         }.start()
                     },
                     onExportResources = {
@@ -1391,9 +1404,48 @@ class MainActivity : ComponentActivity() {
         launchContainerGameFromDebugIntent(intent)
     }
 
+    override fun startActivity(intent: Intent?, options: Bundle?) {
+        suppressPendingIconApplyOnNextStop = true
+        super.startActivity(intent, options)
+    }
+
+    @Suppress("DEPRECATION")
+    override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+        suppressPendingIconApplyOnNextStop = true
+        super.startActivityForResult(intent, requestCode, options)
+    }
+
     override fun onResume() {
         super.onResume()
+        suppressPendingIconApplyOnNextStop = false
         onResumeGameStateRefresh?.invoke()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (suppressPendingIconApplyOnNextStop || isChangingConfigurations) {
+            return
+        }
+        val appContext = applicationContext
+        if (AppIconManager.pendingPreset(appContext) == null) {
+            return
+        }
+        Thread {
+            runCatching {
+                if (!containerRuntime.isGameRunning()) {
+                    val applied = AppIconManager.applyPendingPresetIfNeeded(appContext)
+                    if (applied != null) {
+                        LimbusZhCNApplication.refreshForegroundNotificationIfActive(appContext, applied)
+                    }
+                }
+            }.onFailure { error ->
+                PersistentDiagnosticLog.warn(
+                    TAG,
+                    "Unable to apply queued app icon in onStop",
+                    error
+                )
+            }
+        }.start()
     }
 
     override fun onDestroy() {
