@@ -364,6 +364,11 @@ class MethodProxies {
         @Override
         public Object call(Object who, Method method, Object... args) throws Throwable {
             ComponentName component = (ComponentName) args[0];
+            if (component != null
+                    && getHostPkg().equals(component.getPackageName())
+                    && component.getClassName().startsWith("com.example.limbuszhcn.MainActivityAlias")) {
+                return method.invoke(who, args);
+            }
             return VPackageManager.get().getComponentEnabledSetting(component, getAppUserId());
         }
     }

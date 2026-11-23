@@ -2,14 +2,17 @@ package com.example.limbuszhcn
 
 import android.app.Notification
 import android.app.Application
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.ComponentCallbacks2
 import android.content.Intent
+import android.content.pm.ShortcutManager
 import android.os.Build
 import android.os.Process
 import com.lody.virtual.client.core.SettingConfig
 import com.lody.virtual.client.core.VirtualCore
+import com.lody.virtual.client.stub.HiddenForeNotification
 import com.lody.virtual.helper.compat.NotificationChannelCompat
 import java.io.File
 
@@ -135,13 +138,47 @@ class LimbusZhCNApplication : Application() {
          * @return 带小图标、说明文字和常驻标记的前台服务通知
          */
         override fun getForegroundNotification(): Notification {
-            val context = VirtualCore.get().context
+            return buildForegroundNotification(VirtualCore.get().context)
+        }
+    }
+
+    companion object {
+        private const val TAG = "LimbusZhCNApp"
+        private const val SHORTCUT_ID_PREFIX = "limbus_fg_icon_"
+
+        /** 清理早期通知头像实验写入的动态/长期快捷方式，防止在系统层面产生残留。 */
+        fun clearLegacyNotificationShortcuts(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N_MR1) {
+                return
+            }
+            runCatching {
+                val shortcutManager =
+                    context.getSystemService(ShortcutManager::class.java) ?: return
+                val legacyIds = AppIconPreset.entries.map { "$SHORTCUT_ID_PREFIX${it.id}" }
+                shortcutManager.removeDynamicShortcuts(legacyIds)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    shortcutManager.removeLongLivedShortcuts(legacyIds)
+                }
+            }.onFailure { error ->
+                PersistentDiagnosticLog.warn(
+                    TAG,
+                    "Unable to clear legacy notification shortcuts",
+                    error
+                )
+            }
+        }
+
+        /** 构建当前选中角色图标驱动的容器前台通知（动态更新状态栏小图标）。 */
+        fun buildForegroundNotification(
+            context: Context,
+            preset: AppIconPreset = AppIconManager.currentPreset(context)
+        ): Notification {
             val openLauncherIntent = Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             }
             val contentIntent = PendingIntent.getActivity(
                 context,
-                2781,
+                HiddenForeNotification.FOREGROUND_NOTIFICATION_ID,
                 openLauncherIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
@@ -149,7 +186,7 @@ class LimbusZhCNApplication : Application() {
                 context,
                 NotificationChannelCompat.DAEMON_ID
             ).apply {
-                setSmallIcon(R.drawable.app_icon)
+                setSmallIcon(preset.iconRes)
                 setContentTitle("边狱公司后台运行")
                 setContentText("正在维护容器和游戏运行环境")
                 setContentIntent(contentIntent)
@@ -161,10 +198,37 @@ class LimbusZhCNApplication : Application() {
                 }
             }.build()
         }
-    }
 
-    companion object {
-        private const val TAG = "LimbusZhCNApp"
+        /** 若容器前台通知当前正在展示，则立刻以新选中角色图标刷新，避免空闲时误弹通知。 */
+        fun refreshForegroundNotificationIfActive(
+            context: Context,
+            preset: AppIconPreset = AppIconManager.currentPreset(context)
+        ) {
+            runCatching {
+                val notificationManager =
+                    context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                        ?: return
+                val isActive = notificationManager.activeNotifications.any {
+                    it.id == HiddenForeNotification.FOREGROUND_NOTIFICATION_ID
+                }
+                if (isActive) {
+                    notificationManager.notify(
+                        HiddenForeNotification.FOREGROUND_NOTIFICATION_ID,
+                        buildForegroundNotification(context, preset)
+                    )
+                    PersistentDiagnosticLog.info(
+                        TAG,
+                        "Refreshed active foreground notification icon preset=${preset.id}"
+                    )
+                }
+            }.onFailure { error ->
+                PersistentDiagnosticLog.warn(
+                    TAG,
+                    "Unable to refresh active foreground notification",
+                    error
+                )
+            }
+        }
     }
 }
 

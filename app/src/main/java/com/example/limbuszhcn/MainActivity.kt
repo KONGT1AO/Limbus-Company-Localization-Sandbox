@@ -202,6 +202,12 @@ class MainActivity : ComponentActivity() {
             .remove(LEGACY_KEY_TRANSLATION_CHANNEL)
             .apply()
         requestNotificationPermissionOnce(preferences)
+        runCatching { AppIconManager.reconcileAliasStates(applicationContext) }
+        val initialAppIcon = runCatching {
+            AppIconManager.currentPreset(applicationContext)
+        }.getOrDefault(AppIconPreset.defaultPreset)
+        AppIconManager.applyTaskDescription(this, initialAppIcon)
+        LimbusZhCNApplication.clearLegacyNotificationShortcuts(applicationContext)
 
         setContent {
             var containerStatus by remember { mutableStateOf(readContainerStatus()) }
@@ -240,6 +246,9 @@ class MainActivity : ComponentActivity() {
             var installedPatches by remember { mutableStateOf<List<CachedPatchMetadata>>(emptyList()) }
             var dropInCandidates by remember { mutableStateOf<List<GeminiLangPackImporter.DropInCandidate>>(emptyList()) }
             var hasDropInAccess by remember { mutableStateOf(hasDropInStorageAccess()) }
+            var selectedAppIcon by remember {
+                mutableStateOf(initialAppIcon)
+            }
             var message by remember {
                 mutableStateOf(containerStatus.message)
             }
@@ -255,6 +264,8 @@ class MainActivity : ComponentActivity() {
                 val patches = runCatching { installer?.listInstalledPatches() }.getOrNull().orEmpty()
                 val access = hasDropInStorageAccess()
                 val candidates = runCatching { geminiImporter.listDropInCandidates(applicationContext) }.getOrNull().orEmpty()
+                val currentIcon = runCatching { AppIconManager.currentPreset(applicationContext) }
+                    .getOrDefault(AppIconPreset.defaultPreset)
                 runOnUiThread {
                     containerStatus = status
                     gameRunning = running
@@ -264,6 +275,7 @@ class MainActivity : ComponentActivity() {
                     installedPatches = patches
                     hasDropInAccess = access
                     dropInCandidates = candidates
+                    selectedAppIcon = currentIcon
                     if (report != null) {
                         compatibilityReport = report
                     }
@@ -283,11 +295,14 @@ class MainActivity : ComponentActivity() {
                     val candidates = runCatching {
                         geminiImporter.listDropInCandidates(applicationContext)
                     }.getOrNull().orEmpty()
+                    val currentIcon = runCatching { AppIconManager.currentPreset(applicationContext) }
+                        .getOrDefault(AppIconPreset.defaultPreset)
                     runOnUiThread {
                         gameRunning = running
                         hasDropInAccess = access
                         installedPatches = patches
                         dropInCandidates = candidates
+                        selectedAppIcon = currentIcon
                         if (report != null) {
                             compatibilityReport = report
                         }
@@ -797,6 +812,36 @@ class MainActivity : ComponentActivity() {
                     onScreenOrientationModeChange = { mode ->
                         screenOrientationMode = mode
                         LimbusOrientationManager.setOrientationMode(this@MainActivity, mode)
+                    },
+                    selectedAppIcon = selectedAppIcon,
+                    onSelectAppIcon = { preset ->
+                        Thread {
+                            val outcome = runCatching {
+                                if (containerRuntime.isGameRunning()) {
+                                    "游戏正在后台运行中，请先退出游戏后再更换图标"
+                                } else {
+                                    val changed = AppIconManager.applyPreset(applicationContext, preset)
+                                    val refreshed = AppIconManager.currentPreset(applicationContext)
+                                    LimbusZhCNApplication.refreshForegroundNotificationIfActive(
+                                        applicationContext,
+                                        refreshed
+                                    )
+                                    runOnUiThread {
+                                        selectedAppIcon = refreshed
+                                        AppIconManager.applyTaskDescription(this@MainActivity, refreshed)
+                                    }
+                                    if (changed) {
+                                        "已切换为「${preset.displayName}」图标，返回桌面稍候几秒刷新"
+                                    } else {
+                                        "当前已使用「${preset.displayName}」图标"
+                                    }
+                                }
+                            }.getOrElse { error ->
+                                PersistentDiagnosticLog.error(TAG, "Failed to switch app icon", error)
+                                error.userMessage()
+                            }
+                            runOnUiThread { message = outcome }
+                        }.start()
                     },
                     onExportResources = {
                         val stamp = java.time.LocalDateTime.now()
@@ -1580,7 +1625,7 @@ private fun LimbusPeScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Image(
-                        painter = painterResource(R.drawable.app_icon),
+                        painter = painterResource(AppIconPreset.defaultPreset.iconRes),
                         contentDescription = null,
                         modifier = Modifier.size(48.dp)
                     )

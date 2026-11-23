@@ -47,10 +47,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.limbuszhcn.container.CachedPatchMetadata
@@ -110,6 +112,8 @@ internal fun LimbusPeScreenRedesign(
     onExportDebugLogs: () -> Unit,
     hasDropInAccess: Boolean = true,
     onRequestDropInAccessClick: () -> Unit = {},
+    selectedAppIcon: AppIconPreset = AppIconPreset.defaultPreset,
+    onSelectAppIcon: (AppIconPreset) -> Unit = {},
     screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
     onScreenOrientationModeChange: (Int) -> Unit = {}
 ) {
@@ -125,7 +129,7 @@ internal fun LimbusPeScreenRedesign(
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background,
-        topBar = { TerminalTopBar() },
+        topBar = { TerminalTopBar(iconRes = selectedAppIcon.iconRes) },
         bottomBar = {
             TerminalBottomBar(
                 selectedTab = selectedTab,
@@ -151,6 +155,7 @@ internal fun LimbusPeScreenRedesign(
                     translationEnabled = translationEnabled,
                     compatibilityReport = compatibilityReport,
                     message = message,
+                    iconRes = selectedAppIcon.iconRes,
                     onRequestBatteryOptimization = onRequestBatteryOptimization,
                     onOpenCompatibilitySettings = onOpenCompatibilitySettings
                 )
@@ -175,7 +180,10 @@ internal fun LimbusPeScreenRedesign(
                     containerStatus = containerStatus,
                     githubReleaseUrl = githubReleaseUrl,
                     busy = busy,
+                    gameRunning = gameRunning,
                     message = message,
+                    selectedAppIcon = selectedAppIcon,
+                    onSelectAppIcon = onSelectAppIcon,
                     screenOrientationMode = screenOrientationMode,
                     onScreenOrientationModeChange = onScreenOrientationModeChange,
                     onSyncInstalledGame = onSyncInstalledGame,
@@ -195,7 +203,7 @@ internal fun LimbusPeScreenRedesign(
 }
 
 @Composable
-private fun TerminalTopBar() {
+private fun TerminalTopBar(iconRes: Int = AppIconPreset.defaultPreset.iconRes) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -222,9 +230,12 @@ private fun TerminalTopBar() {
             )
             Spacer(modifier = Modifier.width(12.dp))
             Image(
-                painter = painterResource(R.drawable.app_icon),
+                painter = painterResource(iconRes),
                 contentDescription = null,
-                modifier = Modifier.size(42.dp)
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(RoundedCornerShape(8.dp))
             )
             Spacer(modifier = Modifier.width(12.dp))
             Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
@@ -384,6 +395,7 @@ private fun LaunchPage(
     translationEnabled: Boolean,
     compatibilityReport: DeviceCompatibilityReport,
     message: String,
+    iconRes: Int = AppIconPreset.defaultPreset.iconRes,
     onRequestBatteryOptimization: () -> Unit,
     onOpenCompatibilitySettings: () -> Unit
 ) {
@@ -397,7 +409,8 @@ private fun LaunchPage(
             containerStatus = containerStatus,
             lastInstall = lastInstall,
             fontStatus = fontStatus,
-            translationEnabled = translationEnabled
+            translationEnabled = translationEnabled,
+            iconRes = iconRes
         )
         SystemMessage(message)
         SectionCard(
@@ -452,7 +465,8 @@ private fun MissionPanel(
     containerStatus: ContainerStatus,
     lastInstall: PatchInstallSummary?,
     fontStatus: String,
-    translationEnabled: Boolean
+    translationEnabled: Boolean,
+    iconRes: Int = AppIconPreset.defaultPreset.iconRes
 ) {
     val translationReady = translationEnabled && lastInstall?.indexActivated == true
     val translationValue = when {
@@ -494,8 +508,9 @@ private fun MissionPanel(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Image(
-                    painter = painterResource(R.drawable.app_icon),
+                    painter = painterResource(iconRes),
                     contentDescription = null,
+                    contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(58.dp)
                         .clip(ControlShape)
@@ -748,7 +763,10 @@ private fun MaintenancePage(
     containerStatus: ContainerStatus,
     githubReleaseUrl: String,
     busy: Boolean,
+    gameRunning: Boolean = false,
     message: String,
+    selectedAppIcon: AppIconPreset = AppIconPreset.defaultPreset,
+    onSelectAppIcon: (AppIconPreset) -> Unit = {},
     onSyncInstalledGame: () -> Unit,
     onGithubReleaseUrlChange: (String) -> Unit,
     onPullFromGithubClick: () -> Unit,
@@ -856,6 +874,85 @@ private fun MaintenancePage(
                                     fontWeight = FontWeight.Bold
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+        SectionCard(
+            title = "应用图标",
+            badge = selectedAppIcon.displayName
+        ) {
+            Text(
+                text = "更换桌面、启动器及通知栏图标（桌面应用名称保持不变）。部分机型切换后返回桌面需等待数秒刷新。",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (gameRunning) {
+                InfoStrip("游戏正在后台运行中，请先退出游戏后再更换图标，避免系统刷新桌面时结束游戏进程。")
+            }
+            val switchable = !busy && !gameRunning
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                AppIconPreset.entries.chunked(4).forEach { rowPresets ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        rowPresets.forEach { preset ->
+                            val selected = preset == selectedAppIcon
+                            Surface(
+                                onClick = { onSelectAppIcon(preset) },
+                                enabled = switchable,
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) {
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                                },
+                                border = BorderStroke(
+                                    width = if (selected) 1.5.dp else 1.dp,
+                                    color = if (selected) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                    }
+                                ),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+                                ) {
+                                    Image(
+                                        painter = painterResource(preset.iconRes),
+                                        contentDescription = preset.displayName,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .size(50.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                    )
+                                    Text(
+                                        text = preset.displayName,
+                                        color = if (selected) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        softWrap = false
+                                    )
+                                }
+                            }
+                        }
+                        repeat(4 - rowPresets.size) {
+                            Spacer(modifier = Modifier.weight(1f))
                         }
                     }
                 }
