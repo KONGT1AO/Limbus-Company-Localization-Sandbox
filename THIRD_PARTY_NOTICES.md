@@ -5,6 +5,13 @@ binary components, fonts, and artwork. The root `GPL-3.0` license applies only
 to material for which the project authors have the right to grant that license.
 Third-party material remains under its own license or copyright terms.
 
+## Upstream Project Attribution (BBBEANNN/limbusZhCN)
+
+- Upstream inspiration & initial fork base: <https://github.com/BBBEANNN/limbusZhCN>
+- License: GNU General Public License v3.0 (`GPL-3.0`)
+
+The initial engineering scaffold of this repository was derived from `BBBEANNN/limbusZhCN` under the terms of `GPL-3.0`. Subsequent development in this repository has independently rewritten the user interface, added Android 17 (API 37) compatibility, expanded the IL2CPP/TMP dynamic rendering and dual-weight font pipeline, and introduced multi-pack drop-in management and reverse-landscape orientation locking.
+
 ## VirtualApp
 
 - Location: `third_party/virtualapp-upstream/`
@@ -29,17 +36,16 @@ whether their use and redistribution of this component are permitted.
 The APK files are bundled so a fresh container can bootstrap the Google-service
 compatibility layer without downloading executable code at first launch.
 
-## Chinese localization font
+## Chinese localization fonts
 
-- Runtime asset: `app/src/main/assets/runtime/ChineseFont.ttf`
+- Runtime asset (Regular): `app/src/main/assets/runtime/ChineseFont.ttf` (`SarasaGothicSC-Regular.ttf`, SHA-256: `6541a94ad09601b71dff4100360807f4bb2068a0d5fe8b76c71a75e0cb6cf749`)
+- Runtime asset (Bold): `app/src/main/assets/runtime/ChineseFontBold.ttf` (`SarasaGothicSC-Bold.ttf`, SHA-256: `a56a06f1af27726bc5def015b61deecbbdf5ae6d954a91b1131d8a17290def35`)
 - Source project: <https://github.com/be5invis/Sarasa-Gothic>
 - Release asset: `SarasaGothicSC-TTF-1.0.40.7z`
-- Font file: `SarasaGothicSC-Regular.ttf`
-- SHA-256: `6541a94ad09601b71dff4100360807f4bb2068a0d5fe8b76c71a75e0cb6cf749`
 - Sarasa Gothic license: SIL Open Font License 1.1
 - OFL text: `app/src/main/assets/licenses/Sarasa-Gothic-OFL-1.1.txt`
 
-The font remains subject to the SIL Open Font License and is not relicensed under
+The fonts remain subject to the SIL Open Font License and are not relicensed under
 GPL-3.0.
 
 ## Native hook and Android-derived files
