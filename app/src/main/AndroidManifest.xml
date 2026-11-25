@@ -17,6 +17,8 @@
     </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 应用内更新直接调用系统安装器覆盖安装，无需跳转浏览器。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 容器可能以宿主身份转发前台服务通知；声明权限以兼容 Android 13 及以上。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 允许用户在系统界面明确授予后台省电白名单。 -->
@@ -38,6 +40,16 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.LimbusZhCN"
         tools:targetApi="31">
+        <!-- 仅向系统安装器临时授权读取应用内下载的更新 APK。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.launcherupdate.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/launcher_update_paths" />
+        </provider>
         <service
             android:name=".LauncherTaskWatcherService"
             android:exported="false"

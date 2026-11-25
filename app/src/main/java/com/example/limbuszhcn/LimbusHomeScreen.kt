@@ -2,9 +2,12 @@ package com.example.limbuszhcn
 
 import com.lody.virtual.client.hook.delegate.LimbusOrientationManager
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,11 +19,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.CutCornerShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -29,6 +34,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -45,10 +51,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -59,6 +72,12 @@ import com.example.limbuszhcn.container.CachedPatchMetadata
 import com.example.limbuszhcn.container.ContainerStatus
 import com.example.limbuszhcn.gamefs.PatchInstallSummary
 import com.example.limbuszhcn.ui.theme.LimbusSuccess
+import com.example.limbuszhcn.update.LauncherUpdateRelease
+import com.example.limbuszhcn.update.LauncherUpdateState
+import java.io.File
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
 
 private enum class HostTab(val index: String, val label: String) {
     Launch("01", "启程"),
@@ -115,9 +134,23 @@ internal fun LimbusPeScreenRedesign(
     selectedAppIcon: AppIconPreset = AppIconPreset.defaultPreset,
     onSelectAppIcon: (AppIconPreset) -> Unit = {},
     screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
-    onScreenOrientationModeChange: (Int) -> Unit = {}
+    onScreenOrientationModeChange: (Int) -> Unit = {},
+    launcherUpdateState: LauncherUpdateState = LauncherUpdateState.Idle,
+    showUpdateBadge: Boolean = false,
+    onOpenSettingsClick: () -> Unit = {},
+    onCheckLauncherUpdateClick: () -> Unit = {},
+    onDownloadLauncherUpdateClick: (LauncherUpdateRelease) -> Unit = {},
+    onCancelLauncherUpdateDownloadClick: () -> Unit = {},
+    onInstallLauncherUpdateClick: (File) -> Unit = {},
+    onDismissLauncherUpdateClick: (LauncherUpdateRelease) -> Unit = {}
 ) {
     var selectedTab by remember { mutableStateOf(HostTab.Launch) }
+    var showSettings by remember { mutableStateOf(false) }
+
+    BackHandler(enabled = showSettings) {
+        showSettings = false
+    }
+
     val launchHint = when {
         gameRunning -> "游戏进程仍在运行，可直接返回，无需重新检查环境"
         !translationEnabled -> "当前以纯净官方原版模式启动"
@@ -129,14 +162,31 @@ internal fun LimbusPeScreenRedesign(
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background,
-        topBar = { TerminalTopBar(iconRes = selectedAppIcon.iconRes) },
+        topBar = {
+            TerminalTopBar(
+                iconRes = selectedAppIcon.iconRes,
+                inSettings = showSettings,
+                showUpdateBadge = showUpdateBadge,
+                onSettingsToggle = {
+                    if (showSettings) {
+                        showSettings = false
+                    } else {
+                        showSettings = true
+                        onOpenSettingsClick()
+                    }
+                }
+            )
+        },
         bottomBar = {
             TerminalBottomBar(
                 selectedTab = selectedTab,
                 launchHint = launchHint,
                 busy = busy,
                 gameRunning = gameRunning,
-                onTabSelected = { selectedTab = it },
+                onTabSelected = { tab ->
+                    showSettings = false
+                    selectedTab = tab
+                },
                 onLaunchGameClick = onLaunchGameClick,
                 onRestartGameClick = onRestartGameClick
             )
@@ -147,38 +197,8 @@ internal fun LimbusPeScreenRedesign(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            when (selectedTab) {
-                HostTab.Launch -> LaunchPage(
-                    containerStatus = containerStatus,
-                    lastInstall = lastInstall,
-                    fontStatus = fontStatus,
-                    translationEnabled = translationEnabled,
-                    compatibilityReport = compatibilityReport,
-                    message = message,
-                    iconRes = selectedAppIcon.iconRes,
-                    onRequestBatteryOptimization = onRequestBatteryOptimization,
-                    onOpenCompatibilitySettings = onOpenCompatibilitySettings
-                )
-
-                HostTab.Translation -> TranslationPage(
-                    lastInstall = lastInstall,
-                    cachedMeta = cachedMeta,
-                    fontStatus = fontStatus,
-                    dropInPath = dropInPath,
-                    translationEnabled = translationEnabled,
-                    busy = busy,
-                    hasDropInAccess = hasDropInAccess,
-                    onToggleTranslationEnabled = onToggleTranslationEnabled,
-                    onManagePacksClick = onManagePacksClick,
-                    onImportArchiveClick = onImportArchiveClick,
-                    onImportFolderClick = onImportFolderClick,
-                    onScanDropInAndRefreshClick = onScanDropInAndRefreshClick,
-                    onRequestDropInAccessClick = onRequestDropInAccessClick
-                )
-
-                HostTab.Maintenance -> MaintenancePage(
-                    containerStatus = containerStatus,
-                    githubReleaseUrl = githubReleaseUrl,
+            if (showSettings) {
+                SettingsPage(
                     busy = busy,
                     gameRunning = gameRunning,
                     message = message,
@@ -186,13 +206,56 @@ internal fun LimbusPeScreenRedesign(
                     onSelectAppIcon = onSelectAppIcon,
                     screenOrientationMode = screenOrientationMode,
                     onScreenOrientationModeChange = onScreenOrientationModeChange,
-                    onSyncInstalledGame = onSyncInstalledGame,
-                    onGithubReleaseUrlChange = onGithubReleaseUrlChange,
-                    onPullFromGithubClick = onPullFromGithubClick,
-                    onExportResources = onExportResources,
-                    onImportResources = onImportResources,
-                    onExportDebugLogs = onExportDebugLogs
+                    launcherUpdateState = launcherUpdateState,
+                    onCheckLauncherUpdateClick = onCheckLauncherUpdateClick,
+                    onDownloadLauncherUpdateClick = onDownloadLauncherUpdateClick,
+                    onCancelLauncherUpdateDownloadClick = onCancelLauncherUpdateDownloadClick,
+                    onInstallLauncherUpdateClick = onInstallLauncherUpdateClick,
+                    onDismissLauncherUpdateClick = onDismissLauncherUpdateClick
                 )
+            } else {
+                when (selectedTab) {
+                    HostTab.Launch -> LaunchPage(
+                        containerStatus = containerStatus,
+                        lastInstall = lastInstall,
+                        fontStatus = fontStatus,
+                        translationEnabled = translationEnabled,
+                        compatibilityReport = compatibilityReport,
+                        message = message,
+                        iconRes = selectedAppIcon.iconRes,
+                        onRequestBatteryOptimization = onRequestBatteryOptimization,
+                        onOpenCompatibilitySettings = onOpenCompatibilitySettings
+                    )
+
+                    HostTab.Translation -> TranslationPage(
+                        lastInstall = lastInstall,
+                        cachedMeta = cachedMeta,
+                        fontStatus = fontStatus,
+                        dropInPath = dropInPath,
+                        translationEnabled = translationEnabled,
+                        busy = busy,
+                        hasDropInAccess = hasDropInAccess,
+                        onToggleTranslationEnabled = onToggleTranslationEnabled,
+                        onManagePacksClick = onManagePacksClick,
+                        onImportArchiveClick = onImportArchiveClick,
+                        onImportFolderClick = onImportFolderClick,
+                        onScanDropInAndRefreshClick = onScanDropInAndRefreshClick,
+                        onRequestDropInAccessClick = onRequestDropInAccessClick
+                    )
+
+                    HostTab.Maintenance -> MaintenancePage(
+                        containerStatus = containerStatus,
+                        githubReleaseUrl = githubReleaseUrl,
+                        busy = busy,
+                        message = message,
+                        onSyncInstalledGame = onSyncInstalledGame,
+                        onGithubReleaseUrlChange = onGithubReleaseUrlChange,
+                        onPullFromGithubClick = onPullFromGithubClick,
+                        onExportResources = onExportResources,
+                        onImportResources = onImportResources,
+                        onExportDebugLogs = onExportDebugLogs
+                    )
+                }
             }
         }
 
@@ -203,7 +266,12 @@ internal fun LimbusPeScreenRedesign(
 }
 
 @Composable
-private fun TerminalTopBar(iconRes: Int = AppIconPreset.defaultPreset.iconRes) {
+private fun TerminalTopBar(
+    iconRes: Int = AppIconPreset.defaultPreset.iconRes,
+    inSettings: Boolean = false,
+    showUpdateBadge: Boolean = false,
+    onSettingsToggle: () -> Unit = {}
+) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -250,34 +318,132 @@ private fun TerminalTopBar(iconRes: Int = AppIconPreset.defaultPreset.iconRes) {
                     softWrap = false
                 )
                 Text(
-                    text = "VIRTUAL CONTAINER // 汉化终端",
+                    text = "汉化终端 // v${BuildConfig.VERSION_NAME}",
                     color = MaterialTheme.colorScheme.secondary,
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = FontFamily.Monospace,
-                    letterSpacing = 0.3.sp
+                    letterSpacing = 0.3.sp,
+                    maxLines = 1,
+                    softWrap = false
                 )
             }
             Spacer(modifier = Modifier.weight(1f))
-            Surface(
-                shape = ControlShape,
-                color = MaterialTheme.colorScheme.primaryContainer,
-                modifier = Modifier.width(72.dp)
-            ) {
-                Text(
-                    text = "v${BuildConfig.VERSION_NAME}",
+            if (inSettings) {
+                Surface(
+                    onClick = onSettingsToggle,
+                    shape = ControlShape,
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 4.dp, vertical = 6.dp),
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
-                    letterSpacing = 0.sp,
-                    maxLines = 1,
-                    softWrap = false,
-                    textAlign = TextAlign.Center
-                )
+                        .height(42.dp)
+                        .semantics { contentDescription = "返回主界面" }
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    ) {
+                        TerminalBackArrowIcon(
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "返回",
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
+                }
+            } else {
+                Box(modifier = Modifier.size(42.dp)) {
+                    Surface(
+                        onClick = onSettingsToggle,
+                        shape = ControlShape,
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        border = BorderStroke(
+                            1.dp,
+                            if (showUpdateBadge) MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+                            else MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
+                        ),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .semantics { contentDescription = "终端设置" }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            TerminalGearIcon(
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(21.dp)
+                            )
+                        }
+                    }
+                    if (showUpdateBadge) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .offset(x = 2.dp, y = (-2).dp)
+                                .size(9.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary)
+                                .border(1.5.dp, MaterialTheme.colorScheme.background, CircleShape)
+                        )
+                    }
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun TerminalGearIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        val rOuter = size.minDimension * 0.46f
+        val rInner = size.minDimension * 0.33f
+        val rHole = size.minDimension * 0.16f
+        val teeth = 8
+        val path = Path()
+        val step = (2.0 * PI) / (teeth * 4)
+        for (i in 0 until teeth * 4) {
+            val angle = i * step - PI / 2.0
+            val r = if (i % 4 == 0 || i % 4 == 1) rOuter else rInner
+            val x = cx + (r * cos(angle)).toFloat()
+            val y = cy + (r * sin(angle)).toFloat()
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+        drawPath(path = path, color = color, style = Stroke(width = size.minDimension * 0.095f, join = StrokeJoin.Round))
+        drawCircle(
+            color = color,
+            radius = rHole,
+            center = Offset(cx, cy),
+            style = Stroke(width = size.minDimension * 0.095f)
+        )
+    }
+}
+
+@Composable
+private fun TerminalBackArrowIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = Stroke(width = size.minDimension * 0.14f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val path = Path().apply {
+            moveTo(w * 0.58f, h * 0.20f)
+            lineTo(w * 0.24f, h * 0.50f)
+            lineTo(w * 0.58f, h * 0.80f)
+        }
+        drawPath(path = path, color = color, style = stroke)
+        drawLine(
+            color = color,
+            start = Offset(w * 0.28f, h * 0.50f),
+            end = Offset(w * 0.84f, h * 0.50f),
+            strokeWidth = stroke.width,
+            cap = StrokeCap.Round
+        )
     }
 }
 
@@ -763,18 +929,13 @@ private fun MaintenancePage(
     containerStatus: ContainerStatus,
     githubReleaseUrl: String,
     busy: Boolean,
-    gameRunning: Boolean = false,
     message: String,
-    selectedAppIcon: AppIconPreset = AppIconPreset.defaultPreset,
-    onSelectAppIcon: (AppIconPreset) -> Unit = {},
     onSyncInstalledGame: () -> Unit,
     onGithubReleaseUrlChange: (String) -> Unit,
     onPullFromGithubClick: () -> Unit,
     onExportResources: () -> Unit,
     onImportResources: () -> Unit,
-    onExportDebugLogs: () -> Unit,
-    screenOrientationMode: Int = LimbusOrientationManager.MODE_AUTO_SENSOR,
-    onScreenOrientationModeChange: (Int) -> Unit = {}
+    onExportDebugLogs: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         if (message.isNotBlank()) {
@@ -810,152 +971,6 @@ private fun MaintenancePage(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("手动重新同步宿主机游戏 APK")
-            }
-        }
-        SectionCard(
-            title = "横屏方向锁定",
-            badge = if (screenOrientationMode == LimbusOrientationManager.MODE_LANDSCAPE) "常规横屏" else "反向横屏"
-        ) {
-            Text(
-                text = "针对手机开启竖屏锁定（系统关闭自动旋转）进行专项适配。可自由指定游戏横屏朝向，告别误触音量键与锁屏按键，进入游戏直接锁定。",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall
-            )
-            Column(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                val modes = listOf(
-                    Triple(
-                        LimbusOrientationManager.MODE_REVERSE_LANDSCAPE,
-                        "锁定反向横屏 (推荐)",
-                        "音量键始终朝上 · 避免双手握持误触按键（惯用推荐）"
-                    ),
-                    Triple(
-                        LimbusOrientationManager.MODE_LANDSCAPE,
-                        "锁定常规横屏",
-                        "音量键始终朝下 · 传统原生默认方向"
-                    )
-                )
-                modes.forEach { (mode, title, desc) ->
-                    val selected = screenOrientationMode == mode
-                    Surface(
-                        onClick = { onScreenOrientationModeChange(mode) },
-                        shape = CutCornerShape(topEnd = 6.dp, bottomStart = 6.dp),
-                        color = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                        border = BorderStroke(
-                            1.dp,
-                            if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = title,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                                Text(
-                                    text = desc,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                            }
-                            if (selected) {
-                                Text(
-                                    text = "● 已生效",
-                                    color = MaterialTheme.colorScheme.primary,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        SectionCard(
-            title = "应用图标",
-            badge = selectedAppIcon.displayName
-        ) {
-            Text(
-                text = "选择后返回桌面自动生效（桌面应用名称保持不变），部分机型需等待数秒刷新。",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall
-            )
-            if (gameRunning) {
-                InfoStrip("游戏正在后台运行中，请先退出游戏后再更换图标，避免系统刷新桌面时结束游戏进程。")
-            }
-            val switchable = !busy && !gameRunning
-            Column(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                AppIconPreset.entries.chunked(4).forEach { rowPresets ->
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        rowPresets.forEach { preset ->
-                            val selected = preset == selectedAppIcon
-                            Surface(
-                                onClick = { onSelectAppIcon(preset) },
-                                enabled = switchable,
-                                shape = RoundedCornerShape(10.dp),
-                                color = if (selected) {
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
-                                } else {
-                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-                                },
-                                border = BorderStroke(
-                                    width = if (selected) 1.5.dp else 1.dp,
-                                    color = if (selected) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
-                                    }
-                                ),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
-                                ) {
-                                    Image(
-                                        painter = painterResource(preset.iconRes),
-                                        contentDescription = preset.displayName,
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier
-                                            .size(50.dp)
-                                            .clip(RoundedCornerShape(10.dp))
-                                    )
-                                    Text(
-                                        text = preset.displayName,
-                                        color = if (selected) {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurface
-                                        },
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        softWrap = false
-                                    )
-                                }
-                            }
-                        }
-                        repeat(4 - rowPresets.size) {
-                            Spacer(modifier = Modifier.weight(1f))
-                        }
-                    }
-                }
             }
         }
         SectionCard(
@@ -1032,6 +1047,421 @@ private fun MaintenancePage(
             }
         }
     }
+}
+
+@Composable
+private fun SettingsPage(
+    busy: Boolean,
+    gameRunning: Boolean,
+    message: String,
+    selectedAppIcon: AppIconPreset,
+    onSelectAppIcon: (AppIconPreset) -> Unit,
+    screenOrientationMode: Int,
+    onScreenOrientationModeChange: (Int) -> Unit,
+    launcherUpdateState: LauncherUpdateState,
+    onCheckLauncherUpdateClick: () -> Unit,
+    onDownloadLauncherUpdateClick: (LauncherUpdateRelease) -> Unit,
+    onCancelLauncherUpdateDownloadClick: () -> Unit,
+    onInstallLauncherUpdateClick: (File) -> Unit,
+    onDismissLauncherUpdateClick: (LauncherUpdateRelease) -> Unit
+) {
+    val updateBadge = when (launcherUpdateState) {
+        is LauncherUpdateState.Idle -> "v${BuildConfig.VERSION_NAME}"
+        is LauncherUpdateState.Checking -> "检查中"
+        is LauncherUpdateState.UpToDate -> "已是最新"
+        is LauncherUpdateState.Available -> "有新版本"
+        is LauncherUpdateState.Downloading -> "下载中"
+        is LauncherUpdateState.ReadyToInstall -> "待安装"
+        is LauncherUpdateState.Error -> "检查异常"
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (message.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .padding(top = 12.dp, bottom = 4.dp)
+            ) {
+                SystemMessage(message)
+            }
+        }
+        Box(modifier = Modifier.weight(1f)) {
+            PageColumn {
+                PageHeading(
+                    index = "SET",
+                    title = "终端设置",
+                    subtitle = "管理启动器更新、游戏横屏朝向与应用图标。"
+                )
+
+                SectionCard(
+                    title = "启动器更新",
+                    badge = updateBadge
+                ) {
+                    Text(
+                        text = "当前版本：v${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})",
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "直连 GitHub Releases 检查与下载正式版，支持应用内直接覆盖安装，保留容器内全部游戏数据。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    when (launcherUpdateState) {
+                        LauncherUpdateState.Idle -> {
+                            OutlinedButton(
+                                onClick = onCheckLauncherUpdateClick,
+                                enabled = !busy,
+                                shape = ControlShape,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("检查更新")
+                            }
+                        }
+
+                        LauncherUpdateState.Checking -> {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(
+                                    text = "正在连接 GitHub 检查正式版本...",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+
+                        is LauncherUpdateState.UpToDate -> {
+                            InfoStrip(launcherUpdateState.checkedAtSummary)
+                            OutlinedButton(
+                                onClick = onCheckLauncherUpdateClick,
+                                enabled = !busy,
+                                shape = ControlShape,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("重新检查更新")
+                            }
+                        }
+
+                        is LauncherUpdateState.Available -> {
+                            val release = launcherUpdateState.release
+                            Surface(
+                                shape = CutCornerShape(topEnd = 8.dp, bottomStart = 8.dp),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.padding(12.dp)
+                                ) {
+                                    Text(
+                                        text = "发现新版本：${release.displayLabel}",
+                                        color = MaterialTheme.colorScheme.primary,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = release.releaseNotesSummary,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    release.sizeBytes?.let { bytes ->
+                                        Text(
+                                            text = "安装包大小：${formatMegabytes(bytes)}",
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                }
+                            }
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Button(
+                                    onClick = { onDownloadLauncherUpdateClick(release) },
+                                    enabled = !busy,
+                                    shape = ControlShape,
+                                    modifier = Modifier.weight(1.4f)
+                                ) {
+                                    Text("应用内下载更新", fontWeight = FontWeight.Bold)
+                                }
+                                OutlinedButton(
+                                    onClick = { onDismissLauncherUpdateClick(release) },
+                                    enabled = !busy,
+                                    shape = ControlShape,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("暂不更新")
+                                }
+                            }
+                        }
+
+                        is LauncherUpdateState.Downloading -> {
+                            val total = launcherUpdateState.totalBytes
+                            val downloaded = launcherUpdateState.downloadedBytes
+                            val progress = if (total > 0L) {
+                                (downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+                            } else {
+                                null
+                            }
+                            Text(
+                                text = buildString {
+                                    append("正在下载 ${launcherUpdateState.release.displayLabel}")
+                                    append(" · ${formatMegabytes(downloaded)}")
+                                    if (total > 0L) {
+                                        val pct = ((downloaded * 100L) / total).coerceIn(0L, 100L)
+                                        append(" / ${formatMegabytes(total)} ($pct%)")
+                                    }
+                                },
+                                color = MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            if (progress != null) {
+                                LinearProgressIndicator(
+                                    progress = { progress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                )
+                            } else {
+                                LinearProgressIndicator(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = onCancelLauncherUpdateDownloadClick,
+                                shape = ControlShape,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("取消下载")
+                            }
+                        }
+
+                        is LauncherUpdateState.ReadyToInstall -> {
+                            Surface(
+                                shape = CutCornerShape(topEnd = 8.dp, bottomStart = 8.dp),
+                                color = LimbusSuccess.copy(alpha = 0.14f),
+                                border = BorderStroke(1.dp, LimbusSuccess.copy(alpha = 0.45f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "${launcherUpdateState.release.displayLabel} 已下载并通过包名、版本与同签名校验，可直接覆盖安装。",
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.padding(12.dp)
+                                )
+                            }
+                            Button(
+                                onClick = { onInstallLauncherUpdateClick(launcherUpdateState.apkFile) },
+                                enabled = !busy,
+                                shape = ControlShape,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("立即覆盖安装", fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        is LauncherUpdateState.Error -> {
+                            InfoStrip(launcherUpdateState.message)
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                OutlinedButton(
+                                    onClick = onCheckLauncherUpdateClick,
+                                    enabled = !busy,
+                                    shape = ControlShape,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("重新检查")
+                                }
+                                launcherUpdateState.release?.let { release ->
+                                    Button(
+                                        onClick = { onDownloadLauncherUpdateClick(release) },
+                                        enabled = !busy,
+                                        shape = ControlShape,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("重新下载")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SectionCard(
+                    title = "横屏方向锁定",
+                    badge = if (screenOrientationMode == LimbusOrientationManager.MODE_LANDSCAPE) "常规横屏" else "反向横屏"
+                ) {
+                    Text(
+                        text = "针对手机开启竖屏锁定（系统关闭自动旋转）进行专项适配。可自由指定游戏横屏朝向，告别误触音量键与锁屏按键，进入游戏直接锁定。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        val modes = listOf(
+                            Triple(
+                                LimbusOrientationManager.MODE_REVERSE_LANDSCAPE,
+                                "锁定反向横屏 (推荐)",
+                                "音量键始终朝上 · 避免双手握持误触按键（惯用推荐）"
+                            ),
+                            Triple(
+                                LimbusOrientationManager.MODE_LANDSCAPE,
+                                "锁定常规横屏",
+                                "音量键始终朝下 · 传统原生默认方向"
+                            )
+                        )
+                        modes.forEach { (mode, title, desc) ->
+                            val selected = screenOrientationMode == mode
+                            Surface(
+                                onClick = { onScreenOrientationModeChange(mode) },
+                                shape = CutCornerShape(topEnd = 6.dp, bottomStart = 6.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                ),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = title,
+                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                        Text(
+                                            text = desc,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                    if (selected) {
+                                        Text(
+                                            text = "● 已生效",
+                                            color = MaterialTheme.colorScheme.primary,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SectionCard(
+                    title = "应用图标",
+                    badge = selectedAppIcon.displayName
+                ) {
+                    Text(
+                        text = "选择后返回桌面自动生效（桌面应用名称保持不变），部分机型需等待数秒刷新。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (gameRunning) {
+                        InfoStrip("游戏正在后台运行中，请先退出游戏后再更换图标，避免系统刷新桌面时结束游戏进程。")
+                    }
+                    val switchable = !busy && !gameRunning
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        AppIconPreset.entries.chunked(4).forEach { rowPresets ->
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                rowPresets.forEach { preset ->
+                                    val selected = preset == selectedAppIcon
+                                    Surface(
+                                        onClick = { onSelectAppIcon(preset) },
+                                        enabled = switchable,
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (selected) {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                                        },
+                                        border = BorderStroke(
+                                            width = if (selected) 1.5.dp else 1.dp,
+                                            color = if (selected) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                            }
+                                        ),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Column(
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+                                        ) {
+                                            Image(
+                                                painter = painterResource(preset.iconRes),
+                                                contentDescription = preset.displayName,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier
+                                                    .size(50.dp)
+                                                    .clip(RoundedCornerShape(10.dp))
+                                            )
+                                            Text(
+                                                text = preset.displayName,
+                                                color = if (selected) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurface
+                                                },
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                softWrap = false
+                                            )
+                                        }
+                                    }
+                                }
+                                repeat(4 - rowPresets.size) {
+                                    Spacer(modifier = Modifier.weight(1f))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+            }
+        }
+    }
+}
+
+private fun formatMegabytes(bytes: Long): String {
+    val mb = bytes.coerceAtLeast(0L) / (1024.0 * 1024.0)
+    return String.format(java.util.Locale.US, "%.1f MB", mb)
 }
 
 @Composable

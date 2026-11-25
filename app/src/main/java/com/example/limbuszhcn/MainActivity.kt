@@ -60,6 +60,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,6 +91,10 @@ import com.example.limbuszhcn.gamefs.GameResourceTransfer
 import com.example.limbuszhcn.gamefs.PatchInstallSummary
 import com.example.limbuszhcn.ui.theme.LimbusZhCNTheme
 import com.example.limbuszhcn.update.GeminiLangPackImporter
+import com.example.limbuszhcn.update.LauncherSelfUpdateManager
+import com.example.limbuszhcn.update.LauncherSelfUpdatePolicy
+import com.example.limbuszhcn.update.LauncherUpdateRelease
+import com.example.limbuszhcn.update.LauncherUpdateState
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -119,6 +124,12 @@ class MainActivity : ComponentActivity() {
     private val deviceCompatibility by lazy { DeviceCompatibility(applicationContext) }
     private val translationCacheRoot by lazy { filesDir.toPath().resolve("translation-cache") }
     private val geminiImporter by lazy { GeminiLangPackImporter(translationCacheRoot) }
+    private val launcherUpdateManager by lazy {
+        LauncherSelfUpdateManager(
+            applicationContext,
+            getSharedPreferences("limbus_settings", MODE_PRIVATE)
+        )
+    }
 
     @Volatile
     private var pendingGameRestartForNewIndex: Boolean = false
@@ -252,8 +263,119 @@ class MainActivity : ComponentActivity() {
             var selectedAppIcon by remember {
                 mutableStateOf(initialAppIcon)
             }
+            var launcherUpdateState by remember {
+                mutableStateOf<LauncherUpdateState>(LauncherUpdateState.Idle)
+            }
+            var latestAvailableRelease by remember {
+                mutableStateOf<LauncherUpdateRelease?>(null)
+            }
+            var acknowledgedUpdateKey by remember {
+                mutableStateOf(launcherUpdateManager.acknowledgedUpdateKey())
+            }
+            var updateDownloadCancel by remember {
+                mutableStateOf<AtomicBoolean?>(null)
+            }
+            var pendingInstallApkFile by remember {
+                mutableStateOf<File?>(null)
+            }
             var message by remember {
                 mutableStateOf(containerStatus.message)
+            }
+
+            val showUpdateBadge = LauncherSelfUpdatePolicy.shouldShowReminderDot(
+                release = latestAvailableRelease,
+                currentVersionName = BuildConfig.VERSION_NAME,
+                currentVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                acknowledgedUpdateKey = acknowledgedUpdateKey
+            )
+
+            fun launchApkInstall(apkFile: File) {
+                if (!apkFile.isFile) {
+                    launcherUpdateState = LauncherUpdateState.Error("安装包缓存已失效，请重新下载", latestAvailableRelease)
+                    return
+                }
+                if (!launcherUpdateManager.canRequestPackageInstalls()) {
+                    pendingInstallApkFile = apkFile
+                    runCatching {
+                        startActivity(launcherUpdateManager.buildUnknownSourcesSettingsIntent())
+                        message = "请在系统页面开启「允许安装未知应用」，返回后将自动继续覆盖安装"
+                    }.onFailure { error ->
+                        pendingInstallApkFile = null
+                        message = "无法打开安装权限设置: ${error.userMessage()}"
+                    }
+                    return
+                }
+                runCatching {
+                    startActivity(launcherUpdateManager.buildInstallApkIntent(apkFile))
+                    message = "已调起系统安装器，请确认覆盖安装（容器内游戏数据将完整保留）"
+                }.onFailure { error ->
+                    PersistentDiagnosticLog.error(TAG, "Unable to launch system installer", error)
+                    launcherUpdateState = LauncherUpdateState.Error(
+                        "拉起系统安装器失败: ${error.userMessage()}",
+                        latestAvailableRelease
+                    )
+                }
+            }
+
+            fun checkLauncherUpdate(silent: Boolean) {
+                if (launcherUpdateState is LauncherUpdateState.Checking
+                    || launcherUpdateState is LauncherUpdateState.Downloading
+                ) {
+                    return
+                }
+                if (!silent) {
+                    launcherUpdateState = LauncherUpdateState.Checking
+                }
+                Thread {
+                    val result = runCatching { launcherUpdateManager.fetchLatestRelease() }
+                    runOnUiThread {
+                        result.fold(
+                            onSuccess = { release ->
+                                launcherUpdateManager.markAutoCheckCompleted()
+                                val hasNew = LauncherSelfUpdatePolicy.isUpdateAvailable(
+                                    release = release,
+                                    currentVersionName = BuildConfig.VERSION_NAME,
+                                    currentVersionCode = BuildConfig.VERSION_CODE.toLong()
+                                )
+                                if (hasNew) {
+                                    latestAvailableRelease = release
+                                    launcherUpdateState = LauncherUpdateState.Available(release)
+                                } else {
+                                    latestAvailableRelease = null
+                                    if (!silent) {
+                                        launcherUpdateState = LauncherUpdateState.UpToDate(
+                                            "当前已是最新正式版（v${BuildConfig.VERSION_NAME} / build ${BuildConfig.VERSION_CODE}）"
+                                        )
+                                    }
+                                }
+                            },
+                            onFailure = { error ->
+                                PersistentDiagnosticLog.warn(
+                                    TAG,
+                                    "Launcher self-update check failed silent=$silent",
+                                    error
+                                )
+                                if (!silent) {
+                                    launcherUpdateState = LauncherUpdateState.Error(
+                                        "检查更新失败：${error.userMessage()}（请确认设备可访问 GitHub 后重试）",
+                                        latestAvailableRelease
+                                    )
+                                }
+                            }
+                        )
+                    }
+                }.start()
+            }
+
+            LaunchedEffect(Unit) {
+                Thread {
+                    runCatching {
+                        launcherUpdateManager.cleanupStaleUpdates(BuildConfig.VERSION_CODE.toLong())
+                    }
+                }.start()
+                if (launcherUpdateManager.shouldRunAutoCheck()) {
+                    checkLauncherUpdate(silent = true)
+                }
             }
 
             fun syncUiSnapshots() {
@@ -308,6 +430,11 @@ class MainActivity : ComponentActivity() {
                         selectedAppIcon = currentIcon
                         if (report != null) {
                             compatibilityReport = report
+                        }
+                        val queuedApk = pendingInstallApkFile
+                        if (queuedApk != null && launcherUpdateManager.canRequestPackageInstalls()) {
+                            pendingInstallApkFile = null
+                            launchApkInstall(queuedApk)
                         }
                     }
                 }.start()
@@ -895,6 +1022,83 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }.start()
+                    },
+                    launcherUpdateState = launcherUpdateState,
+                    showUpdateBadge = showUpdateBadge,
+                    onOpenSettingsClick = {
+                        latestAvailableRelease?.let { rel ->
+                            launcherUpdateManager.acknowledgeUpdate(rel.updateKey)
+                            acknowledgedUpdateKey = rel.updateKey
+                        }
+                    },
+                    onCheckLauncherUpdateClick = {
+                        checkLauncherUpdate(silent = false)
+                    },
+                    onDownloadLauncherUpdateClick = { release ->
+                        val cancelFlag = AtomicBoolean(false)
+                        updateDownloadCancel = cancelFlag
+                        launcherUpdateState = LauncherUpdateState.Downloading(
+                            release = release,
+                            downloadedBytes = 0L,
+                            totalBytes = release.sizeBytes ?: -1L
+                        )
+                        Thread {
+                            val result = runCatching {
+                                launcherUpdateManager.downloadAndVerify(
+                                    release = release,
+                                    currentVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                                    cancelled = cancelFlag
+                                ) { downloaded, total ->
+                                    runOnUiThread {
+                                        if (!cancelFlag.get()) {
+                                            launcherUpdateState = LauncherUpdateState.Downloading(
+                                                release = release,
+                                                downloadedBytes = downloaded,
+                                                totalBytes = total
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            runOnUiThread {
+                                updateDownloadCancel = null
+                                result.fold(
+                                    onSuccess = { apkFile ->
+                                        launcherUpdateState = LauncherUpdateState.ReadyToInstall(release, apkFile)
+                                        launchApkInstall(apkFile)
+                                    },
+                                    onFailure = { error ->
+                                        if (error is LauncherSelfUpdateManager.CancelledDownloadException) {
+                                            launcherUpdateState = LauncherUpdateState.Available(release)
+                                            message = "已取消下载更新包"
+                                        } else {
+                                            PersistentDiagnosticLog.warn(
+                                                TAG,
+                                                "Launcher self-update download/verify failed",
+                                                error
+                                            )
+                                            launcherUpdateState = LauncherUpdateState.Error(
+                                                error.userMessage(),
+                                                release
+                                            )
+                                        }
+                                    }
+                                )
+                            }
+                        }.start()
+                    },
+                    onCancelLauncherUpdateDownloadClick = {
+                        updateDownloadCancel?.set(true)
+                    },
+                    onInstallLauncherUpdateClick = { apkFile ->
+                        launchApkInstall(apkFile)
+                    },
+                    onDismissLauncherUpdateClick = { release ->
+                        launcherUpdateManager.acknowledgeUpdate(release.updateKey)
+                        acknowledgedUpdateKey = release.updateKey
+                        launcherUpdateState = LauncherUpdateState.UpToDate(
+                            "已暂缓 ${release.displayLabel} 提醒，后续可随时在此手动检查更新"
+                        )
                     }
                 )
 
