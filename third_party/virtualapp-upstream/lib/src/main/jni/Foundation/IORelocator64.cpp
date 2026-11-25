@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/system_properties.h>
 #include <ucontext.h>
 #include <android/log.h>
@@ -1394,6 +1395,22 @@ HOOK_DEF(int, kill, pid_t pid, int sig) {
     return static_cast<int>(syscall(__NR_kill, pid, sig));
 }
 
+static bool is_limbus_one_shot_one_sec_itimer(const struct itimerval *value) {
+    return value != nullptr
+           && value->it_value.tv_sec == 1
+           && value->it_value.tv_usec == 0
+           && value->it_interval.tv_sec == 0
+           && value->it_interval.tv_usec == 0;
+}
+
+[[noreturn]] static void park_limbus_appsealing_killer_thread(const char *source, pid_t tid, pid_t pid) {
+    ALOGE("%s >>> parking AppSealing delayed killer thread tid=%d pid=%d", source, tid, pid);
+    for (;;) {
+        struct timespec ts = { 3600, 0 };
+        nanosleep(&ts, nullptr);
+    }
+}
+
 // unsigned int alarm(unsigned int seconds);
 HOOK_DEF(unsigned int, alarm, unsigned int seconds) {
     if (seconds > 0 && is_limbus_container_process()) {
@@ -1413,11 +1430,20 @@ HOOK_DEF(unsigned int, alarm, unsigned int seconds) {
 // int setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value);
 HOOK_DEF(int, setitimer, int which, const struct itimerval *new_value, struct itimerval *old_value) {
     if (which == ITIMER_REAL && new_value && is_limbus_container_process()) {
-        ALOGE("setitimer >>> blocked Limbus container ITIMER_REAL sec : %ld usec : %ld interval_sec : %ld interval_usec : %ld",
+        pid_t tid = static_cast<pid_t>(syscall(__NR_gettid));
+        pid_t pid = getpid();
+        ALOGE("setitimer >>> blocked Limbus container ITIMER_REAL sec : %ld usec : %ld interval_sec : %ld interval_usec : %ld tid : %d pid : %d",
               static_cast<long>(new_value->it_value.tv_sec),
               static_cast<long>(new_value->it_value.tv_usec),
               static_cast<long>(new_value->it_interval.tv_sec),
-              static_cast<long>(new_value->it_interval.tv_usec));
+              static_cast<long>(new_value->it_interval.tv_usec),
+              tid, pid);
+        if (is_limbus_one_shot_one_sec_itimer(new_value) && tid != pid) {
+            // AppSealing 后台检测线程（可能附着在 ART JavaVM 上）触发 MemoryHash 后会调用单次 1s ITIMER_REAL，
+            // 若直接返回 0，该线程会在数百毫秒后主动触发 SIGSEGV 崩死进程；
+            // 在 Native 安全点永久 nanosleep 挂起既可阻断自杀链路，又避免触发 ART DetachCurrentThread 致命检查。
+            park_limbus_appsealing_killer_thread("setitimer", tid, pid);
+        }
         if (old_value) {
             memset(old_value, 0, sizeof(*old_value));
         }
@@ -2414,7 +2440,19 @@ HOOK_DEF(long, syscall, long number, ...) {
 #endif
 #ifdef __NR_setitimer
         if (number == __NR_setitimer && a1 == ITIMER_REAL && a2 != 0) {
-            ALOGE("syscall >>> blocked Limbus container setitimer ITIMER_REAL");
+            const auto *new_value = reinterpret_cast<const struct itimerval *>(a2);
+            pid_t tid = static_cast<pid_t>(limbus_signal_raw_syscall4(__NR_gettid, 0, 0, 0, 0));
+            pid_t pid = static_cast<pid_t>(limbus_signal_raw_syscall4(__NR_getpid, 0, 0, 0, 0));
+            ALOGE("syscall >>> blocked Limbus container setitimer ITIMER_REAL sec=%ld usec=%ld tid=%d pid=%d",
+                  static_cast<long>(new_value->it_value.tv_sec),
+                  static_cast<long>(new_value->it_value.tv_usec),
+                  tid, pid);
+            if (is_limbus_one_shot_one_sec_itimer(new_value) && tid != pid) {
+                park_limbus_appsealing_killer_thread("syscall(setitimer)", tid, pid);
+            }
+            if (a3 != 0) {
+                memset(reinterpret_cast<void *>(a3), 0, sizeof(struct itimerval));
+            }
             return 0;
         }
 #endif
