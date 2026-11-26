@@ -162,6 +162,29 @@ class MethodProxies {
         return shouldExposeHostGoogleServiceToLimbus(packageName);
     }
 
+    private static boolean isTrustedFirebaseAuthBrowserIntent(Intent intent) {
+        if (intent == null || intent.getComponent() != null || intent.getPackage() != null) {
+            return false;
+        }
+        Uri data = intent.getData();
+        if (data == null) {
+            return false;
+        }
+        return LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+                intent.getAction(),
+                data.getScheme(),
+                data.getHost(),
+                data.getPath());
+    }
+
+    private static String describeSanitizedUrlForLog(Intent intent) {
+        Uri data = intent == null ? null : intent.getData();
+        if (data == null) {
+            return "null";
+        }
+        return data.getScheme() + "://" + data.getHost() + (data.getPath() == null ? "" : data.getPath());
+    }
+
     private static boolean shouldBlockHostActivityForLimbus(Intent intent, ActivityInfo info) {
         if (!shouldIsolateHostActivitiesForLimbus()) {
             return false;
@@ -896,7 +919,10 @@ class MethodProxies {
                 }
             }
             // chooser
-            if (intent.getPackage() == null && intent.getComponent() == null && ChooserActivity.check(intent)) {
+            if (intent.getPackage() == null
+                    && intent.getComponent() == null
+                    && !isTrustedFirebaseAuthBrowserIntent(intent)
+                    && ChooserActivity.check(intent)) {
                 if (shouldIsolateHostActivitiesForLimbus()) {
                     Log.i("LimbusVA", "Block host chooser activity for Limbus: " + describeIntentForLog(intent));
                     return ActivityManagerCompat.START_INTENT_NOT_RESOLVED;
@@ -920,10 +946,22 @@ class MethodProxies {
                 if (intent.getPackage() != null && isAppPkg(intent.getPackage())) {
                     return ActivityManagerCompat.START_INTENT_NOT_RESOLVED;
                 }
-                if (shouldIsolateHostActivitiesForLimbus()) {
+                boolean trustedAuthBrowser = isTrustedFirebaseAuthBrowserIntent(intent);
+                if (shouldIsolateHostActivitiesForLimbus() && !trustedAuthBrowser) {
                     Log.i("LimbusVA", "Block unresolved host activity lookup for Limbus: "
                             + describeIntentForLog(intent));
                     return ActivityManagerCompat.START_INTENT_NOT_RESOLVED;
+                }
+                if (trustedAuthBrowser) {
+                    Log.i("LimbusVA", "Route trusted Firebase Auth intent to built-in OAuth browser url="
+                            + describeSanitizedUrlForLog(intent));
+                    Intent oauthBrowserIntent = new Intent(Intent.ACTION_VIEW, intent.getData());
+                    oauthBrowserIntent.setClassName(
+                            getHostPkg(),
+                            "com.lody.virtual.client.stub.LimbusOAuthBrowserActivity");
+                    oauthBrowserIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    args[intentIndex] = oauthBrowserIntent;
+                    return method.invoke(who, args);
                 }
 
                 //xdja uac scheme
@@ -953,6 +991,12 @@ class MethodProxies {
                     return ActivityManagerCompat.START_INTENT_NOT_RESOLVED;
                 }
 
+                if (trustedAuthBrowser && !getHostPkg().equals(resolveInfo.activityInfo.packageName)) {
+                    Log.i("LimbusVA", "Launch host browser for Limbus Firebase Auth pkg="
+                            + resolveInfo.activityInfo.packageName
+                            + " url=" + describeSanitizedUrlForLog(intent));
+                    return method.invoke(who, args);
+                }
                 if (shouldBlockHostActivityForLimbus(intent, resolveInfo.activityInfo)) {
                     Log.i("LimbusVA", "Block resolved host activity for Limbus: "
                             + resolveInfo.activityInfo.packageName + "/" + resolveInfo.activityInfo.name

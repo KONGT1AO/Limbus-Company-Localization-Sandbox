@@ -234,4 +234,89 @@ class LimbusAuthenticationCompatTest {
         assertNull(LimbusAuthenticationCompat.resolveFirebaseAuthRedirectActivity(
             "genericidp", "firebase.auth", "/unexpected"))
     }
+
+    /** 验证仅对受信任的 Firebase Auth / Apple OAuth HTTPS 链接放行系统浏览器外跳。 */
+    @Test
+    fun allowsOnlyTrustedFirebaseAuthAndAppleOAuthBrowserUrls() {
+        val view = "android.intent.action.VIEW"
+        assertTrue(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", "limbus-company-33638194.firebaseapp.com", "/__/auth/handler"))
+        assertTrue(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", "limbus-company-33638194.web.app", "/__/auth/action"))
+        assertTrue(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", "appleid.apple.com", "/auth/authorize"))
+
+        assertFalse(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            "android.intent.action.MAIN", "https", "limbus-company-33638194.firebaseapp.com", "/__/auth/handler"))
+        assertFalse(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "http", "limbus-company-33638194.firebaseapp.com", "/__/auth/handler"))
+        assertFalse(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", "limbus-company-33638194.firebaseapp.com", "/other"))
+        assertFalse(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", ".firebaseapp.com", "/__/auth/handler"))
+        assertFalse(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", "evil.example.com", "/__/auth/handler"))
+        assertFalse(LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+            view, "https", "appleid.apple.com.evil.com", "/auth/authorize"))
+    }
+
+    /** 验证无 URI 浏览器探针仅对 Firebase Auth 两个认证页面生效。 */
+    @Test
+    fun matchesOnlyFirebaseAuthActivityClassNamesForBrowserProbe() {
+        assertTrue(LimbusAuthenticationCompat.isFirebaseAuthActivityClassName(
+            "com.google.firebase.auth.internal.GenericIdpActivity"))
+        assertTrue(LimbusAuthenticationCompat.isFirebaseAuthActivityClassName(
+            "com.google.firebase.auth.internal.RecaptchaActivity"))
+        assertFalse(LimbusAuthenticationCompat.isFirebaseAuthActivityClassName(
+            "com.unity3d.player.UnityPlayerActivity"))
+        assertFalse(LimbusAuthenticationCompat.isFirebaseAuthActivityClassName(null))
+    }
+
+    /** 验证内置 OAuth 浏览器能精准提取 intent:// 与直连回调并剥离原版包名锁定，同时拒绝非法跳转。 */
+    @Test
+    fun extractsFirebaseAuthRedirectFromIntentAndDirectUris() {
+        val intentUri = "intent://firebase.auth/?link=https%3A%2F%2Flimbus-company-33638194.firebaseapp.com%2F__%2Fauth%2Fcallback%3Fcode%3D123" +
+            "#Intent;scheme=genericidp;package=com.ProjectMoon.LimbusCompany;S.browser_fallback_url=https%3A%2F%2Fexample.com;end"
+        assertEquals(
+            "genericidp://firebase.auth/?link=https%3A%2F%2Flimbus-company-33638194.firebaseapp.com%2F__%2Fauth%2Fcallback%3Fcode%3D123",
+            LimbusAuthenticationCompat.extractFirebaseAuthRedirectUrl(intentUri)
+        )
+
+        val directRecaptcha = "recaptcha://firebase.auth/?token=abc"
+        assertEquals(
+            directRecaptcha,
+            LimbusAuthenticationCompat.extractFirebaseAuthRedirectUrl(directRecaptcha)
+        )
+
+        assertNull(LimbusAuthenticationCompat.extractFirebaseAuthRedirectUrl(
+            "intent://evil.example/?x=1#Intent;scheme=genericidp;package=com.ProjectMoon.LimbusCompany;end"))
+        assertNull(LimbusAuthenticationCompat.extractFirebaseAuthRedirectUrl(
+            "intent://firebase.auth/?x=1#Intent;scheme=https;package=com.ProjectMoon.LimbusCompany;end"))
+        assertNull(LimbusAuthenticationCompat.extractFirebaseAuthRedirectUrl(
+            "https://appleid.apple.com/auth/authorize"))
+    }
+
+    /** 验证内置 OAuth 浏览器仅放行 HTTPS 顶级导航并安全移除 UA 中的 WebView 标记。 */
+    @Test
+    fun validatesOAuthWebViewNavigationAndCleansUserAgent() {
+        assertTrue(LimbusAuthenticationCompat.isAllowedOAuthWebViewNavigationUrl("https://appleid.apple.com/auth/authorize"))
+        assertFalse(LimbusAuthenticationCompat.isAllowedOAuthWebViewNavigationUrl("http://appleid.apple.com"))
+        assertFalse(LimbusAuthenticationCompat.isAllowedOAuthWebViewNavigationUrl("file:///etc/hosts"))
+        assertFalse(LimbusAuthenticationCompat.isAllowedOAuthWebViewNavigationUrl("javascript:alert(1)"))
+
+        assertEquals(
+            "Mozilla/5.0 (Linux; Android 16; V2408A) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36",
+            LimbusAuthenticationCompat.stripWebViewMarkerFromUserAgent(
+                "Mozilla/5.0 (Linux; Android 16; V2408A; wv) AppleWebKit/537.36 Version/4.0 Chrome/131.0.0.0 Mobile Safari/537.36"
+            )
+        )
+
+        assertTrue(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey("link"))
+        assertTrue(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey("eventId"))
+        assertTrue(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey("encryptionEnabled"))
+        assertTrue(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey("firebaseError"))
+        assertFalse(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey("browser_fallback_url"))
+        assertFalse(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey("arbitrary_extra"))
+        assertFalse(LimbusAuthenticationCompat.isAllowedFirebaseAuthCallbackExtraKey(null))
+    }
 }

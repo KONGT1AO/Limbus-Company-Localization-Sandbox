@@ -4,6 +4,12 @@
 
     <queries>
         <package android:name="com.ProjectMoon.LimbusCompany" />
+        <!-- 允许容器在 Apple / Firebase Auth 网页登录时解析宿主机默认 HTTPS 浏览器。 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
         <!-- Android 11 起 PackageManager 查询受限；显式声明常见 ROM 的后台权限管理器，
              才能在 vivo/iQOO、MIUI、ColorOS、EMUI 等设备上验证并打开对应设置页。 -->
         <package android:name="com.iqoo.secure" />

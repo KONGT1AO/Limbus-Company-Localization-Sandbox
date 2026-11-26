@@ -283,4 +283,148 @@ public final class LimbusAuthenticationCompat {
         }
         return null;
     }
+
+    /**
+     * 判断游戏发起的浏览器 Intent 是否属于受信任的 Firebase Auth / Apple OAuth 网页授权链接。
+     *
+     * <p>为了维持 AppSealing 宿主隔离，仅精确放行隐式 {@code ACTION_VIEW} 的 HTTPS Firebase Auth
+     * 授权入口（{@code /__/auth/handler}、{@code /__/auth/action}）与 {@code appleid.apple.com}，
+     * 避免向游戏暴露其它宿主应用或任意外部跳转。</p>
+     */
+    public static boolean isTrustedFirebaseAuthBrowserUrl(
+            String action,
+            String scheme,
+            String host,
+            String path) {
+        if (!"android.intent.action.VIEW".equals(action)
+                || scheme == null || !"https".equalsIgnoreCase(scheme)
+                || host == null || host.isEmpty()) {
+            return false;
+        }
+        String normalizedHost = host.toLowerCase(Locale.ENGLISH);
+        if ("appleid.apple.com".equals(normalizedHost)) {
+            return path == null || path.isEmpty() || path.startsWith("/");
+        }
+        boolean isFirebaseAuthHost = (normalizedHost.endsWith(".firebaseapp.com")
+                && normalizedHost.length() > ".firebaseapp.com".length())
+                || (normalizedHost.endsWith(".web.app")
+                && normalizedHost.length() > ".web.app".length());
+        if (!isFirebaseAuthHost) {
+            return false;
+        }
+        return "/__/auth/handler".equals(path) || "/__/auth/action".equals(path);
+    }
+
+    /**
+     * 判断调用栈类名是否属于 Firebase Auth 内置网页授权入口页面。
+     *
+     * <p>Firebase Auth SDK 的 {@code GenericIdpActivity} 会先用不带 URI 的 {@code new Intent(ACTION_VIEW)}
+     * 探测设备是否存在浏览器；仅在调用栈确认为这两个认证页面时放行该探针，不向 AppSealing 暴露宿主包。</p>
+     */
+    public static boolean isFirebaseAuthActivityClassName(String className) {
+        return GENERIC_IDP_ACTIVITY.equals(className) || RECAPTCHA_ACTIVITY.equals(className);
+    }
+
+    /**
+     * 从内置 OAuth WebView 拦截到的跳转地址中提取受信任的 Firebase Auth 回调 URL。
+     *
+     * <p>支持两种形态：直接回调（{@code genericidp://firebase.auth/?...} / {@code recaptcha://firebase.auth/?...}）
+     * 以及 Firebase 网页常用的 Android {@code intent://firebase.auth/?...#Intent;scheme=genericidp;package=...;end}。
+     * 提取时会剥离显式 {@code package=} 绑定，仅保留标准回调 URI，确保回传到容器内游戏而非宿主机原版。</p>
+     *
+     * @param rawUrl WebView 拦截到的原始跳转字符串
+     * @return 验证通过的 {@code genericidp://} 或 {@code recaptcha://} 回调 URL；不匹配时返回 {@code null}
+     */
+    public static String extractFirebaseAuthRedirectUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.isEmpty()) {
+            return null;
+        }
+        String candidate = rawUrl.trim();
+        if (candidate.regionMatches(true, 0, "intent://", 0, "intent://".length())) {
+            int marker = candidate.indexOf("#Intent;");
+            if (marker <= "intent://".length()) {
+                return null;
+            }
+            String body = candidate.substring("intent://".length(), marker);
+            String fragment = candidate.substring(marker + "#Intent;".length());
+            String scheme = null;
+            for (String token : fragment.split(";")) {
+                if (token.startsWith("scheme=")) {
+                    scheme = token.substring("scheme=".length()).trim();
+                    break;
+                }
+            }
+            if (scheme == null || scheme.isEmpty()) {
+                return null;
+            }
+            candidate = scheme + "://" + body;
+        }
+        int schemeEnd = candidate.indexOf("://");
+        if (schemeEnd <= 0) {
+            return null;
+        }
+        String scheme = candidate.substring(0, schemeEnd).toLowerCase(Locale.ENGLISH);
+        String rest = candidate.substring(schemeEnd + 3);
+        int queryOrFrag = rest.length();
+        int qIdx = rest.indexOf('?');
+        if (qIdx >= 0 && qIdx < queryOrFrag) {
+            queryOrFrag = qIdx;
+        }
+        int fIdx = rest.indexOf('#');
+        if (fIdx >= 0 && fIdx < queryOrFrag) {
+            queryOrFrag = fIdx;
+        }
+        String authorityAndPath = rest.substring(0, queryOrFrag);
+        int slashIdx = authorityAndPath.indexOf('/');
+        String host = slashIdx >= 0 ? authorityAndPath.substring(0, slashIdx) : authorityAndPath;
+        String path = slashIdx >= 0 ? authorityAndPath.substring(slashIdx) : "";
+        if (resolveFirebaseAuthRedirectActivity(scheme, host, path) == null) {
+            return null;
+        }
+        return scheme + "://" + rest;
+    }
+
+    /**
+     * 判断内置 OAuth WebView 是否允许顶级导航到指定 URL（仅放行 HTTPS 网页）。
+     */
+    public static boolean isAllowedOAuthWebViewNavigationUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return false;
+        }
+        String trimmed = url.trim();
+        return trimmed.regionMatches(true, 0, "https://", 0, "https://".length());
+    }
+
+    /**
+     * 判断从 Firebase Auth {@code intent://} 回调解析出的 Extra 键是否允许安全转发到容器内游戏。
+     *
+     * <p>{@code GenericIdpActivity} 与 {@code RecaptchaActivity} 通过 {@code link}、{@code eventId}、
+     * {@code encryptionEnabled}、{@code firebaseError} 等基本类型 Extra 接收授权结果；此处显式屏蔽
+     * {@code browser_fallback_url} 等浏览器元数据，避免无关参数进入容器。</p>
+     */
+    public static boolean isAllowedFirebaseAuthCallbackExtraKey(String key) {
+        if (key == null || key.isEmpty()) {
+            return false;
+        }
+        return "link".equals(key)
+                || "eventId".equals(key)
+                || "encryptionEnabled".equals(key)
+                || "firebaseError".equals(key)
+                || "recaptchaToken".equals(key)
+                || key.startsWith("com.google.firebase.auth.");
+    }
+
+    /**
+     * 移除 Chromium WebView User-Agent 中的 {@code ; wv} 与 {@code Version/4.0 } 标记，
+     * 保留真实设备型号与 Chromium 版本号，避免第三方 OAuth 页面误判拒绝内置 WebView。
+     */
+    public static String stripWebViewMarkerFromUserAgent(String userAgent) {
+        if (userAgent == null || userAgent.isEmpty()) {
+            return "";
+        }
+        return userAgent
+                .replace("; wv)", ")")
+                .replace("; wv;", ";")
+                .replace("Version/4.0 ", "");
+    }
 }

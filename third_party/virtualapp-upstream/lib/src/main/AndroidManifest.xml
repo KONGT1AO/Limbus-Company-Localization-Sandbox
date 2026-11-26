@@ -423,6 +423,18 @@
             </intent-filter>
         </activity>
 
+        <!--
+            宿主内置的 Firebase Auth / Apple OAuth 授权浏览器页面。
+            直接拦截 Firebase 回调的 intent:// / genericidp:// 并剥离原版包名锁定，无缝回传至容器。
+        -->
+        <activity
+            android:name=".client.stub.LimbusOAuthBrowserActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|uiMode"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+
         <service
             android:name=".client.stub.ShadowPendingService"
             android:exported="true"

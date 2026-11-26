@@ -386,6 +386,8 @@ public final class VClient extends IVClient.Stub {
                     true);
         } else if(ActivityThreadQ.handleNewIntent != null){
             ActivityThreadQ.handleNewIntent.call(VirtualCore.mainThread(), data.token, Collections.singletonList(intent));
+        } else {
+            deliverNewIntentCompat(data.token, intent, data.intent);
         }
         if("com.tencent.mm".equals(getCurrentPackage())){
             //xdja 修复微信按2次返回键退出
@@ -401,6 +403,72 @@ public final class VClient extends IVClient.Stub {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Android 14+（API 34～37）兼容的 {@code onNewIntent} 分发实现。
+     *
+     * <p>AOSP 在新版本中将 {@code ActivityThread.handleNewIntent} 的首个参数从 {@code IBinder}
+     * 调整为 {@code ActivityClientRecord}，导致 VirtualApp 原有的三个静态反射字段全为 {@code null}。
+     * 这里先按新签名反射调用，并在不可用时回退到公开标准 API {@link android.app.Instrumentation#callActivityOnNewIntent}。</p>
+     */
+    private void deliverNewIntentCompat(IBinder token, Intent referrerIntent, Intent rawIntent) {
+        if (token == null) {
+            return;
+        }
+        try {
+            Object mainThread = VirtualCore.mainThread();
+            Map<IBinder, Object> activities = ActivityThread.mActivities == null
+                    ? null
+                    : ActivityThread.mActivities.get(mainThread);
+            Object record = activities == null ? null : activities.get(token);
+            if (record == null) {
+                Log.w("LimbusVA", "deliverNewIntentCompat missing ActivityClientRecord for token=" + token);
+                return;
+            }
+            Activity activity = ActivityThread.ActivityClientRecord.activity == null
+                    ? null
+                    : ActivityThread.ActivityClientRecord.activity.get(record);
+            String activityName = activity == null ? "null" : activity.getClass().getName();
+            List<Intent> intentList = Collections.singletonList(referrerIntent);
+            for (Method method : mainThread.getClass().getDeclaredMethods()) {
+                String name = method.getName();
+                if (!"handleNewIntent".equals(name) && !"performNewIntents".equals(name)) {
+                    continue;
+                }
+                Class<?>[] params = method.getParameterTypes();
+                if (params.length == 2
+                        && params[0].isInstance(record)
+                        && List.class.isAssignableFrom(params[1])) {
+                    method.setAccessible(true);
+                    method.invoke(mainThread, record, intentList);
+                    Log.i("LimbusVA", "Delivered newIntent via " + name + "(ActivityClientRecord, List) target=" + activityName);
+                    return;
+                }
+                if (params.length == 3
+                        && params[0].isInstance(record)
+                        && List.class.isAssignableFrom(params[1])
+                        && params[2] == boolean.class) {
+                    method.setAccessible(true);
+                    method.invoke(mainThread, record, intentList, true);
+                    Log.i("LimbusVA", "Delivered newIntent via " + name + "(ActivityClientRecord, List, boolean) target=" + activityName);
+                    return;
+                }
+            }
+            if (activity != null) {
+                android.app.Instrumentation instrumentation = ActivityThread.mInstrumentation == null
+                        ? null
+                        : ActivityThread.mInstrumentation.get(mainThread);
+                if (instrumentation != null) {
+                    instrumentation.callActivityOnNewIntent(activity, rawIntent);
+                    Log.i("LimbusVA", "Delivered newIntent via Instrumentation.callActivityOnNewIntent target=" + activityName);
+                    return;
+                }
+            }
+            Log.w("LimbusVA", "deliverNewIntentCompat found no delivery path target=" + activityName);
+        } catch (Throwable error) {
+            Log.e("LimbusVA", "deliverNewIntentCompat failed", error);
         }
     }
 

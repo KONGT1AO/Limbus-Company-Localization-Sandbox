@@ -20,6 +20,7 @@ import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.pm.Signature;
 import android.graphics.Bitmap;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
 import android.os.IInterface;
@@ -36,6 +37,7 @@ import com.lody.virtual.client.fixer.ComponentFixer;
 import com.lody.virtual.client.hook.base.MethodProxy;
 import com.lody.virtual.client.hook.utils.MethodParameterUtils;
 import com.lody.virtual.client.ipc.VPackageManager;
+import com.lody.virtual.helper.compat.LimbusAuthenticationCompat;
 import com.lody.virtual.helper.compat.ParceledListSliceCompat;
 import com.lody.virtual.helper.utils.ArrayUtils;
 import com.lody.virtual.helper.utils.FileUtils;
@@ -1391,6 +1393,32 @@ class MethodProxies {
             ResolveInfo resolveInfo = VPackageManager.get().resolveIntent(intent, resolvedType, flags, userId);
             if (resolveInfo == null) {
                 if (shouldIsolateHostPackagesForLimbus()) {
+                    if (isTrustedFirebaseAuthBrowserIntent(intent)) {
+                        ResolveInfo info = (ResolveInfo) method.invoke(who, args);
+                        if (info != null && info.activityInfo != null
+                                && !shouldHidePackageFromCurrentApp(info.activityInfo.packageName)) {
+                            ComponentFixer.fixOutsideComponentInfo(info.activityInfo);
+                            Log.i("LimbusVA", "Resolved host browser for Limbus Firebase Auth pkg="
+                                    + info.activityInfo.packageName);
+                            return info;
+                        }
+                    } else if (isFirebaseAuthBrowserProbeIntent(intent)) {
+                        ResolveInfo info = (ResolveInfo) method.invoke(who, args);
+                        if (info == null || info.activityInfo == null
+                                || shouldHidePackageFromCurrentApp(info.activityInfo.packageName)) {
+                            Intent httpsProbe = new Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse("https://limbus-company-33638194.firebaseapp.com/__/auth/handler"));
+                            info = VirtualCore.get().getUnHookPackageManager().resolveActivity(httpsProbe, 0);
+                        }
+                        if (info != null && info.activityInfo != null
+                                && !shouldHidePackageFromCurrentApp(info.activityInfo.packageName)) {
+                            ComponentFixer.fixOutsideComponentInfo(info.activityInfo);
+                            Log.i("LimbusVA", "Resolved host browser probe for Limbus Firebase Auth pkg="
+                                    + info.activityInfo.packageName);
+                            return info;
+                        }
+                    }
                     return null;
                 }
                 ResolveInfo info = (ResolveInfo) method.invoke(who, args);
@@ -1400,6 +1428,38 @@ class MethodProxies {
                 }
             }
             return resolveInfo;
+        }
+
+        private static boolean isTrustedFirebaseAuthBrowserIntent(Intent intent) {
+            if (intent == null || intent.getComponent() != null || intent.getPackage() != null) {
+                return false;
+            }
+            Uri data = intent.getData();
+            if (data == null) {
+                return false;
+            }
+            return LimbusAuthenticationCompat.isTrustedFirebaseAuthBrowserUrl(
+                    intent.getAction(),
+                    data.getScheme(),
+                    data.getHost(),
+                    data.getPath());
+        }
+
+        private static boolean isFirebaseAuthBrowserProbeIntent(Intent intent) {
+            if (intent == null
+                    || !Intent.ACTION_VIEW.equals(intent.getAction())
+                    || intent.getData() != null
+                    || intent.getType() != null
+                    || intent.getComponent() != null
+                    || intent.getPackage() != null) {
+                return false;
+            }
+            for (StackTraceElement element : Thread.currentThread().getStackTrace()) {
+                if (LimbusAuthenticationCompat.isFirebaseAuthActivityClassName(element.getClassName())) {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 
