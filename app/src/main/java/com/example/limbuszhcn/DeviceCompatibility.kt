@@ -99,8 +99,8 @@ internal class DeviceCompatibility(private val context: Context) {
                 add("系统没有 arm64 运行环境，无法加载游戏与汉化原生库")
             }
             if (isAggressiveBackgroundRom() && !ignoresBatteryOptimizations) {
-                // 国产 ROM 经常在 Activity 切换到游戏后清理容器 server；这里只提示用户显式放行。
-                add("建议在系统设置中允许自启动、后台高耗电和后台运行")
+                // 国产 ROM 经常在 Activity 切换到游戏或跨进程跳 microG 时拦截，这里明确提示用户放行。
+                add("建议在系统设置中允许自启动、后台高耗电、关联启动与后台弹出界面")
             }
             if (activityManager.isLowRamDevice) {
                 add("设备处于低内存模式，启动前建议关闭其他大型应用")

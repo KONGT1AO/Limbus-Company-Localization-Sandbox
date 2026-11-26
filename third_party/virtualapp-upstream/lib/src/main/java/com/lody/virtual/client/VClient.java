@@ -62,6 +62,7 @@ import com.lody.virtual.client.service.ServiceManager;
 import com.lody.virtual.client.stub.ShadowService;
 import com.lody.virtual.client.stub.StubManifest;
 import com.lody.virtual.helper.compat.BuildCompat;
+import com.lody.virtual.helper.compat.LimbusAuthenticationCompat;
 import com.lody.virtual.helper.compat.NativeLibraryHelperCompat;
 import com.lody.virtual.helper.compat.StorageManagerCompat;
 import com.lody.virtual.helper.compat.StrictModeCompat;
@@ -572,6 +573,7 @@ public final class VClient extends IVClient.Stub {
         disableFrameworkCredentialServiceForLimbus(packageName);
         Context context = createPackageContext(data.appInfo);
         applyLimbusVisibleContextDirs(context, packageName);
+        applyConnectivityServiceProxyIfNeeded(context, packageName);
         File codeCacheDir;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             codeCacheDir = context.getCodeCacheDir();
@@ -2021,9 +2023,26 @@ public final class VClient extends IVClient.Stub {
         return current;
     }
 
+    /**
+     * 为游戏与容器内 microG 进程安装 {@code ConnectivityManager} 调用方身份代理。
+     *
+     * <p>microG 在点击“登录”后会立即通过 {@code ConnectivityManager.getActiveNetworkInfo()} 校验网络。
+     * 此处仅代理网络服务身份，不修改 microG 的私有数据目录。</p>
+     */
+    public void applyConnectivityServiceProxyIfNeeded(Context context, String packageName) {
+        if (context == null || !LimbusAuthenticationCompat.shouldProxyConnectivityService(packageName)) {
+            return;
+        }
+        Context baseContext = unwrapBaseContext(context);
+        if (baseContext == null) {
+            return;
+        }
+        applyLimbusConnectivityServiceProxy(baseContext, packageName, VirtualCore.get().getHostPkg());
+    }
+
     private static void applyLimbusConnectivityServiceProxy(Context context, String packageName,
                                                               String hostPackageName) {
-        if (context == null || !"com.ProjectMoon.LimbusCompany".equals(packageName)
+        if (context == null || !LimbusAuthenticationCompat.shouldProxyConnectivityService(packageName)
                 || mirror.android.net.ConnectivityManager.mService == null
                 || mirror.android.net.IConnectivityManager.TYPE == null) {
             return;
@@ -2035,7 +2054,9 @@ public final class VClient extends IVClient.Stub {
                 return;
             }
             IInterface service = mirror.android.net.ConnectivityManager.mService.get(manager);
-            if (service == null) {
+            if (service == null
+                    || (Proxy.isProxyClass(service.getClass())
+                    && Proxy.getInvocationHandler(service) instanceof LimbusConnectivityInvocationHandler)) {
                 return;
             }
             Object proxy = Proxy.newProxyInstance(
@@ -2044,10 +2065,12 @@ public final class VClient extends IVClient.Stub {
                     new LimbusConnectivityInvocationHandler(
                             service, packageName, hostPackageName, Process.myUid()));
             mirror.android.net.ConnectivityManager.mService.set(manager, (IInterface) proxy);
-            Log.i("LimbusVA", "Applied Limbus ConnectivityManager context proxy service="
-                    + service.getClass().getName() + " context=" + context.getClass().getName());
+            Log.i("LimbusVA", "Applied virtual ConnectivityManager context proxy package=" + packageName
+                    + " service=" + service.getClass().getName()
+                    + " context=" + context.getClass().getName());
         } catch (Throwable error) {
-            Log.w("LimbusVA", "Unable to apply Limbus ConnectivityManager context proxy", error);
+            Log.w("LimbusVA", "Unable to apply virtual ConnectivityManager context proxy package="
+                    + packageName, error);
         }
     }
 

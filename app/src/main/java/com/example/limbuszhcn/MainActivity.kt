@@ -920,7 +920,7 @@ class MainActivity : ComponentActivity() {
                         runCatching {
                             startActivity(deviceCompatibility.settingsIntent())
                             PersistentDiagnosticLog.info(TAG, "Opened device compatibility settings")
-                            message = "请在系统设置中允许本应用的「自启动」「后台高耗电」与「关联启动」"
+                            message = "请在系统设置中允许本应用的「自启动」「后台高耗电」「关联启动」与「后台弹出界面」"
                         }.onFailure { error ->
                             PersistentDiagnosticLog.error(TAG, "Unable to open compatibility settings", error)
                             message = error.userMessage()
@@ -2003,7 +2003,7 @@ private fun LimbusPeScreen(
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Text(
-                    "为避免 Google 网页认证跳回游戏时被系统杀后台导致黑屏，建议允许本应用的「自启动」「后台高耗电」与「关联启动」。",
+                    "为避免 Google 登录跳转 microG 或认证返回游戏时被系统拦截导致黑屏，建议允许本应用的「自启动」「后台高耗电」「关联启动」与「后台弹出界面」。",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall
                 )

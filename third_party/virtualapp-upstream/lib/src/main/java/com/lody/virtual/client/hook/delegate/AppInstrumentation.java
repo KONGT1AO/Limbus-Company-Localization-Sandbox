@@ -12,6 +12,9 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.content.res.Resources;
+import android.graphics.Color;
+import android.graphics.Insets;
+import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
@@ -20,6 +23,8 @@ import android.os.UserHandle;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
 import android.webkit.WebView;
 import android.webkit.WebSettings;
 
@@ -230,6 +235,7 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
         if (activity != null && LIMBUS_PACKAGE.equals(activity.getPackageName())) {
             LimbusOrientationManager.get().applyLockedOrientation(activity);
         }
+        applyMicrogLoginSystemBarInsetsIfNeeded(activity);
         exposeMicrogLoginWebViewIfBridgeStalls(activity);
     }
 
@@ -268,6 +274,68 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
         } catch (Throwable error) {
             Log.e("LimbusVA", "Unable to rebuild microG sign-in target theme activity="
                     + targetInfo.name, error);
+        }
+    }
+
+    /**
+     * 为容器内 microG {@code LoginActivity} 补齐 Android 15+ 强制 Edge-to-Edge 下的系统栏与输入法避让，
+     * 并确保窗口具备不透明白底。
+     *
+     * <p>microG 的 {@code login_assistant} 布局未声明 {@code fitsSystemWindows}，在宿主以
+     * {@code targetSdk = 35} 运行时，底部 54dp 的“返回/登录”按钮栏会落入系统三键导航栏或手势条背后
+     * 导致点击被系统吞掉；同时明确亮色背景可防止残留透明窗口在异常态下显黑。</p>
+     */
+    private void applyMicrogLoginSystemBarInsetsIfNeeded(Activity activity) {
+        if (activity == null) {
+            return;
+        }
+        if (!LimbusAuthenticationCompat.shouldApplyMicrogLoginSystemBarInsets(
+                VClient.get().getCurrentPackage(),
+                activity.getPackageName(),
+                activity.getClass().getName())) {
+            return;
+        }
+        try {
+            Window window = activity.getWindow();
+            if (window != null) {
+                window.setBackgroundDrawable(new ColorDrawable(Color.WHITE));
+            }
+        } catch (Throwable error) {
+            Log.w("LimbusVA", "Unable to set opaque background for microG LoginActivity", error);
+        }
+        if (Build.VERSION.SDK_INT < 35) {
+            return;
+        }
+        try {
+            View content = activity.findViewById(android.R.id.content);
+            if (content == null) {
+                return;
+            }
+            View target = (content instanceof ViewGroup && ((ViewGroup) content).getChildCount() > 0)
+                    ? ((ViewGroup) content).getChildAt(0)
+                    : content;
+            final int initLeft = target.getPaddingLeft();
+            final int initTop = target.getPaddingTop();
+            final int initRight = target.getPaddingRight();
+            final int initBottom = target.getPaddingBottom();
+            target.setOnApplyWindowInsetsListener((view, insets) -> {
+                Insets bars = insets.getInsets(
+                        WindowInsets.Type.systemBars()
+                                | WindowInsets.Type.displayCutout()
+                                | WindowInsets.Type.ime()
+                );
+                view.setPadding(
+                        initLeft + bars.left,
+                        initTop + bars.top,
+                        initRight + bars.right,
+                        initBottom + bars.bottom
+                );
+                return insets;
+            });
+            target.requestApplyInsets();
+            Log.i("LimbusVA", "Applied Android 15+ system bar insets for microG LoginActivity");
+        } catch (Throwable error) {
+            Log.w("LimbusVA", "Unable to apply system bar insets for microG LoginActivity", error);
         }
     }
 
@@ -342,10 +410,11 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
             }
 
             Log.i("LimbusVA", "Observed microG Google login navigation; scheduling bridge check url=" + currentUrl);
-            loginWebView.setVisibility(View.VISIBLE);
+            // 不再在发现 URL 的瞬间抢先强行设为 VISIBLE，避免透明 WebView 提前覆盖确认页或吞掉点击；
+            // 先给 microG 原生 mm.showView() 桥接 3 秒时间，仅在桥接确实停滞时才兜底显露。
             loginWebView.postDelayed(
                     () -> recoverMicrogLoginWebViewIfNeeded(loginWebView, settings),
-                    1500L);
+                    3000L);
         }, 1000L);
     }
 
@@ -362,6 +431,8 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
         boolean bridgeStalled = loginWebView.getVisibility() != View.VISIBLE;
         if (bridgeStalled) {
             Log.w("LimbusVA", "microG login bridge did not reveal WebView; applying visibility fallback");
+            // microG createWebView 默认设透明底(0)，强行显露前补白底避免网络慢或渲染异常时显黑。
+            loginWebView.setBackgroundColor(Color.WHITE);
             loginWebView.setVisibility(View.VISIBLE);
         }
         int delayedCacheMode = settings.getCacheMode();
@@ -433,19 +504,9 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
     public static synchronized void installOplusActivityManagerFallbackIfNeeded(Activity activity) {
         String currentPackage = VClient.get().getCurrentPackage();
         String activityClassName = activity == null ? null : activity.getClass().getName();
-        boolean isLimbusProcess = LIMBUS_PACKAGE.equals(currentPackage);
-        boolean isPendingIntentBridge = activity != null
-                && "com.lody.virtual.client.stub.ShadowPendingActivity"
-                .equals(activityClassName);
-        boolean isGoogleIdentityActivity = GMS_PACKAGE.equals(currentPackage)
-                && (MICROG_ASSISTED_SIGN_IN_ACTIVITY.equals(activityClassName)
-                || MICROG_AUTH_SIGN_IN_ACTIVITY.equals(activityClassName)
-                || MICROG_LOGIN_ACTIVITY.equals(activityClassName)
-                || MICROG_CONSENT_SIGN_IN_ACTIVITY.equals(activityClassName)
-                || (activityClassName != null && activityClassName.startsWith("org.microg.gms.auth.consent.")));
         if (sOplusActivityManagerFallbackAttempted
-                || Build.VERSION.SDK_INT < ANDROID_16_API_LEVEL
-                || (!isLimbusProcess && !isPendingIntentBridge && !isGoogleIdentityActivity)) {
+                || !LimbusAuthenticationCompat.shouldInstallOplusActivityManagerFallback(
+                Build.VERSION.SDK_INT, currentPackage, activityClassName)) {
             return;
         }
         sOplusActivityManagerFallbackAttempted = true;
@@ -634,6 +695,7 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
                 mirror.android.app.ContextImpl.mBasePackageName.set(context, targetInfo.packageName);
             }
             VClient.get().applyLimbusVisibleContextDirs(context, targetInfo.packageName);
+            VClient.get().applyConnectivityServiceProxyIfNeeded(context, targetInfo.packageName);
         } catch (Throwable error) {
             Log.e("LimbusVA", "AppInstrumentation failed to restore activity context packageName="
                     + targetInfo.packageName, error);

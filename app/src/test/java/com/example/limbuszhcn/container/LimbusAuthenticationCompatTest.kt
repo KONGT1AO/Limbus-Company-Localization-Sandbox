@@ -87,12 +87,14 @@ class LimbusAuthenticationCompatTest {
             gms, gms, null))
     }
 
-    /** 验证 Google 登录父子页面均继承 microG 应用主题，并保留 Activity 显式主题的优先级。 */
+    /** 验证 Google 登录父子页面与 LoginActivity 均重建目标主题，并保留 Activity 显式主题的优先级。 */
     @Test
     fun resolvesBothMicrogSignInThemesWithApplicationFallback() {
         for (activityClass in listOf(
             "org.microg.gms.auth.signin.AssistedSignInActivity",
-            "org.microg.gms.auth.signin.AuthSignInActivity"
+            "org.microg.gms.auth.signin.AuthSignInActivity",
+            "org.microg.gms.auth.login.LoginActivity",
+            "org.microg.gms.auth.consent.ConsentSignInActivity"
         )) {
             assertEquals(100, LimbusAuthenticationCompat.resolveMicrogSignInTheme(
                 "com.google.android.gms", "com.google.android.gms", activityClass, 0, 100))
@@ -103,7 +105,7 @@ class LimbusAuthenticationCompatTest {
         }
     }
 
-    /** 验证主题重建不会命中其它进程、目标包、同名前缀页面或一般 microG 页面。 */
+    /** 验证主题重建不会命中其它进程、目标包、同名前缀页面或无关 microG 页面。 */
     @Test
     fun keepsThemeRepairScopedToExactMicrogSignInActivities() {
         val authActivity = "org.microg.gms.auth.signin.AuthSignInActivity"
@@ -115,7 +117,61 @@ class LimbusAuthenticationCompatTest {
             "com.google.android.gms", "com.google.android.gms", "$authActivity.Unexpected", 200, 100))
         assertEquals(0, LimbusAuthenticationCompat.resolveMicrogSignInTheme(
             "com.google.android.gms", "com.google.android.gms",
-            "org.microg.gms.auth.login.LoginActivity", 200, 100))
+            "org.microg.gms.auth.login.OtherActivity", 200, 100))
+    }
+
+    /** 验证仅对 microG LoginActivity 启用 Android 15+ 系统栏避让，避免影响其它页面。 */
+    @Test
+    fun appliesSystemBarInsetsOnlyToMicrogLoginActivity() {
+        val gms = "com.google.android.gms"
+        val login = "org.microg.gms.auth.login.LoginActivity"
+        assertTrue(LimbusAuthenticationCompat.shouldApplyMicrogLoginSystemBarInsets(gms, gms, login))
+        assertFalse(LimbusAuthenticationCompat.shouldApplyMicrogLoginSystemBarInsets(
+            "com.ProjectMoon.LimbusCompany", gms, login))
+        assertFalse(LimbusAuthenticationCompat.shouldApplyMicrogLoginSystemBarInsets(
+            gms, gms, "org.microg.gms.auth.signin.AuthSignInActivity"))
+        assertFalse(LimbusAuthenticationCompat.shouldApplyMicrogLoginSystemBarInsets(
+            gms, "example.other", login))
+    }
+
+    /** 验证 ConnectivityManager 身份代理覆盖游戏本体与 microG，不影响未知包。 */
+    @Test
+    fun proxiesConnectivityServiceForLimbusAndGmsOnly() {
+        assertTrue(LimbusAuthenticationCompat.shouldProxyConnectivityService("com.ProjectMoon.LimbusCompany"))
+        assertTrue(LimbusAuthenticationCompat.shouldProxyConnectivityService("com.google.android.gms"))
+        assertFalse(LimbusAuthenticationCompat.shouldProxyConnectivityService("example.other"))
+        assertFalse(LimbusAuthenticationCompat.shouldProxyConnectivityService(null))
+    }
+
+    /** 验证 Android 16+ ColorOS 空服务兜底覆盖游戏、跳板页及全部 microG 页面。 */
+    @Test
+    fun installsOplusFallbackForLimbusBridgeAndAllGmsActivitiesOnApi36Plus() {
+        assertFalse(LimbusAuthenticationCompat.shouldInstallOplusActivityManagerFallback(
+            35, "com.google.android.gms", "org.microg.gms.auth.login.LoginActivity"))
+        assertTrue(LimbusAuthenticationCompat.shouldInstallOplusActivityManagerFallback(
+            36, "com.ProjectMoon.LimbusCompany", "com.unity3d.player.UnityPlayerActivity"))
+        assertTrue(LimbusAuthenticationCompat.shouldInstallOplusActivityManagerFallback(
+            36, null, "com.lody.virtual.client.stub.ShadowPendingActivity"))
+        assertTrue(LimbusAuthenticationCompat.shouldInstallOplusActivityManagerFallback(
+            36, "com.google.android.gms", "org.microg.gms.auth.AskPermissionActivity"))
+        assertFalse(LimbusAuthenticationCompat.shouldInstallOplusActivityManagerFallback(
+            36, "example.other", "example.other.MainActivity"))
+    }
+
+    /** 验证非主进程分配独立 WebView 数据目录后缀，主进程保持默认目录不变。 */
+    @Test
+    fun resolvesWebViewDataDirectorySuffixForSecondaryProcessesOnly() {
+        assertNull(LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(
+            "io.limbuspe.box", "io.limbuspe.box"))
+        assertEquals("p0", LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(
+            "io.limbuspe.box:p0", "io.limbuspe.box"))
+        assertEquals("p2", LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(
+            "io.limbuspe.box:p2", "io.limbuspe.box"))
+        assertEquals("x", LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(
+            "io.limbuspe.box:x", "io.limbuspe.box"))
+        assertEquals("ui_1", LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(
+            "io.limbuspe.box:ui/1", "io.limbuspe.box"))
+        assertNull(LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(null, "io.limbuspe.box"))
     }
 
     /** 验证游戏、microG 与 FakeStore 均不会进入不兼容的旧式 ART VM Hook。 */

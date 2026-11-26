@@ -99,10 +99,11 @@ public final class LimbusAuthenticationCompat {
     }
 
     /**
-     * 为两层已确认的 microG 登录页面选择目标主题，避免继承宿主 Stub 的主题缓存。
+     * 为已确认的 microG 登录与授权页面选择目标主题，避免继承宿主 Stub 的透明主题缓存。
      *
-     * <p>Activity 没有单独声明主题时应继承应用主题。其它包或页面返回零，由原有
-     * Activity 处理路径负责，避免把登录兼容扩大到未知组件。</p>
+     * <p>Activity 没有单独声明主题时应继承应用主题。包含 {@code LoginActivity} 在内的登录链路均基于
+     * AppCompat，若先被宿主 {@code VATheme}（透明背景）缓存主题，容易在深色模式或渲染异常时显黑。
+     * 其它包或无关页面返回零，由原有 Activity 处理路径负责。</p>
      *
      * @param currentPackage 当前虚拟进程绑定的包名
      * @param activityPackage 目标 Activity 所属包名
@@ -121,11 +122,97 @@ public final class LimbusAuthenticationCompat {
                 || !GMS_PACKAGE.equals(activityPackage)
                 || !(MICROG_ASSISTED_SIGN_IN_ACTIVITY.equals(activityClass)
                 || MICROG_AUTH_SIGN_IN_ACTIVITY.equals(activityClass)
+                || MICROG_LOGIN_ACTIVITY.equals(activityClass)
                 || MICROG_CONSENT_SIGN_IN_ACTIVITY.equals(activityClass)
                 || (activityClass != null && activityClass.startsWith("org.microg.gms.auth.consent.")))) {
             return 0;
         }
         return activityTheme != 0 ? activityTheme : applicationTheme;
+    }
+
+    /**
+     * 判断是否需要为 microG 登录页补齐 Android 15+ 强制 Edge-to-Edge 下的系统栏避让。
+     *
+     * <p>microG 的 {@code login_assistant} 布局没有声明 {@code fitsSystemWindows}，底部“登录”按钮紧贴
+     * 屏幕底边。宿主以 {@code targetSdk = 35} 运行时，Android 15+ 会将其延伸到导航栏背后导致无法点击。</p>
+     */
+    public static boolean shouldApplyMicrogLoginSystemBarInsets(
+            String currentPackage,
+            String activityPackage,
+            String activityClass) {
+        return GMS_PACKAGE.equals(currentPackage)
+                && GMS_PACKAGE.equals(activityPackage)
+                && MICROG_LOGIN_ACTIVITY.equals(activityClass);
+    }
+
+    /**
+     * 判断当前虚拟进程是否需要对 {@code ConnectivityManager} 代理调用方包名与 UID。
+     *
+     * <p>游戏本体与容器内 microG 均会在联网判定和 Google Checkin 前查询系统网络状态，
+     * 统一替换为宿主物理身份可避免 Android 13+ 厂商系统校验包名/UID 不匹配。</p>
+     */
+    public static boolean shouldProxyConnectivityService(String packageName) {
+        return LIMBUS_PACKAGE.equals(packageName) || GMS_PACKAGE.equals(packageName);
+    }
+
+    /**
+     * 判断是否应安装 Android 16+ ColorOS 的 {@code OplusActivityManager} 空服务兜底。
+     *
+     * <p>放行游戏本体、PendingIntent 跳板以及全部虚拟 GMS 页面，避免 microG 打开权限确认或其它
+     * 辅助页时在 {@code PhoneWindow.installDecor()} 触发厂商空指针崩溃。</p>
+     */
+    public static boolean shouldInstallOplusActivityManagerFallback(
+            int sdkInt,
+            String currentPackage,
+            String activityClassName) {
+        if (sdkInt < 36) {
+            return false;
+        }
+        boolean isLimbusProcess = LIMBUS_PACKAGE.equals(currentPackage);
+        boolean isPendingIntentBridge = "com.lody.virtual.client.stub.ShadowPendingActivity"
+                .equals(activityClassName);
+        boolean isGmsProcess = GMS_PACKAGE.equals(currentPackage);
+        return isLimbusProcess || isPendingIntentBridge || isGmsProcess;
+    }
+
+    /**
+     * 为非主进程解析独立的 WebView 数据目录后缀，防止 Android 9+ 多进程争抢同一数据目录锁。
+     *
+     * @param processName 当前进程名（如 {@code io.limbuspe.box:p2}）
+     * @param hostPackageName 宿主主进程包名（如 {@code io.limbuspe.box}）
+     * @return 非主进程返回清洗后的安全后缀；主进程或无效输入返回 {@code null}
+     */
+    public static String resolveWebViewDataDirectorySuffix(
+            String processName,
+            String hostPackageName) {
+        if (processName == null || processName.isEmpty()
+                || hostPackageName == null || hostPackageName.isEmpty()) {
+            return null;
+        }
+        if (hostPackageName.equals(processName)) {
+            return null;
+        }
+        String rawSuffix;
+        int colonIndex = processName.indexOf(':');
+        if (colonIndex >= 0 && colonIndex + 1 < processName.length()) {
+            rawSuffix = processName.substring(colonIndex + 1);
+        } else {
+            rawSuffix = processName;
+        }
+        StringBuilder sanitized = new StringBuilder(rawSuffix.length());
+        for (int i = 0; i < rawSuffix.length(); i++) {
+            char ch = rawSuffix.charAt(i);
+            if ((ch >= 'a' && ch <= 'z')
+                    || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9')
+                    || ch == '_' || ch == '-' || ch == '.') {
+                sanitized.append(ch);
+            } else {
+                sanitized.append('_');
+            }
+        }
+        String result = sanitized.toString();
+        return result.isEmpty() ? null : result;
     }
 
     /**

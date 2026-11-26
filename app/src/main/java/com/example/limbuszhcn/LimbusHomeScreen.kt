@@ -596,7 +596,7 @@ private fun LaunchPage(
                 value = compatibilityReport.batteryOptimizationStatus
             )
             Text(
-                text = "Google 网页认证返回游戏时，系统可能终止后台进程。建议允许本应用的“自启动”“后台高耗电”与“关联启动”。",
+                text = "Google 登录跨进程跳转或认证返回游戏时，国产系统可能拦截界面或清理后台。建议允许本应用的“自启动”“后台高耗电”“关联启动”与“后台弹出界面”。",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )

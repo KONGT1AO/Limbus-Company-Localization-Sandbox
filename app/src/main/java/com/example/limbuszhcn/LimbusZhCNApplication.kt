@@ -10,9 +10,11 @@ import android.content.Intent
 import android.content.pm.ShortcutManager
 import android.os.Build
 import android.os.Process
+import android.webkit.WebView
 import com.lody.virtual.client.core.SettingConfig
 import com.lody.virtual.client.core.VirtualCore
 import com.lody.virtual.client.stub.HiddenForeNotification
+import com.lody.virtual.helper.compat.LimbusAuthenticationCompat
 import com.lody.virtual.helper.compat.NotificationChannelCompat
 import java.io.File
 
@@ -35,12 +37,37 @@ class LimbusZhCNApplication : Application() {
             TAG,
             "attachBaseContext pid=${Process.myPid()} process=${base.getProcessNameForLog()} package=$packageName"
         )
+        configureProcessWebViewDataDirectory(base)
         invalidateStaleGmsChimeraConfig(base)
         runCatching {
             VirtualCore.get().startup(this, LimbusVirtualConfig(packageName))
             PersistentDiagnosticLog.info(TAG, "VirtualCore.startup success pid=${Process.myPid()}")
         }.onFailure { error ->
             PersistentDiagnosticLog.error(TAG, "VirtualApp startup failed", error)
+        }
+    }
+
+    private fun configureProcessWebViewDataDirectory(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return
+        }
+        val processName = runCatching { Application.getProcessName() }.getOrNull()
+        val suffix = LimbusAuthenticationCompat.resolveWebViewDataDirectorySuffix(
+            processName,
+            context.packageName
+        ) ?: return
+        runCatching {
+            WebView.setDataDirectorySuffix(suffix)
+            PersistentDiagnosticLog.info(
+                TAG,
+                "Configured WebView data directory suffix=$suffix process=$processName"
+            )
+        }.onFailure { error ->
+            PersistentDiagnosticLog.warn(
+                TAG,
+                "Unable to configure WebView data directory suffix=$suffix process=$processName",
+                error
+            )
         }
     }
 
