@@ -11828,6 +11828,14 @@ static bool install_method_info_hook(const void *method_info, void *replacement,
 
 bool has_inline_hook_space_global(void *klass, void *pointer) {
     if (klass == nullptr || pointer == nullptr || g_class_get_methods == nullptr) return false;
+#if defined(__aarch64__)
+    // 若函数体在前 3 条指令内已返回，说明不足 16 字节，禁止 inline hook 以防覆写相邻方法入口。
+    constexpr uint32_t kArm64RetInsn = 0xD65F03C0U;
+    const auto *insns = reinterpret_cast<const uint32_t *>(pointer);
+    if (insns[0] == kArm64RetInsn || insns[1] == kArm64RetInsn || insns[2] == kArm64RetInsn) {
+        return false;
+    }
+#endif
     std::vector<uintptr_t> pointers;
     void *iterator = nullptr;
     const void *candidate = nullptr;
@@ -12074,6 +12082,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
     void *text_data_manager_class = nullptr;
     void *loading_scene_manager_class = nullptr;
     void *ask_defeat_popup_class = nullptr;
+    void *local_game_option_class = nullptr;
+    void *global_game_manager_class = nullptr;
     const void *get_language_method = nullptr;
     const void *get_global_language_method = nullptr;
     struct AcquisitionTarget {
@@ -12211,12 +12221,14 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         if (get_language_method == nullptr) {
             void *klass = class_from_name(image, "LocalSave", "LocalGameOptionData");
             if (klass != nullptr) {
+                local_game_option_class = klass;
                 get_language_method = class_get_method_from_name(klass, "GetLanguage", 0);
             }
         }
         if (get_global_language_method == nullptr) {
             void *klass = class_from_name(image, "", "GlobalGameManager");
             if (klass != nullptr) {
+                global_game_manager_class = klass;
                 get_global_language_method = class_get_method_from_name(klass, "get_Lang", 0);
             }
         }
@@ -13411,14 +13423,22 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                         reinterpret_cast<void **>(&g_original_tmp_set_char_array_range));
             }
         }
-        if (get_language_pointer != nullptr) {
-            MSHookFunction(get_language_pointer,
-                           reinterpret_cast<void *>(replacement_get_language),
-                           reinterpret_cast<void **>(&g_original_get_language));
+        if (get_language_method != nullptr && local_game_option_class != nullptr) {
+            install_il2cpp_method_hook_safe(
+                    local_game_option_class,
+                    get_language_method,
+                    reinterpret_cast<void *>(replacement_get_language),
+                    &g_original_get_language,
+                    "LocalGameOptionData.GetLanguage");
         }
-        MSHookFunction(get_global_language_pointer,
-                       reinterpret_cast<void *>(replacement_global_get_language),
-                       reinterpret_cast<void **>(&g_original_global_get_language));
+        if (get_global_language_method != nullptr && global_game_manager_class != nullptr) {
+            install_il2cpp_method_hook_safe(
+                    global_game_manager_class,
+                    get_global_language_method,
+                    reinterpret_cast<void *>(replacement_global_get_language),
+                    &g_original_global_get_language,
+                    "GlobalGameManager.get_Lang");
+        }
         size_t acquisition_counts[] = {0, 0, 0};
         size_t keyword_text_getter_count = 0;
         std::unordered_set<void *> acquisition_pointers;

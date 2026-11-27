@@ -90,6 +90,8 @@ namespace IOUniformer {
 
 void scanLimbusNativeSyscalls(const char *nativeLibraryDir);
 
+bool preloadLimbusAppSealing(const char *nativeLibraryDir);
+
 int maintainLimbusAppSealingPatches();
 
 #endif //NDK_HOOK_H

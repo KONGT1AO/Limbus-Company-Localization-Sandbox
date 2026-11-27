@@ -64,9 +64,11 @@ import com.lody.virtual.client.stub.StubManifest;
 import com.lody.virtual.helper.compat.BuildCompat;
 import com.lody.virtual.helper.compat.LimbusAuthenticationCompat;
 import com.lody.virtual.helper.compat.NativeLibraryHelperCompat;
+import com.lody.virtual.helper.compat.ProviderAcquirePolicy;
 import com.lody.virtual.helper.compat.StorageManagerCompat;
 import com.lody.virtual.helper.compat.StrictModeCompat;
 import com.lody.virtual.helper.utils.ComponentUtils;
+import com.lody.virtual.helper.utils.ContainerDiagnosticLog;
 import com.lody.virtual.helper.utils.FileUtils;
 import com.lody.virtual.helper.utils.Reflect;
 import com.lody.virtual.helper.utils.VLog;
@@ -103,7 +105,10 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import mirror.android.app.ActivityManagerNative;
 import mirror.android.app.ActivityThread;
@@ -170,7 +175,9 @@ public final class VClient extends IVClient.Stub {
     private CrashHandler crashHandler;
     private InstalledAppInfo mAppInfo;
     private int mTargetSdkVersion;
+    private final Object mBindApplicationMonitor = new Object();
     private ConditionVariable mBindingApplicationLock;
+    private final ConcurrentHashMap<String, IInterface> mInstalledLocalProviders = new ConcurrentHashMap<>();
     private boolean mEnvironmentPrepared = false;
     private volatile boolean mHideHostPackageForLimbus = false;
     private static final ThreadLocal<Boolean> sApplyingLimbusPlayCoreLocalTesting = new ThreadLocal<>();
@@ -223,6 +230,14 @@ public final class VClient extends IVClient.Stub {
     public String getCurrentPackage() {
         return mBoundApplication != null ?
                 mBoundApplication.appInfo.packageName : VPackageManager.get().getNameForUid(getVUid());
+    }
+
+    public String getCurrentProcessName() {
+        if (mBoundApplication != null && !TextUtils.isEmpty(mBoundApplication.processName)) {
+            return mBoundApplication.processName;
+        }
+        ClientConfig config = clientConfig;
+        return config != null ? config.processName : null;
     }
 
     public ApplicationInfo getCurrentApplicationInfo() {
@@ -480,25 +495,55 @@ public final class VClient extends IVClient.Stub {
             return;
         }
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            if (mBindingApplicationLock != null) {
-                mBindingApplicationLock.block();
-                mBindingApplicationLock = null;
-            } else {
-                mBindingApplicationLock = new ConditionVariable();
-            }
-            VirtualRuntime.getUIHandler().post(new Runnable() {
-                @Override
-                public void run() {
-                    bindApplicationNoCheck(packageName, processName);
-                    ConditionVariable lock = mBindingApplicationLock;
-                    mBindingApplicationLock = null;
-                    if (lock != null) {
-                        lock.open();
-                    }
+            final ConditionVariable lock;
+            final boolean shouldPost;
+            synchronized (mBindApplicationMonitor) {
+                if (isAppRunning()) {
+                    return;
                 }
-            });
-            if (mBindingApplicationLock != null) {
-                mBindingApplicationLock.block();
+                if (mBindingApplicationLock != null) {
+                    lock = mBindingApplicationLock;
+                    shouldPost = false;
+                } else {
+                    lock = new ConditionVariable();
+                    mBindingApplicationLock = lock;
+                    shouldPost = true;
+                }
+            }
+            if (shouldPost) {
+                VirtualRuntime.getUIHandler().post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            bindApplicationNoCheck(packageName, processName);
+                        } catch (Throwable error) {
+                            ContainerDiagnosticLog.error(
+                                    "LimbusVA",
+                                    "VClient.bindApplication failed package=" + packageName
+                                            + " process=" + processName,
+                                    error
+                            );
+                        } finally {
+                            synchronized (mBindApplicationMonitor) {
+                                if (mBindingApplicationLock == lock) {
+                                    mBindingApplicationLock = null;
+                                }
+                            }
+                            lock.open();
+                        }
+                    }
+                });
+            }
+            boolean completed = lock.block(ProviderAcquirePolicy.BIND_APPLICATION_TIMEOUT_MS);
+            if (!completed) {
+                ContainerDiagnosticLog.warn(
+                        "LimbusVA",
+                        "VClient.bindApplication timed out after "
+                                + ProviderAcquirePolicy.BIND_APPLICATION_TIMEOUT_MS
+                                + "ms package=" + packageName
+                                + " process=" + processName
+                                + " running=" + isAppRunning()
+                );
             }
         } else {
             bindApplicationNoCheck(packageName, processName);
@@ -785,7 +830,7 @@ public final class VClient extends IVClient.Stub {
                 Log.e("LimbusVA", "Process shutdown during virtual bind package=" + shutdownPackageName
                         + " process=" + shutdownProcessName
                         + " pid=" + Process.myPid()), "limbus-va-shutdown"));
-        Log.i("LimbusVA", "VClient.bindApplication before makeApplication package=" + packageName
+        ContainerDiagnosticLog.info("LimbusVA", "VClient.bindApplication before makeApplication package=" + packageName
                 + " process=" + processName + " info=" + data.info);
 
         try {
@@ -812,7 +857,22 @@ public final class VClient extends IVClient.Stub {
              * Android 16 的失效回溯地址已由原生信号保护单独处理，因此这里不能停用扫描。
              */
             String scannerNativeLibDir = resolveLimbusScannerNativeLibraryDir(packageName, data.appInfo.nativeLibraryDir);
+            boolean appSealingPreloaded = false;
             if (limbusAppSealing) {
+                /*
+                 * 优先在主线程通过游戏自身的 ClassLoader 同步加载 libcovault-appsec.so 并完成扫描，
+                 * 保证与 makeApplication 共享同一个 linker namespace（全局唯一映射），同时避免后台
+                 * 扫描线程与初始化期间的 fork() 竞争系统锁或内存页锁导致静默死锁黑屏。
+                 */
+                appSealingPreloaded = preloadLimbusAppSealingInGameClassLoader(
+                        data.info,
+                        data.appInfo != null ? data.appInfo.className : null,
+                        data.appInfo != null ? data.appInfo.nativeLibraryDir : null,
+                        scannerNativeLibDir);
+                ContainerDiagnosticLog.info("LimbusVA", "VClient.bindApplication AppSealing sync preload="
+                        + appSealingPreloaded + " nativeLibDir=" + scannerNativeLibDir);
+            }
+            if (limbusAppSealing && !appSealingPreloaded) {
                 limbusScannerRunning = new AtomicBoolean(true);
                 AtomicBoolean scannerRunning = limbusScannerRunning;
                 String nativeLibraryDir = scannerNativeLibDir;
@@ -822,8 +882,9 @@ public final class VClient extends IVClient.Stub {
                     while (scannerRunning.get() && System.currentTimeMillis() < deadline) {
                         NativeEngine.scanLimbusNativeSyscalls(nativeLibraryDir);
                         scans++;
+                        long sleepMs = ProviderAcquirePolicy.computeAppSealingScanSleepMs(scans);
                         try {
-                            Thread.sleep(10L);
+                            Thread.sleep(sleepMs);
                         } catch (InterruptedException ignored) {
                             Thread.currentThread().interrupt();
                             break;
@@ -844,13 +905,15 @@ public final class VClient extends IVClient.Stub {
                     limbusScanner.interrupt();
                 }
             }
-            Log.i("LimbusVA", "VClient.bindApplication makeApplication success app=" + mInitialApplication);
+            ContainerDiagnosticLog.info("LimbusVA", "VClient.bindApplication makeApplication success package="
+                    + packageName + " app=" + mInitialApplication);
             if (limbusAppSealing) {
                 NativeEngine.scanLimbusNativeSyscalls(scannerNativeLibDir);
                 startLimbusAppSealingPatchMaintainer();
             }
         } catch (Throwable e) {
-            Log.e("LimbusVA", "VClient.bindApplication makeApplication failed", e);
+            ContainerDiagnosticLog.error("LimbusVA", "VClient.bindApplication makeApplication failed package="
+                    + packageName + " process=" + processName, e);
             throw new RuntimeException("Unable to makeApplication", e);
         }
         Log.e("kk", data.info+" mInitialApplication set  " + LoadedApk.mApplication.get(data.info));
@@ -988,7 +1051,8 @@ public final class VClient extends IVClient.Stub {
         VirtualCore.get().getAppCallback().afterApplicationCreate(packageName, processName, mInitialApplication);
         Log.i("LimbusVA", "VClient.bindApplication after afterApplicationCreate");
         VActivityManager.get().appDoneExecuting(info.packageName);
-        Log.i("LimbusVA", "VClient.bindApplication done package=" + packageName + " process=" + processName);
+        ContainerDiagnosticLog.info("LimbusVA", "VClient.bindApplication done package=" + packageName
+                + " process=" + processName + " providers=" + mInstalledLocalProviders.size());
 
         //xdja
        /* context.getCacheDir();
@@ -2315,14 +2379,105 @@ public final class VClient extends IVClient.Stub {
         try {
             for (ProviderInfo cpi : providers) {
                 try {
-                    ActivityThread.installProvider(mainThread, app, cpi, null);
+                    Object holder = ActivityThread.installProvider(mainThread, app, cpi, null);
+                    IInterface provider = extractProviderFromHolder(holder);
+                    cacheInstalledLocalProvider(cpi, provider);
                 } catch (Throwable e) {
-                    e.printStackTrace();
+                    ContainerDiagnosticLog.warn(
+                            "LimbusVA",
+                            "installContentProviders failed authority=" + (cpi != null ? cpi.authority : null)
+                                    + " name=" + (cpi != null ? cpi.name : null),
+                            e
+                    );
                 }
             }
         } finally {
             Binder.restoreCallingIdentity(origId);
         }
+    }
+
+    private IInterface extractProviderFromHolder(Object holder) {
+        if (holder == null) {
+            return null;
+        }
+        try {
+            if (BuildCompat.isOreo()) {
+                return ContentProviderHolderOreo.provider.get(holder);
+            }
+            return IActivityManager.ContentProviderHolder.provider.get(holder);
+        } catch (Throwable error) {
+            VLog.w(TAG, "Unable to extract provider from holder: %s", error);
+            return null;
+        }
+    }
+
+    private void cacheInstalledLocalProvider(ProviderInfo info, IInterface provider) {
+        if (info == null || provider == null) {
+            return;
+        }
+        Set<String> authorities = ProviderAcquirePolicy.splitAuthorities(info.authority);
+        for (String authority : authorities) {
+            mInstalledLocalProviders.put(authority, provider);
+        }
+    }
+
+    private IInterface installSingleContentProviderNow(Context app, ProviderInfo info) {
+        long origId = Binder.clearCallingIdentity();
+        Object mainThread = VirtualCore.mainThread();
+        try {
+            Object holder = ActivityThread.installProvider(mainThread, app, info, null);
+            IInterface provider = extractProviderFromHolder(holder);
+            if (provider != null) {
+                cacheInstalledLocalProvider(info, provider);
+                return provider;
+            }
+        } catch (Throwable error) {
+            ContainerDiagnosticLog.warn(
+                    "LimbusVA",
+                    "Local on-demand installProvider failed authority=" + info.authority
+                            + " name=" + info.name,
+                    error
+            );
+        } finally {
+            Binder.restoreCallingIdentity(origId);
+        }
+        return findInstalledProviderClient(info);
+    }
+
+    private IInterface installSingleProviderLocally(final Context app, final ProviderInfo info) {
+        if (app == null || info == null) {
+            return null;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return installSingleContentProviderNow(app, info);
+        }
+        final AtomicReference<IInterface> installed = new AtomicReference<>();
+        final ConditionVariable done = new ConditionVariable();
+        VirtualRuntime.getUIHandler().post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    IInterface existing = findInstalledProviderClient(info);
+                    if (existing != null) {
+                        installed.set(existing);
+                    } else {
+                        installed.set(installSingleContentProviderNow(app, info));
+                    }
+                } finally {
+                    done.open();
+                }
+            }
+        });
+        if (!done.block(ProviderAcquirePolicy.LOCAL_PROVIDER_INSTALL_TIMEOUT_MS)) {
+            ContainerDiagnosticLog.warn(
+                    "LimbusVA",
+                    "Local on-demand installProvider timed out after "
+                            + ProviderAcquirePolicy.LOCAL_PROVIDER_INSTALL_TIMEOUT_MS
+                            + "ms authority=" + info.authority
+            );
+        }
+        IInterface provider = installed.get();
+        return provider != null ? provider : findInstalledProviderClient(info);
     }
 
     /**
@@ -2386,55 +2541,67 @@ public final class VClient extends IVClient.Stub {
     }
 
     /**
+     * 在当前虚拟进程内部直接解析并返回本进程声明的 ContentProvider，避免跨 {@code :x} 回调自身。
+     */
+    public IInterface acquireLocalProviderClient(ProviderInfo info) {
+        if (info == null) {
+            return null;
+        }
+        if (!isAppRunning()) {
+            bindApplication(info.packageName, info.processName);
+        }
+        Application app = getCurrentApplication();
+        if (app == null) {
+            ContainerDiagnosticLog.warn(
+                    "LimbusVA",
+                    "acquireLocalProviderClient aborted: application not bound authority=" + info.authority
+                            + " process=" + info.processName
+            );
+            return null;
+        }
+        IInterface installedProvider = findInstalledProviderClient(info);
+        if (installedProvider != null) {
+            VLog.i(TAG, "Reuse ActivityThread provider client: %s", info.authority);
+            return installedProvider;
+        }
+        // Android 16 上已安装 Provider 可能未出现在 mProviderMap 中；改为本地按需补装，
+        // 严禁再通过 ContentResolver 走 GetContentProvider Hook 回调 :x 形成自递归死锁。
+        IInterface locallyInstalled = installSingleProviderLocally(app, info);
+        if (locallyInstalled != null) {
+            ContainerDiagnosticLog.info(
+                    "LimbusVA",
+                    "Installed virtual provider locally on demand authority=" + info.authority
+                            + " process=" + info.processName
+            );
+            return locallyInstalled;
+        }
+        ContainerDiagnosticLog.warn(
+                "LimbusVA",
+                "acquireLocalProviderClient unable to resolve authority=" + info.authority
+                        + " package=" + info.packageName
+                        + " process=" + info.processName
+        );
+        return null;
+    }
+
+    /**
      * 获取当前虚拟进程中指定 ContentProvider 的 Binder 客户端。
      *
-     * <p>Android 16 上，Provider 已由 {@code ActivityThread} 安装后，再通过宿主
-     * {@link ContentResolver} 查询虚拟 authority 仍可能返回 {@code null}。因此优先从
-     * {@code ActivityThread} 的已安装 Provider 记录中读取 Binder，旧版系统查询路径继续作为回退。</p>
+     * <p>优先从本进程缓存与 {@code ActivityThread} 的已安装 Provider 记录中读取 Binder；
+     * 若未命中则在本进程内按需补装，不再通过宿主 {@link ContentResolver} 再次查询自身
+     * authority，彻底杜绝 Android 16 上的 {@code :p1 -> :x -> :p1} 自递归死锁。</p>
      *
      * @param info 需要获取的虚拟 Provider 信息。
      * @return Provider 的 Binder；Provider 尚未安装或无法获取时返回 {@code null}。
      */
     @Override
     public IBinder acquireProviderClient(ProviderInfo info) {
-        if (!isAppRunning()) {
-            VClient.get().bindApplication(info.packageName, info.processName);
-        }
-        if (VClient.get().getCurrentApplication() == null) {
-            return null;
-        }
-        IInterface installedProvider = findInstalledProviderClient(info);
-        if (installedProvider != null) {
-            VLog.i(TAG, "Reuse ActivityThread provider client: %s", info.authority);
-            return installedProvider.asBinder();
-        }
-
-        IInterface provider = null;
-        String authority = ComponentUtils.getFirstAuthority(info);
-        ContentResolver resolver = VirtualCore.get().getContext().getContentResolver();
-        ContentProviderClient client = null;
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-                client = resolver.acquireUnstableContentProviderClient(authority);
-            } else {
-                client = resolver.acquireContentProviderClient(authority);
-            }
-        } catch (Throwable e) {
-            e.printStackTrace();
-        }
-        if (client != null) {
-            provider = mirror.android.content.ContentProviderClient.mContentProvider.get(client);
-            client.release();
-        }
-        IBinder binder = provider != null ? provider.asBinder() : null;
-        if (binder != null) {
-            return binder;
-        }
-        return null;
+        IInterface provider = acquireLocalProviderClient(info);
+        return provider != null ? provider.asBinder() : null;
     }
 
     /**
-     * 从 ActivityThread 的本进程 Provider 表中查找与目标 authority 匹配的客户端。
+     * 从本地缓存与 ActivityThread 的本进程 Provider 表中查找与目标 authority 匹配的客户端。
      *
      * <p>这里按 {@link ProviderInfo} 中的 authority 精确匹配，而不依赖 Android 16
      * 已发生行为变化的系统级 Provider 再查询。遍历范围仅限当前虚拟 Provider 进程已经安装的记录。</p>
@@ -2448,9 +2615,21 @@ public final class VClient extends IVClient.Stub {
             return null;
         }
 
+        IInterface cached = mInstalledLocalProviders.get(targetAuthority);
+        if (cached != null) {
+            IBinder binder = cached.asBinder();
+            if (binder != null && binder.isBinderAlive()) {
+                return cached;
+            }
+            mInstalledLocalProviders.remove(targetAuthority, cached);
+        }
+
         try {
             // Provider 表可能在安装或卸载过程中变化，读取时同步该表以避免遍历期间结构被修改。
             Map<Object, Object> providerMap = ActivityThread.mProviderMap.get(VirtualCore.mainThread());
+            if (providerMap == null) {
+                return null;
+            }
             synchronized (providerMap) {
                 for (Object clientRecord : providerMap.values()) {
                     Object holder = ActivityThread.ProviderClientRecordJB.mHolder.get(clientRecord);
@@ -2471,12 +2650,12 @@ public final class VClient extends IVClient.Stub {
 
                     IInterface provider = ActivityThread.ProviderClientRecordJB.mProvider.get(clientRecord);
                     if (provider != null) {
+                        cacheInstalledLocalProvider(installedInfo, provider);
                         return provider;
                     }
                 }
             }
         } catch (Throwable error) {
-            // 反射字段随系统版本变化时保留旧 ContentResolver 路径，不让兼容分支阻断 Provider 获取。
             VLog.w(TAG, "Unable to reuse installed provider client for %s: %s",
                     targetAuthority, error);
         }
@@ -2635,6 +2814,77 @@ public final class VClient extends IVClient.Stub {
 
     public ClassLoader getClassLoader() {
         return LoadedApk.getClassLoader.call(mBoundApplication.info);
+    }
+
+    private static boolean preloadLimbusAppSealingInGameClassLoader(
+            Object loadedApk,
+            String appClassName,
+            String realNativeLibDir,
+            String scannerNativeLibDir) {
+        if (loadedApk == null) {
+            return false;
+        }
+        try {
+            ClassLoader gameClassLoader = LoadedApk.getClassLoader.call(loadedApk);
+            if (gameClassLoader == null) {
+                Log.w("LimbusVA", "VClient.preloadLimbusAppSealing skipped: null game ClassLoader");
+                return false;
+            }
+            String foundPath = null;
+            if (gameClassLoader instanceof dalvik.system.BaseDexClassLoader) {
+                foundPath = ((dalvik.system.BaseDexClassLoader) gameClassLoader).findLibrary("covault-appsec");
+            }
+            Class<?> callerClass = null;
+            if (!TextUtils.isEmpty(appClassName)) {
+                try {
+                    // loadClass 仅解析类对象而不触发静态初始化块，提供合法的所属 ClassLoader 上下文。
+                    callerClass = gameClassLoader.loadClass(appClassName);
+                } catch (Throwable ignored) {
+                }
+            }
+            boolean loaded = false;
+            Runtime runtime = Runtime.getRuntime();
+            try {
+                java.lang.reflect.Method loadLibrary3 = Runtime.class.getDeclaredMethod(
+                        "loadLibrary0", ClassLoader.class, Class.class, String.class);
+                loadLibrary3.setAccessible(true);
+                loadLibrary3.invoke(runtime, gameClassLoader, callerClass, "covault-appsec");
+                loaded = true;
+            } catch (NoSuchMethodException ignored) {
+                try {
+                    java.lang.reflect.Method loadLibrary2 = Runtime.class.getDeclaredMethod(
+                            "loadLibrary0", ClassLoader.class, String.class);
+                    loadLibrary2.setAccessible(true);
+                    loadLibrary2.invoke(runtime, gameClassLoader, "covault-appsec");
+                    loaded = true;
+                } catch (NoSuchMethodException ignored2) {
+                    if (!TextUtils.isEmpty(foundPath)) {
+                        java.lang.reflect.Method nativeLoad = Runtime.class.getDeclaredMethod(
+                                "nativeLoad", String.class, ClassLoader.class);
+                        nativeLoad.setAccessible(true);
+                        Object err = nativeLoad.invoke(runtime, foundPath, gameClassLoader);
+                        loaded = (err == null);
+                        if (!loaded) {
+                            Log.w("LimbusVA", "VClient.preloadLimbusAppSealing nativeLoad error=" + err);
+                        }
+                    }
+                }
+            }
+            if (!loaded) {
+                Log.w("LimbusVA", "VClient.preloadLimbusAppSealing failed to load in game ClassLoader foundPath=" + foundPath);
+                return false;
+            }
+            String syncTarget = !TextUtils.isEmpty(foundPath)
+                    ? foundPath
+                    : (!TextUtils.isEmpty(realNativeLibDir) ? realNativeLibDir : scannerNativeLibDir);
+            boolean synced = NativeEngine.preloadLimbusAppSealing(syncTarget);
+            Log.i("LimbusVA", "VClient.preloadLimbusAppSealing gameClassLoader loaded=true synced=" + synced
+                    + " syncTarget=" + syncTarget);
+            return synced;
+        } catch (Throwable e) {
+            Log.w("LimbusVA", "VClient.preloadLimbusAppSealing failed, falling back to scanner thread", e);
+            return false;
+        }
     }
 
     private void applyLimbusThreadContextClassLoader(Object loadedApk, String reason) {

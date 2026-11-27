@@ -74,9 +74,11 @@ import com.lody.virtual.helper.compat.BuildCompat;
 import com.lody.virtual.helper.compat.BundleCompat;
 import com.lody.virtual.helper.compat.IntentCompat;
 import com.lody.virtual.helper.compat.ParceledListSliceCompat;
+import com.lody.virtual.helper.compat.ProviderAcquirePolicy;
 import com.lody.virtual.helper.utils.ArrayUtils;
 import com.lody.virtual.helper.utils.BitmapUtils;
 import com.lody.virtual.helper.utils.ComponentUtils;
+import com.lody.virtual.helper.utils.ContainerDiagnosticLog;
 import com.lody.virtual.helper.utils.DrawableUtils;
 import com.lody.virtual.helper.utils.FileUtils;
 import com.lody.virtual.helper.utils.Reflect;
@@ -2395,6 +2397,8 @@ class MethodProxies {
 
     static class GetContentProvider extends MethodProxy {
 
+        private static final ThreadLocal<java.util.Set<String>> sAcquiringAuthorities = new ThreadLocal<>();
+
         @Override
         public String getMethodName() {
             return "getContentProvider";
@@ -2404,9 +2408,6 @@ class MethodProxies {
         public Object call(Object who, Method method, Object... args) throws Throwable {
             int nameIdx = getProviderNameIndex();
             String name = (String) args[nameIdx];
-            if (LIMBUS_PACKAGE.equals(getAppPkg()) && "com.google.android.gms.chimera".equals(name)) {
-                Log.i("LimbusVA", "Allow host GMS chimera provider for Limbus dynamic service resolution");
-            }
 
             if ((name.startsWith(StubManifest.STUB_CP_AUTHORITY)
                     || name.startsWith(StubManifest.STUB_CP_AUTHORITY_64BIT)
@@ -2431,39 +2432,72 @@ class MethodProxies {
                     return null;
                 }
 
-                ClientConfig config = VActivityManager.get().initProcess(info.packageName, info.processName, userId, VActivityManager.PROCESS_TYPE_PROVIDER);
-                if (config == null) {
+                java.util.Set<String> inFlight = sAcquiringAuthorities.get();
+                if (inFlight == null) {
+                    inFlight = new java.util.HashSet<>();
+                    sAcquiringAuthorities.set(inFlight);
+                }
+                if (!inFlight.add(name)) {
+                    ContainerDiagnosticLog.warn(
+                            "LimbusVA",
+                            "Blocked re-entrant getContentProvider authority=" + name
+                                    + " appPkg=" + getAppPkg()
+                                    + " process=" + VClient.get().getCurrentProcessName()
+                    );
                     return null;
                 }
-                args[nameIdx] = StubManifest.getStubAuthority(config.vpid, config.is64Bit);
-                Object holder = method.invoke(who, args);
-                if (holder == null) {
-                    return null;
-                }
-                if (BuildCompat.isOreo()) {
-                    IInterface provider = ContentProviderHolderOreo.provider.get(holder);
-                    if (provider != null) {
-                        provider = VActivityManager.get().acquireProviderClient(userId, info, getVUid(), android.os.Process.myPid(), getAppPkg());
-                    }
-                    if (provider == null) {
-                        VLog.e("VActivityManager", "acquireProviderClient fail: " + name);
+                try {
+                    boolean sameProcess = ProviderAcquirePolicy.isSameVirtualProcess(
+                            getAppPkg(),
+                            VClient.get().getCurrentProcessName(),
+                            info.packageName,
+                            info.processName
+                    );
+                    ClientConfig config = sameProcess
+                            ? VClient.get().getClientConfig()
+                            : VActivityManager.get().initProcess(info.packageName, info.processName, userId, VActivityManager.PROCESS_TYPE_PROVIDER);
+                    if (config == null) {
                         return null;
                     }
-                    ContentProviderHolderOreo.provider.set(holder, provider);
-                    ContentProviderHolderOreo.info.set(holder, info);
-                } else {
-                    IInterface provider = IActivityManager.ContentProviderHolder.provider.get(holder);
-                    if (provider != null) {
-                        provider = VActivityManager.get().acquireProviderClient(userId, info, getVUid(), android.os.Process.myPid(), getAppPkg());
-                    }
-                    if (provider == null) {
-                        VLog.e("VActivityManager", "acquireProviderClient fail: " + name);
+                    args[nameIdx] = StubManifest.getStubAuthority(config.vpid, config.is64Bit);
+                    Object holder = method.invoke(who, args);
+                    if (holder == null) {
                         return null;
                     }
-                    IActivityManager.ContentProviderHolder.provider.set(holder, provider);
-                    IActivityManager.ContentProviderHolder.info.set(holder, info);
+                    if (BuildCompat.isOreo()) {
+                        IInterface provider = ContentProviderHolderOreo.provider.get(holder);
+                        if (provider != null) {
+                            provider = sameProcess
+                                    ? VClient.get().acquireLocalProviderClient(info)
+                                    : VActivityManager.get().acquireProviderClient(userId, info, getVUid(), android.os.Process.myPid(), getAppPkg());
+                        }
+                        if (provider == null) {
+                            VLog.e("VActivityManager", "acquireProviderClient fail: " + name);
+                            return null;
+                        }
+                        ContentProviderHolderOreo.provider.set(holder, provider);
+                        ContentProviderHolderOreo.info.set(holder, info);
+                    } else {
+                        IInterface provider = IActivityManager.ContentProviderHolder.provider.get(holder);
+                        if (provider != null) {
+                            provider = sameProcess
+                                    ? VClient.get().acquireLocalProviderClient(info)
+                                    : VActivityManager.get().acquireProviderClient(userId, info, getVUid(), android.os.Process.myPid(), getAppPkg());
+                        }
+                        if (provider == null) {
+                            VLog.e("VActivityManager", "acquireProviderClient fail: " + name);
+                            return null;
+                        }
+                        IActivityManager.ContentProviderHolder.provider.set(holder, provider);
+                        IActivityManager.ContentProviderHolder.info.set(holder, info);
+                    }
+                    return holder;
+                } finally {
+                    inFlight.remove(name);
                 }
-                return holder;
+            }
+            if (LIMBUS_PACKAGE.equals(getAppPkg()) && "com.google.android.gms.chimera".equals(name)) {
+                Log.i("LimbusVA", "Fallback to host GMS chimera provider because container microG did not resolve it");
             }
             VLog.w("VActivityManger", "getContentProvider:%s", name);
             Object holder = method.invoke(who, args);

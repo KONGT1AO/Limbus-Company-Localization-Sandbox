@@ -372,7 +372,12 @@ int redirect_proc_maps(const char *const pathname, const int flags, const int mo
     if (!is_proc_path(pathname, &relative) || !is_proc_maps_file(relative)) {
         return 0;
     }
-    ALOGE("start redirect: %s", pathname);
+    static volatile int maps_redirect_count = 0;
+    int redirect_index = __sync_fetch_and_add(&maps_redirect_count, 1) + 1;
+    bool should_log = redirect_index <= 8 || (redirect_index % 200) == 0;
+    if (should_log) {
+        ALOGE("start redirect: %s (count=%d)", pathname, redirect_index);
+    }
 
     int fd = syscall(__NR_openat, AT_FDCWD, pathname, flags, mode);
     if (fd == -1) {
@@ -391,7 +396,9 @@ int redirect_proc_maps(const char *const pathname, const int flags, const int mo
     lseek(fake_fd, 0, SEEK_SET);
     syscall(__NR_close, fd);
 
-    ALOGI("fake_maps: faked %s -> fd %d", pathname, fake_fd);
+    if (should_log) {
+        ALOGI("fake_maps: faked %s -> fd %d (count=%d)", pathname, fake_fd, redirect_index);
+    }
     return fake_fd;
 }
 

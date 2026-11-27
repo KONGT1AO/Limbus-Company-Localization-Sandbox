@@ -2645,3 +2645,7 @@ IOUniformer::startUniformer(const char *so_path, const char *so_path_64, const c
     setenv("V_NATIVE_PATH", native_path, 1);
     startIOHook(api_level);
 }
+
+bool preloadLimbusAppSealing(const char *) {
+    return false;
+}

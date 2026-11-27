@@ -267,6 +267,15 @@ public class NativeEngine {
         }
     }
 
+    public static boolean preloadLimbusAppSealing(String nativeLibraryDir) {
+        try {
+            return nativePreloadLimbusAppSealing(nativeLibraryDir);
+        } catch (Throwable e) {
+            VLog.e(TAG, VLog.getStackTraceString(e));
+            return false;
+        }
+    }
+
     public static int maintainLimbusAppSealingPatches() {
         try {
             return nativeMaintainLimbusAppSealingPatches();
@@ -563,6 +572,8 @@ public class NativeEngine {
     private static native void nativeHookLimbusFindClass();
 
     private static native void nativeScanLimbusNativeSyscalls(String nativeLibraryDir);
+
+    private static native boolean nativePreloadLimbusAppSealing(String nativeLibraryDir);
 
     private static native int nativeMaintainLimbusAppSealingPatches();
 

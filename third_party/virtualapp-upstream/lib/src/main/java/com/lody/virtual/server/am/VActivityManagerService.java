@@ -44,7 +44,9 @@ import com.lody.virtual.helper.compat.ApplicationThreadCompat;
 import com.lody.virtual.helper.compat.BroadcastReceiverCompat;
 import com.lody.virtual.helper.compat.BundleCompat;
 import com.lody.virtual.helper.compat.PermissionCompat;
+import com.lody.virtual.helper.compat.ProviderAcquirePolicy;
 import com.lody.virtual.helper.utils.ComponentUtils;
+import com.lody.virtual.helper.utils.ContainerDiagnosticLog;
 import com.lody.virtual.helper.utils.Singleton;
 import com.lody.virtual.helper.utils.VLog;
 import com.lody.virtual.os.VBinder;
@@ -440,10 +442,28 @@ public class VActivityManagerService extends IActivityManager.Stub {
             r = startProcessIfNeedLocked(processName, userId, info.packageName, -1, VBinder.getCallingUid(), VActivityManager.PROCESS_TYPE_PROVIDER);
         }
         if (r != null) {
+            IVClient client = r.client;
+            if (client == null || !client.asBinder().isBinderAlive()) {
+                ContainerDiagnosticLog.warn(
+                        "LimbusVA",
+                        "VAMS.acquireProviderClient target binder dead process=" + processName
+                                + " pid=" + r.pid + " authority=" + info.authority
+                );
+                onProcessDied(r);
+                return null;
+            }
             try {
-                return r.client.acquireProviderClient(info);
-            } catch (RemoteException e) {
-                e.printStackTrace();
+                return client.acquireProviderClient(info);
+            } catch (Throwable e) {
+                ContainerDiagnosticLog.warn(
+                        "LimbusVA",
+                        "VAMS.acquireProviderClient remote call failed process=" + processName
+                                + " pid=" + r.pid + " authority=" + info.authority,
+                        e
+                );
+                if (!client.asBinder().isBinderAlive()) {
+                    onProcessDied(r);
+                }
             }
         }
         return null;
@@ -727,11 +747,32 @@ public class VActivityManagerService extends IActivityManager.Stub {
             if (vpid == -1) {
                 app = mProcessNames.get(processName, vuid);
                 if (app != null) {
-                    if (app.initLock != null) {
-                        app.initLock.block();
+                    ConditionVariable initLock = app.initLock;
+                    boolean initCompleted = true;
+                    if (initLock != null) {
+                        initCompleted = initLock.block(ProviderAcquirePolicy.PROCESS_INIT_TIMEOUT_MS);
+                        if (!initCompleted) {
+                            ContainerDiagnosticLog.warn(
+                                    "LimbusVA",
+                                    "startProcessIfNeedLocked timed out waiting initLock process="
+                                            + processName + " pid=" + app.pid + " vpid=" + app.vpid
+                            );
+                        }
                     }
-                    if (app.client != null) {
+                    if (initCompleted
+                            && app.client != null
+                            && app.client.asBinder().isBinderAlive()) {
                         return app;
+                    }
+                    ContainerDiagnosticLog.warn(
+                            "LimbusVA",
+                            "startProcessIfNeedLocked discarding stale process=" + processName
+                                    + " pid=" + app.pid + " vpid=" + app.vpid
+                                    + " initCompleted=" + initCompleted
+                    );
+                    try {
+                        app.kill();
+                    } catch (Throwable ignored) {
                     }
                 }
                 VLog.w(TAG, "start new process : " + processName + " by " + VActivityManager.getTypeString(type));

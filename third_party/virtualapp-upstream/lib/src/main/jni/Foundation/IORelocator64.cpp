@@ -66,11 +66,14 @@ int g_api_level;
 bool execve_process = false;
 bool g_limbus_container_process_known = false;
 bool g_limbus_container_process = false;
+static volatile pid_t g_limbus_container_pid = 0;
 static thread_local bool g_proc_redirect_active = false;
 static pthread_mutex_t g_limbus_syscall_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 static std::set<void *> g_limbus_hooked_syscalls;
 static std::set<int> g_limbus_seen_syscall_nums;
 static std::set<std::string> g_limbus_seen_syscall_sites;
+static std::set<std::string> g_limbus_scanned_libs;
+static std::atomic<int> g_limbus_syscall_scan_log_count{0};
 static pthread_mutex_t g_limbus_signal_diag_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_limbus_signal_diag_count = 0;
 static int g_limbus_network_diag_count = 0;
@@ -146,6 +149,64 @@ char *get_process_name() {
         }
     }
     return cmdline;
+}
+
+#if defined(__aarch64__)
+static long limbus_signal_raw_syscall4(long number,
+                                       long argument0,
+                                       long argument1,
+                                       long argument2,
+                                       long argument3) {
+    register long x0 asm("x0") = argument0;
+    register long x1 asm("x1") = argument1;
+    register long x2 asm("x2") = argument2;
+    register long x3 asm("x3") = argument3;
+    register long x8 asm("x8") = number;
+    asm volatile(
+            "svc #0"
+            : "+r"(x0)
+            : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+            : "memory", "cc");
+    return x0;
+}
+#endif
+
+static inline long limbus_raw_getpid() {
+#if defined(__aarch64__)
+    return limbus_signal_raw_syscall4(__NR_getpid, 0, 0, 0, 0);
+#else
+    return syscall(__NR_getpid);
+#endif
+}
+
+// AppSealing 会通过 fork() 拉起短期子进程执行反调试/ptrace 检测并立即 _exit()。
+// 子进程必须能够正常退出，不能被父进程的退出保护拦截或卡在非 async-signal-safe 锁上。
+static inline bool is_limbus_forked_child_process() {
+    pid_t parent_pid = g_limbus_container_pid;
+    if (parent_pid <= 0) {
+        return false;
+    }
+    long current_pid = limbus_raw_getpid();
+    return current_pid > 0 && static_cast<pid_t>(current_pid) != parent_pid;
+}
+
+static inline bool is_limbus_parent_process_target(long target_pid) {
+    pid_t parent_pid = g_limbus_container_pid;
+    return parent_pid > 0 && target_pid == static_cast<long>(parent_pid);
+}
+
+[[noreturn]] static inline void limbus_raw_exit_group_now(int status) {
+#if defined(__aarch64__)
+    for (;;) {
+        limbus_signal_raw_syscall4(__NR_exit_group, status, 0, 0, 0);
+        limbus_signal_raw_syscall4(__NR_exit, status, 0, 0, 0);
+    }
+#else
+    for (;;) {
+        syscall(__NR_exit_group, status);
+        syscall(__NR_exit, status);
+    }
+#endif
 }
 
 bool is_limbus_container_process() {
@@ -1154,9 +1215,13 @@ void init_limbus_container_process_flag() {
             && (strstr(process_name, "limbuspe.box") != nullptr
             || strstr(process_name, "limbuszhcn") != nullptr
             || strstr(process_name, "com.ProjectMoon.LimbusCompany") != nullptr);
+    g_limbus_container_pid = g_limbus_container_process
+            ? static_cast<pid_t>(limbus_raw_getpid())
+            : 0;
     g_limbus_container_process_known = true;
-    ALOGI("Limbus container process flag : %d name : %s",
+    ALOGI("Limbus container process flag : %d pid : %d name : %s",
           g_limbus_container_process ? 1 : 0,
+          static_cast<int>(g_limbus_container_pid),
           process_name != nullptr ? process_name : "(null)");
     free(process_name);
 }
@@ -1374,6 +1439,12 @@ HOOK_DEF(int, fstatat64, int dirfd, const char *pathname, struct stat *buf, int 
 
 // int kill(pid_t pid, int sig);
 HOOK_DEF(int, kill, pid_t pid, int sig) {
+    if (is_limbus_forked_child_process()) {
+        if (is_limbus_parent_process_target(pid) && should_block_limbus_terminating_signal(sig)) {
+            return block_limbus_signal_int();
+        }
+        return static_cast<int>(syscall(__NR_kill, pid, sig));
+    }
     pid_t self = getpid();
     ALOGE("kill >>> pid : %d, sig : %d, self : %d", pid, sig, self);
     if (should_block_limbus_terminating_signal(sig)) {
@@ -1454,6 +1525,9 @@ HOOK_DEF(int, setitimer, int which, const struct itimerval *new_value, struct it
 
 // int raise(int sig);
 HOOK_DEF(int, raise, int sig) {
+    if (is_limbus_forked_child_process()) {
+        return orig_raise(sig);
+    }
     if (should_block_limbus_terminating_signal(sig)) {
         ALOGE("raise >>> blocked Limbus container signal : %d", sig);
         return block_limbus_signal_int();
@@ -1467,6 +1541,9 @@ HOOK_DEF(int, raise, int sig) {
 
 // int tkill(pid_t tid, int sig);
 HOOK_DEF(int, tkill, pid_t tid, int sig) {
+    if (is_limbus_forked_child_process()) {
+        return orig_tkill(tid, sig);
+    }
     ALOGE("tkill >>> tid : %d, sig : %d", tid, sig);
     log_limbus_signal_diagnostic("tkill", tid, sig);
     if (should_block_limbus_terminating_signal(sig)) {
@@ -1482,6 +1559,12 @@ HOOK_DEF(int, tkill, pid_t tid, int sig) {
 
 // int tgkill(pid_t tgid, pid_t tid, int sig);
 HOOK_DEF(int, tgkill, pid_t tgid, pid_t tid, int sig) {
+    if (is_limbus_forked_child_process()) {
+        if (is_limbus_parent_process_target(tgid) && should_block_limbus_terminating_signal(sig)) {
+            return block_limbus_signal_int();
+        }
+        return orig_tgkill(tgid, tid, sig);
+    }
     pid_t self = getpid();
     if (!is_limbus_allowed_signal_noise(sig)) {
         ALOGE("tgkill >>> tgid : %d, tid : %d, sig : %d, self : %d", tgid, tid, sig, self);
@@ -1500,6 +1583,9 @@ HOOK_DEF(int, tgkill, pid_t tgid, pid_t tid, int sig) {
 
 // int pthread_kill(pthread_t thread, int sig);
 HOOK_DEF(int, pthread_kill, pthread_t thread, int sig) {
+    if (is_limbus_forked_child_process()) {
+        return orig_pthread_kill(thread, sig);
+    }
     if (!is_limbus_allowed_signal_noise(sig)) {
         ALOGE("pthread_kill >>> sig : %d", sig);
     }
@@ -1517,6 +1603,9 @@ HOOK_DEF(int, pthread_kill, pthread_t thread, int sig) {
 
 // void exit(int status);
 HOOK_DEF(void, exit, int status) {
+    if (is_limbus_forked_child_process()) {
+        limbus_raw_exit_group_now(status);
+    }
     if (is_limbus_container_process()) {
         if (handle_limbus_process_exit("exit", status, __builtin_return_address(0))) {
             return;
@@ -1527,6 +1616,9 @@ HOOK_DEF(void, exit, int status) {
 
 // void _exit(int status);
 HOOK_DEF(void, _exit, int status) {
+    if (is_limbus_forked_child_process()) {
+        limbus_raw_exit_group_now(status);
+    }
     if (is_limbus_container_process()) {
         handle_limbus_process_exit("_exit", status, __builtin_return_address(0));
     }
@@ -1535,6 +1627,10 @@ HOOK_DEF(void, _exit, int status) {
 
 // void abort(void);
 HOOK_DEF(void, abort) {
+    if (is_limbus_forked_child_process()) {
+        orig_abort();
+        limbus_raw_exit_group_now(128 + SIGABRT);
+    }
     if (is_limbus_container_process()) {
         handle_limbus_process_exit("abort", 0, __builtin_return_address(0));
     }
@@ -1590,14 +1686,15 @@ static int collect_limbus_signal_module(struct dl_phdr_info *info, size_t, void 
     return 0;
 }
 
-static void collect_limbus_signal_exec_maps(
+static size_t collect_limbus_signal_exec_maps(
         std::pair<LimbusSignalModule *, size_t> *state) {
     if (state == nullptr || state->second >= kLimbusSignalModuleLimit) {
-        return;
+        return 0;
     }
+    size_t initial_count = state->second;
     FILE *maps = fopen("/proc/self/maps", "r");
     if (maps == nullptr) {
-        return;
+        return 0;
     }
 
     char line[PATH_MAX + 128];
@@ -1651,21 +1748,44 @@ static void collect_limbus_signal_exec_maps(
         module.name[length] = '\0';
     }
     fclose(maps);
+    return state->second - initial_count;
 }
 
 static void refresh_limbus_signal_modules() {
-    if (!is_limbus_container_process()) {
+    if (!is_limbus_container_process() || is_limbus_forked_child_process()) {
         return;
     }
-    int next = g_limbus_signal_module_active == 0 ? 1 : 0;
+    int active = g_limbus_signal_module_active == 0 ? 0 : 1;
+    int next = active == 0 ? 1 : 0;
     memset(g_limbus_signal_modules[next], 0, sizeof(g_limbus_signal_modules[next]));
     std::pair<LimbusSignalModule *, size_t> state = {
             g_limbus_signal_modules[next],
             0,
     };
     // 先记录装载器看不到的 ART 执行区，再补充常规 ELF 模块。
-    collect_limbus_signal_exec_maps(&state);
+    size_t exec_maps_added = collect_limbus_signal_exec_maps(&state);
+    if (exec_maps_added == 0) {
+        // 如果当前环境暂不可读 /proc/self/maps，保留旧缓存中的低地址与 ART 执行区条目。
+        sig_atomic_t prev_count = g_limbus_signal_module_counts[active];
+        if (prev_count > 0 && static_cast<size_t>(prev_count) <= kLimbusSignalModuleLimit) {
+            for (sig_atomic_t i = 0; i < prev_count && state.second < kLimbusSignalModuleLimit; ++i) {
+                const LimbusSignalModule &prev = g_limbus_signal_modules[active][i];
+                bool is_preserved_exec = prev.end <= 0x100000000ULL
+                        || strstr(prev.name, "oat") != nullptr
+                        || strstr(prev.name, "jit") != nullptr
+                        || strstr(prev.name, "dalvik") != nullptr
+                        || strstr(prev.name, "base.apk") != nullptr
+                        || strcmp(prev.name, "<anonymous-exec>") == 0;
+                if (is_preserved_exec) {
+                    state.first[state.second++] = prev;
+                }
+            }
+        }
+    }
     dl_iterate_phdr(collect_limbus_signal_module, &state);
+    if (state.second == 0 && g_limbus_signal_module_counts[active] > 0) {
+        return;
+    }
     g_limbus_signal_module_counts[next] = static_cast<sig_atomic_t>(state.second);
     __sync_synchronize();
     g_limbus_signal_module_active = static_cast<sig_atomic_t>(next);
@@ -1743,24 +1863,6 @@ static char *limbus_signal_append_module(char *cursor,
 }
 
 #if defined(__aarch64__)
-static long limbus_signal_raw_syscall4(long number,
-                                       long argument0,
-                                       long argument1,
-                                       long argument2,
-                                       long argument3) {
-    register long x0 asm("x0") = argument0;
-    register long x1 asm("x1") = argument1;
-    register long x2 asm("x2") = argument2;
-    register long x3 asm("x3") = argument3;
-    register long x8 asm("x8") = number;
-    asm volatile(
-            "svc #0"
-            : "+r"(x0)
-            : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
-            : "memory", "cc");
-    return x0;
-}
-
 static void limbus_persist_signal_diagnostic(const char *message, size_t length) {
     if (message == nullptr || length == 0) {
         return;
@@ -1802,7 +1904,9 @@ static char *limbus_signal_append_proc_map(char *cursor,
             O_RDONLY | O_CLOEXEC,
             0);
     if (fd < 0) {
-        return limbus_signal_append_text(cursor, end, "<open-failed>");
+        cursor = limbus_signal_append_text(cursor, end, "<open-err:");
+        cursor = limbus_signal_append_signed(cursor, end, -fd);
+        return limbus_signal_append_text(cursor, end, ">");
     }
 
     char read_buffer[512];
@@ -1810,6 +1914,8 @@ static char *limbus_signal_append_proc_map(char *cursor,
     size_t line_length = 0;
     bool line_overflow = false;
     bool matched = false;
+    long total_bytes = 0;
+    long read_error = 0;
     while (!matched) {
         long count = limbus_signal_raw_syscall4(
                 __NR_read,
@@ -1817,9 +1923,14 @@ static char *limbus_signal_append_proc_map(char *cursor,
                 reinterpret_cast<long>(read_buffer),
                 sizeof(read_buffer),
                 0);
-        if (count <= 0) {
+        if (count < 0) {
+            read_error = -count;
             break;
         }
+        if (count == 0) {
+            break;
+        }
+        total_bytes += count;
         for (long i = 0; i < count && !matched; ++i) {
             char value = read_buffer[i];
             if (value != '\n') {
@@ -1902,7 +2013,15 @@ static char *limbus_signal_append_proc_map(char *cursor,
     }
     limbus_signal_raw_syscall4(__NR_close, fd, 0, 0, 0);
     if (!matched) {
-        cursor = limbus_signal_append_text(cursor, end, "<unknown>");
+        if (read_error > 0) {
+            cursor = limbus_signal_append_text(cursor, end, "<read-err:");
+            cursor = limbus_signal_append_signed(cursor, end, read_error);
+            cursor = limbus_signal_append_text(cursor, end, ">");
+        } else if (total_bytes == 0) {
+            cursor = limbus_signal_append_text(cursor, end, "<empty>");
+        } else {
+            cursor = limbus_signal_append_text(cursor, end, "<unknown>");
+        }
     }
     return cursor;
 }
@@ -1961,6 +2080,14 @@ HOOK_DEF(int, sigaction, int signum, const struct sigaction *act, struct sigacti
 }
 
 static void limbus_sigsegv_guard(int sig, siginfo_t *info, void *context) {
+    if (is_limbus_forked_child_process()) {
+        struct sigaction default_action;
+        memset(&default_action, 0, sizeof(default_action));
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        orig_sigaction(SIGSEGV, &default_action, nullptr);
+        limbus_raw_exit_group_now(128 + SIGSEGV);
+    }
     char diagnostic[2048];
     char *cursor = diagnostic;
     char *end = diagnostic + sizeof(diagnostic) - 2;
@@ -2218,6 +2345,14 @@ static void maintain_limbus_sigsegv_guard() {
 }
 
 static void limbus_sigill_guard(int sig, siginfo_t *info, void *context) {
+    if (is_limbus_forked_child_process()) {
+        struct sigaction default_action;
+        memset(&default_action, 0, sizeof(default_action));
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        orig_sigaction(SIGILL, &default_action, nullptr);
+        limbus_raw_exit_group_now(128 + SIGILL);
+    }
 #if defined(__aarch64__)
     if (context != nullptr && info != nullptr && info->si_code == ILL_ILLOPC) {
         auto *ucontext = reinterpret_cast<ucontext_t *>(context);
@@ -2299,6 +2434,50 @@ HOOK_DEF(long, syscall, long number, ...) {
     long a5 = va_arg(args, long);
     long a6 = va_arg(args, long);
     va_end(args);
+
+    if (is_limbus_forked_child_process()) {
+#ifdef __NR_exit
+        if (number == __NR_exit) {
+#if defined(__aarch64__)
+            return limbus_signal_raw_syscall4(__NR_exit, a1, 0, 0, 0);
+#else
+            return orig_syscall(number, a1, a2, a3, a4, a5, a6);
+#endif
+        }
+#endif
+#ifdef __NR_exit_group
+        if (number == __NR_exit_group) {
+            limbus_raw_exit_group_now(static_cast<int>(a1));
+        }
+#endif
+        if (number == __NR_kill
+                && is_limbus_parent_process_target(a1)
+                && should_block_limbus_terminating_signal(static_cast<int>(a2))) {
+            return block_limbus_signal_long();
+        }
+#ifdef __NR_tgkill
+        if (number == __NR_tgkill
+                && is_limbus_parent_process_target(a1)
+                && should_block_limbus_terminating_signal(static_cast<int>(a3))) {
+            return block_limbus_signal_long();
+        }
+#endif
+#ifdef __NR_rt_sigqueueinfo
+        if (number == __NR_rt_sigqueueinfo
+                && is_limbus_parent_process_target(a1)
+                && should_block_limbus_terminating_signal(static_cast<int>(a2))) {
+            return block_limbus_signal_long();
+        }
+#endif
+#ifdef __NR_rt_tgsigqueueinfo
+        if (number == __NR_rt_tgsigqueueinfo
+                && is_limbus_parent_process_target(a1)
+                && should_block_limbus_terminating_signal(static_cast<int>(a3))) {
+            return block_limbus_signal_long();
+        }
+#endif
+        return orig_syscall(number, a1, a2, a3, a4, a5, a6);
+    }
 
     if (is_limbus_container_process()) {
 #ifdef __NR_openat
@@ -2454,6 +2633,36 @@ HOOK_DEF(long, syscall, long number, ...) {
                 memset(reinterpret_cast<void *>(a3), 0, sizeof(struct itimerval));
             }
             return 0;
+        }
+#endif
+#ifdef __NR_renameat
+        if (number == __NR_renameat && a2 != 0 && a4 != 0) {
+            char temp_old[PATH_MAX], temp_new[PATH_MAX];
+            const char *relocated_old = relocate_path_with_dirfd(
+                    static_cast<int>(a1), reinterpret_cast<const char *>(a2), temp_old, sizeof(temp_old));
+            const char *relocated_new = relocate_path_with_dirfd(
+                    static_cast<int>(a3), reinterpret_cast<const char *>(a4), temp_new, sizeof(temp_new));
+            if (relocated_old == nullptr || relocated_new == nullptr) {
+                errno = EACCES;
+                return -1;
+            }
+            return orig_syscall(number, a1, reinterpret_cast<long>(relocated_old),
+                                a3, reinterpret_cast<long>(relocated_new), a5, a6);
+        }
+#endif
+#ifdef __NR_renameat2
+        if (number == __NR_renameat2 && a2 != 0 && a4 != 0) {
+            char temp_old[PATH_MAX], temp_new[PATH_MAX];
+            const char *relocated_old = relocate_path_with_dirfd(
+                    static_cast<int>(a1), reinterpret_cast<const char *>(a2), temp_old, sizeof(temp_old));
+            const char *relocated_new = relocate_path_with_dirfd(
+                    static_cast<int>(a3), reinterpret_cast<const char *>(a4), temp_new, sizeof(temp_new));
+            if (relocated_old == nullptr || relocated_new == nullptr) {
+                errno = EACCES;
+                return -1;
+            }
+            return orig_syscall(number, a1, reinterpret_cast<long>(relocated_old),
+                                a3, reinterpret_cast<long>(relocated_new), a5, a6);
         }
 #endif
 #ifdef __NR_rt_sigaction
@@ -2810,8 +3019,8 @@ HOOK_DEF(int, chroot, const char *pathname) {
 // int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
 HOOK_DEF(int, renameat, int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
     char temp_old[PATH_MAX], temp_new[PATH_MAX];
-    const char *relocated_path_old = relocate_path(oldpath, temp_old, sizeof(temp_old));
-    const char *relocated_path_new = relocate_path(newpath, temp_new, sizeof(temp_new));
+    const char *relocated_path_old = relocate_path_with_dirfd(olddirfd, oldpath, temp_old, sizeof(temp_old));
+    const char *relocated_path_new = relocate_path_with_dirfd(newdirfd, newpath, temp_new, sizeof(temp_new));
     if (relocated_path_old && relocated_path_new) {
         xdja::zs::sp <virtualFile> *vf2 = virtualFileManager::getVFM().queryVF(
                 (char *) relocated_path_old);
@@ -2887,6 +3096,16 @@ HOOK_DEF(int, renameat2, int olddirfd, const char *oldpath, int newdirfd,
                                        relocated_path_new,
                                        flags));
     int saved_errno = ret < 0 ? errno : 0;
+#ifdef __NR_renameat
+    if (ret < 0 && saved_errno == ENOSYS && flags == 0) {
+        ret = static_cast<int>(syscall(__NR_renameat,
+                                       olddirfd,
+                                       relocated_path_old,
+                                       newdirfd,
+                                       relocated_path_new));
+        saved_errno = ret < 0 ? errno : 0;
+    }
+#endif
 
     xdja::zs::sp<virtualFile> *target_virtual_file = virtualFileManager::getVFM().queryVF(
             const_cast<char *>(relocated_path_new));
@@ -2898,17 +3117,20 @@ HOOK_DEF(int, renameat2, int olddirfd, const char *oldpath, int newdirfd,
         target->delRef();
     }
 
-    // UnityCache 是本问题的关键提交点，保留低频结果日志便于真机确认临时文件已成功归档。
+    // UnityCache 是资源包下载提交点：失败全部记录，成功仅保留前 16 条避免大更新刷屏。
     if ((oldpath != nullptr && strstr(oldpath, "/UnityCache/") != nullptr)
             || (newpath != nullptr && strstr(newpath, "/UnityCache/") != nullptr)) {
-        ALOGI("Limbus UnityCache renameat2 >>> ret=%d errno=%d flags=0x%x old=%s relocated_old=%s new=%s relocated_new=%s",
-              ret,
-              saved_errno,
-              flags,
-              oldpath != nullptr ? oldpath : "(null)",
-              relocated_path_old,
-              newpath != nullptr ? newpath : "(null)",
-              relocated_path_new);
+        static std::atomic<int> unity_cache_rename_ok_logs{0};
+        if (ret < 0 || unity_cache_rename_ok_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+            ALOGI("Limbus UnityCache renameat2 >>> ret=%d errno=%d flags=0x%x old=%s relocated_old=%s new=%s relocated_new=%s",
+                  ret,
+                  saved_errno,
+                  flags,
+                  oldpath != nullptr ? oldpath : "(null)",
+                  relocated_path_old,
+                  newpath != nullptr ? newpath : "(null)",
+                  relocated_path_new);
+        }
     }
     if (ret < 0) {
         errno = saved_errno;
@@ -4964,9 +5186,36 @@ static bool is_limbus_native_path(const char *name) {
             || strstr(name, "AppSealing") != nullptr;
 }
 
-static void hook_limbus_native_syscalls(const char *name, bool allow_loaded_fallback) {
-    if (!is_limbus_container_process() || !is_limbus_native_path(name)) {
-        return;
+static bool is_limbus_lib_already_scanned(const char *lib_name) {
+    if (lib_name == nullptr || lib_name[0] == '\0') {
+        return false;
+    }
+    const char *base = strrchr(lib_name, '/');
+    base = base != nullptr ? base + 1 : lib_name;
+    pthread_mutex_lock(&g_limbus_syscall_hook_lock);
+    bool scanned = g_limbus_scanned_libs.find(base) != g_limbus_scanned_libs.end();
+    pthread_mutex_unlock(&g_limbus_syscall_hook_lock);
+    return scanned;
+}
+
+static bool mark_limbus_lib_scanned(const char *lib_name) {
+    if (lib_name == nullptr || lib_name[0] == '\0') {
+        return false;
+    }
+    const char *base = strrchr(lib_name, '/');
+    base = base != nullptr ? base + 1 : lib_name;
+    if (strcmp(base, "libcovault-appsec.so") == 0 && g_limbus_appsealing_base == 0) {
+        return false;
+    }
+    pthread_mutex_lock(&g_limbus_syscall_hook_lock);
+    bool inserted = g_limbus_scanned_libs.insert(base).second;
+    pthread_mutex_unlock(&g_limbus_syscall_hook_lock);
+    return inserted;
+}
+
+static bool hook_limbus_native_syscalls(const char *name, bool allow_loaded_fallback) {
+    if (!is_limbus_container_process() || is_limbus_forked_child_process() || !is_limbus_native_path(name)) {
+        return false;
     }
     int matched_maps = findSyscallsCount(name, on_found_limbus_syscall_arch64);
     if (matched_maps == 0 && allow_loaded_fallback) {
@@ -4981,13 +5230,17 @@ static void hook_limbus_native_syscalls(const char *name, bool allow_loaded_fall
                   matched_maps);
         }
     }
-    ALOGE("Limbus syscall hook >>> scan native map name=%s matchedMaps=%d", name, matched_maps);
+    bool newly_scanned = false;
     if (matched_maps > 0) {
+        newly_scanned |= mark_limbus_lib_scanned(name);
         probe_limbus_translation_runtime(name);
+    }
+    if (newly_scanned || (matched_maps == 0 && g_limbus_syscall_scan_log_count.fetch_add(1, std::memory_order_relaxed) < 8)) {
+        ALOGE("Limbus syscall hook >>> scan native map name=%s matchedMaps=%d", name, matched_maps);
     }
 
     const char *real_lib_dir = getenv("V_LIMBUS_REAL_LIB_DIR");
-    if (real_lib_dir != nullptr && name != nullptr) {
+    if (real_lib_dir != nullptr && name != nullptr && matched_maps == 0) {
         const char *lib_name = strrchr(name, '/');
         lib_name = lib_name == nullptr ? name : lib_name + 1;
         if (strstr(lib_name, ".so") != nullptr) {
@@ -4999,19 +5252,21 @@ static void hook_limbus_native_syscalls(const char *name, bool allow_loaded_fall
                     real_matched_maps = findLoadedSyscallsCount(
                             real_path, on_found_limbus_syscall_arch64);
                 }
-                ALOGE("Limbus syscall hook >>> scan real native map path=%s matchedMaps=%d",
-                      real_path,
-                      real_matched_maps);
                 if (real_matched_maps > 0) {
+                    newly_scanned |= mark_limbus_lib_scanned(lib_name);
                     probe_limbus_translation_runtime(real_path);
+                    ALOGE("Limbus syscall hook >>> scan real native map path=%s matchedMaps=%d",
+                          real_path,
+                          real_matched_maps);
                 }
             }
         }
     }
+    return newly_scanned;
 }
 
 void scanLimbusNativeSyscalls(const char *nativeLibraryDir) {
-    if (!is_limbus_container_process()) {
+    if (!is_limbus_container_process() || is_limbus_forked_child_process()) {
         return;
     }
     const char *libs[] = {
@@ -5020,25 +5275,73 @@ void scanLimbusNativeSyscalls(const char *nativeLibraryDir) {
             "libunity.so",
             "libmain.so",
     };
+    bool any_newly_scanned = false;
     for (const char *lib : libs) {
+        if (is_limbus_lib_already_scanned(lib)) {
+            continue;
+        }
         /*
          * 优先使用完整路径接管真实映射。只按文件名查找时会先经过伪装后的 maps，
          * 同一库可能被拆成很多段，首轮处理耗时过长；完整路径能让 AppSealing 的
-         * 固定结束进程位置更早被接管。随后仍按文件名补查动态生成的匿名映射。
+         * 固定结束进程位置更早被接管。仅在完整路径未命中时再按文件名补查动态映射。
          */
         if (nativeLibraryDir != nullptr && nativeLibraryDir[0] != '\0') {
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/%s", nativeLibraryDir, lib);
-            hook_limbus_native_syscalls(path, true);
+            any_newly_scanned |= hook_limbus_native_syscalls(path, true);
         }
-        hook_limbus_native_syscalls(lib, true);
+        if (!is_limbus_lib_already_scanned(lib)) {
+            any_newly_scanned |= hook_limbus_native_syscalls(lib, true);
+        }
     }
-    // 原生保护库可能绕过 libc 直接替换信号处理器，因此每轮加载扫描结束后都校正一次。
+    if (g_limbus_appsealing_base != 0) {
+        maintainLimbusAppSealingPatches();
+    } else {
+        // 原生保护库可能绕过 libc 直接替换信号处理器，因此每轮加载扫描结束后都校正一次。
+        maintain_limbus_sigsegv_guard();
+    }
+    int active = g_limbus_signal_module_active == 0 ? 0 : 1;
+    if (any_newly_scanned || g_limbus_signal_module_counts[active] == 0) {
+        // This entry point runs outside the linker callback after the game libraries are loaded.
+        // Refreshing from onSoLoaded would re-enter dl_iterate_phdr while bionic is mutating its
+        // module list and can itself cause a synchronous SIGSEGV on Android 12/13.
+        refresh_limbus_signal_modules();
+    }
+}
+
+bool preloadLimbusAppSealing(const char *nativeLibraryDir) {
+    if (!is_limbus_container_process() || is_limbus_forked_child_process()) {
+        return false;
+    }
+    /*
+     * libcovault-appsec.so 必须由游戏自身的 PathClassLoader 在游戏 linker namespace 中装入，
+     * 避免宿主侧直接 dlopen 产生双份映射。此处仅在主线程同步扫描已装入的唯一映射并刷新守卫。
+     */
+    char path[PATH_MAX];
+    const char *target = "libcovault-appsec.so";
+    if (nativeLibraryDir != nullptr && nativeLibraryDir[0] != '\0') {
+        size_t len = strlen(nativeLibraryDir);
+        if (len > 3 && strcmp(nativeLibraryDir + len - 3, ".so") == 0) {
+            target = nativeLibraryDir;
+        } else {
+            snprintf(path, sizeof(path), "%s/libcovault-appsec.so", nativeLibraryDir);
+            target = path;
+        }
+        hook_limbus_native_syscalls(target, true);
+    }
+    if (g_limbus_appsealing_base == 0) {
+        hook_limbus_native_syscalls("libcovault-appsec.so", true);
+    }
+    if (g_limbus_appsealing_base != 0) {
+        maintainLimbusAppSealingPatches();
+    }
     maintain_limbus_sigsegv_guard();
-    // This entry point runs outside the linker callback after the game libraries are loaded.
-    // Refreshing from onSoLoaded would re-enter dl_iterate_phdr while bionic is mutating its
-    // module list and can itself cause a synchronous SIGSEGV on Android 12/13.
+    maintain_limbus_sigill_guard();
     refresh_limbus_signal_modules();
+    ALOGE("Limbus AppSealing preload >>> synced base=%p path=%s",
+          reinterpret_cast<void *>(g_limbus_appsealing_base),
+          target);
+    return g_limbus_appsealing_base != 0;
 }
 
 void onSoLoaded(const char *name, void *handle) {
@@ -5115,27 +5418,56 @@ bool relocate_linker(const char* LINKER_PATH) {
     return false;
 }
 
+static bool is_arm64_short_branch_stub(void *fn) {
+#if defined(__aarch64__)
+    if (fn == nullptr) {
+        return false;
+    }
+    const auto *insns = reinterpret_cast<const uint32_t *>(fn);
+    // 检测前 3 条指令内是否包含无条件分支 b <imm26>（例如 bti c; mov w4, wzr; b renameat2@plt），
+    // 此类 8~12 字节短跳板不可被 16 字节 inline hook 改写，否则会越界破坏相邻函数。
+    for (int i = 0; i < 3; ++i) {
+        if ((insns[i] & 0xFC000000U) == 0x14000000U) {
+            return true;
+        }
+    }
+#else
+    (void) fn;
+#endif
+    return false;
+}
+
 void startIOHook(int api_level) {
     void *handle = dlopen("libc.so", RTLD_NOW);
 
     if (handle) {
         init_limbus_container_process_flag();
+        if (is_limbus_container_process()) {
+            // 提前启用 PR_SET_DUMPABLE，避免 isDebuggable=false 导致启动初期在 HyperOS 等
+            // 系统上 /proc/self/maps 读空及 crash_dump64 权限拒绝（AppSealing 自身随后也会设置）。
+            int dumpable_ret = prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+            ALOGI("Limbus container >>> prctl(PR_SET_DUMPABLE, 1) ret=%d errno=%d",
+                  dumpable_ret, dumpable_ret == 0 ? 0 : errno);
+        }
         ignore_limbus_sigalrm_if_needed();
         HOOK_SYMBOL(handle, fchownat);
-        if (api_level >= 36) {
+        void *renameat2_addr = dlsym(handle, "renameat2");
+        if (renameat2_addr != nullptr) {
             /*
-             * Android 16 的 arm64 bionic renameat 只有 12 字节，末尾直接跳转
-             * renameat2。旧 MSHookFunction 需要改写 16 字节，会越界覆盖紧邻的
-             * rmdir 首指令并产生 SIGILL；API 36 保留 libc 原实现。
-             */
-            ALOGE("IO hook >>> skip Android 16 arm64 libc renameat hook to preserve adjacent rmdir");
-            /*
-             * rename/renameat 在 Android 16 都会跳转到独立的 renameat2 包装；该入口有
-             * 足够的 28 字节可供旧 inline hook 安全建立跳板。UnityCache 的 native
-             * Temp -> Shared 提交也经过这里，因此改 hook renameat2 才能保留下载资源。
+             * Android 11+ (API 30+) bionic 的 rename()/renameat() 均直接跳转 renameat2；
+             * 此前仅在 api_level >= 36 上挂钩 renameat2，导致 Android 11~15 的 UnityCache
+             * Temp -> Shared 重命名完全绕过重定向、重复下载且空间不涨。这里对全部导出
+             * renameat2 的系统统一挂钩 renameat2。
              */
             HOOK_SYMBOL(handle, renameat2);
-            ALOGE("IO hook >>> hooked Android 16 arm64 libc renameat2 for virtual cache commits");
+            void *renameat_addr = dlsym(handle, "renameat");
+            bool skip_renameat = api_level >= 35 || is_arm64_short_branch_stub(renameat_addr);
+            if (skip_renameat) {
+                ALOGE("IO hook >>> hooked libc renameat2 and skipped short renameat stub api=%d", api_level);
+            } else {
+                HOOK_SYMBOL(handle, renameat);
+                ALOGE("IO hook >>> hooked both libc renameat2 and renameat api=%d", api_level);
+            }
         } else {
             HOOK_SYMBOL(handle, renameat);
         }

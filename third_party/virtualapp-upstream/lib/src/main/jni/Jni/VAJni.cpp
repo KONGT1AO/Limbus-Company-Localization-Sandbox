@@ -35,6 +35,11 @@ static void jni_nativeScanLimbusNativeSyscalls(JNIEnv *env, jclass clazz, jstrin
     scanLimbusNativeSyscalls(dir.c_str());
 }
 
+static jboolean jni_nativePreloadLimbusAppSealing(JNIEnv *env, jclass clazz, jstring nativeLibraryDir) {
+    ScopeUtfString dir(nativeLibraryDir);
+    return static_cast<jboolean>(preloadLimbusAppSealing(dir.c_str()) ? JNI_TRUE : JNI_FALSE);
+}
+
 static jint jni_nativeMaintainLimbusAppSealingPatches(JNIEnv *env, jclass clazz) {
     return maintainLimbusAppSealingPatches();
 }
@@ -186,6 +191,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *_vm, void *) {
             {"nativeHookLimbusProcessExit",            "()V",                                                         (void *) jni_nativeHookLimbusProcessExit},
             {"nativeHookLimbusFindClass",              "()V",                                                         (void *) jni_nativeHookLimbusFindClass},
             {"nativeScanLimbusNativeSyscalls",         "(Ljava/lang/String;)V",                                       (void *) jni_nativeScanLimbusNativeSyscalls},
+            {"nativePreloadLimbusAppSealing",          "(Ljava/lang/String;)Z",                                       (void *) jni_nativePreloadLimbusAppSealing},
             {"nativeMaintainLimbusAppSealingPatches",  "()I",                                                        (void *) jni_nativeMaintainLimbusAppSealingPatches},
             {"nativeConfigureLimbusTranslationRuntime", "(Ljava/lang/String;)V",                                      (void *) jni_nativeConfigureLimbusTranslationRuntime},
             {"nativeReverseRedirectedPath",            "(Ljava/lang/String;)Ljava/lang/String;",                      (void *) jni_nativeReverseRedirectedPath},
